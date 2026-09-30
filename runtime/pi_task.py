@@ -2416,7 +2416,8 @@ def run_worker(args) -> int:
                 if now - last_command_scan >= 1.0:
                     last_command_scan = now
                     try:
-                        command_guard.scan()
+                        if not board_pause_active(task)[0]:
+                            command_guard.scan()
                     except Exception as exc:
                         # Failed observation never authorizes worker cancellation.
                         detail = f"{type(exc).__name__}: {exc}"
