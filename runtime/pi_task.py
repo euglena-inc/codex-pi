@@ -36,6 +36,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 
 import pi_phase
+from pi_command_guard import CommandGuard
 from pi_phase import contract_hash, contract_view, load_contract, validate_contract
 from pi_size import measure, sanitize_snapshot
 from pi_summary import bounded, compact, read_meta, summarize
@@ -83,7 +84,7 @@ PHASE_TERMINAL_STATES = ("completed", "failed", "timed_out", "cancelled", "inter
 CONFIG_KEYS = ("schemaVersion", "model", "thinking", "constraints", "checks",
                "maxWorkers", "timeoutSeconds")
 HELPER_FILES = ("pi_task.py", "pi_phase.py", "pi_summary.py", "pi_check.py", "pi_copy.py",
-                "pi_size.py", "pi_board.py", "pi_takeover.py", "VERSION")
+                "pi_size.py", "pi_board.py", "pi_takeover.py", "pi_command_guard.py", "VERSION")
 REFERENCE_EXTENSIONS = ("md", "markdown", "txt", "json", "sh", "bash", "zsh", "py",
                         "js", "mjs", "cjs", "ts", "tsx", "yaml", "yml", "toml", "cfg", "ini")
 
@@ -2034,6 +2035,7 @@ def compose_brief(task: dict, round_number: int, prompt: str, prior: dict | None
         lines += ["", f"Previous round {prior.get('round')}: outcome={prior.get('state')} "
                       f"exit={prior.get('exitCode')} head={prior.get('endHead')}. "
                       "That is execution evidence only; read its summary before continuing."]
+    lines += ["Every temporary bash probe must have a finite timeout; default supervisor ceiling is 600 seconds plus cleanup grace. Use try/finally to close the complete fixture, not only its product core. Propagate HTTP/assertion errors as nonzero exits; catch-and-print is not verification. Formal pi_check retains its owned declared wrapper deadline. Unknown process ownership is reported and never blindly signalled."]
     command_timeout = task["timeoutSeconds"]
     if isinstance(phase_record, dict):
         contract_timeout = (phase_record.get("contract") or {}).get("commandTimeoutSeconds")
@@ -2390,6 +2392,9 @@ def run_worker(args) -> int:
                                          env=worker_env(), pass_fds=(args.lock_fd,))
             state["piPid"] = child.pid
             atomic(state_path, state)
+            command_guard = CommandGuard(round_dir, child.pid,
+                ceiling=float((phase_record or {}).get("contract", {}).get("commandTimeoutSeconds") or 3600))
+            last_command_scan = 0.0
             deadline = time.monotonic() + timeout_seconds
             board_interval = board_refresh_seconds()
             last_board_refresh = time.monotonic() - board_interval
@@ -2408,6 +2413,16 @@ def run_worker(args) -> int:
                     timed_out, outcome, code = True, "timed_out", 124
                     break
                 now = time.monotonic()
+                if now - last_command_scan >= 1.0:
+                    last_command_scan = now
+                    try:
+                        command_guard.scan()
+                    except Exception as exc:
+                        # Failed observation never authorizes worker cancellation.
+                        detail = f"{type(exc).__name__}: {exc}"
+                        if state.get("commandProtectionError") != detail:
+                            state["commandProtectionError"] = detail
+                            atomic(state_path, state)
                 if resource_monitor is not None \
                         and now - last_resource_scan >= resource_interval:
                     last_resource_scan = now
