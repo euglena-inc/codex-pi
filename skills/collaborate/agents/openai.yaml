@@ -1,0 +1,6 @@
+interface:
+  display_name: "Codex + Pi"
+  short_description: "标准化任务规格、派工提示和交付证据，主会话设计验收、Pi 整块实施"
+  default_prompt: "使用 $collaborate 为当前任务形成标准 Pi 任务包；若已授权执行，再委托 Pi 整块实施并在本会话验收。"
+policy:
+  allow_implicit_invocation: true

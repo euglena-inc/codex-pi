@@ -1,0 +1,13 @@
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Private execution evidence and credentials
+.env
+.env.*
+!.env.example
+private/
+artifacts/private/
+docs/validation/*.json
+docs/validation/*.log
