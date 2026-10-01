@@ -1,5 +1,7 @@
 # Owned Pi command protection
 
+> 本说明已脱敏；样例路径和会话 ID 不能用于真实任务回放。原始日志与回执保留在私有档案，不随公开仓库分发。
+
 User requested durable hang protection and a 30-minute main-thread inspection on 2026-10-01 after an Eugl-Eugene probe left an HTTP listener open. This changes command supervision, not worker model ownership, acceptance, frozen budgets or the one-delivery takeover policy.
 
 New task snapshots include `pi_command_guard.py`. The existing supervisor observes exact bash start/end events and OS process identity. Temporary probes default to 600 seconds plus 10 seconds cleanup grace. Explicit tool timeouts are bounded by the phase command ceiling. An actually owned `pi_check` child/running marker retains its declared bounded deadline. Native completion wins over delayed observations. Timeout evidence is persisted before signalling the unique direct, newly born child process group; PID reuse, overlapping starts, background processes from older calls, detached descendants or failed OS inspection do not authorize signalling. No shell-output keyword classifier is used. A signal/inspection/persistence failure is unknown, not success or authorization to cancel Pi.
