@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Check tracked content or reachable history; never print matched values."""
+"""Check tracked content or reachable history; never print matched values.
+
+The final lines are a machine-readable summary for the phase check parser: the count is the number
+of inspected files (or historical blobs), so a zero-exit run reports zero skips without claiming a
+unit-test result.
+"""
 from __future__ import annotations
 
 import argparse
 import re
 import subprocess
+import time
 from pathlib import Path
 
 
@@ -62,6 +68,7 @@ def history_blobs():
 
 
 def main() -> int:
+    started = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--history", action="store_true")
     args = parser.parse_args()
@@ -81,6 +88,8 @@ def main() -> int:
     for issue in sorted(set(issues)):
         print(issue)
     print(f"{'FAIL' if issues else 'PASS'}: {count} {'historical blobs' if args.history else 'tracked files'} checked; matched values withheld")
+    print(f"Ran {count} tests in {time.monotonic() - started:.3f}s")
+    print("FAILED (failures=1)" if issues else "OK")
     return 1 if issues else 0
 
 
