@@ -5,10 +5,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from runtime_helpers import RUNTIME, Repo, base_env, cleanup_repos, default_config
+from runtime_helpers import RUNTIME, Repo, base_env, cleanup_repos, default_config, cli_json
 sys.path.insert(0, str(RUNTIME))
 import pi_board
-from pi_execution import terminal_evidence
+from pi_execution import effective_execution, terminal_evidence
 from pi_takeover import review_policy
 
 
@@ -85,6 +85,43 @@ class ExecutionTest(unittest.TestCase):
         tool=json.dumps({"type":"tool_execution_end","toolName":"large","output":"x"*1_250_000})
         path.write_text(final+"\n"+tool+"\n")
         self.assertEqual(terminal_evidence(path)["status"],"unknown")
+
+    def test_recorded_unknown_is_rechecked_only_with_explicit_terminal_authority(self):
+        path=self.root/'stream.jsonl'
+        path.write_text(json.dumps({"type":"message_end","message":{"role":"assistant",
+            "stopReason":"stop","content":[{"type":"text","text":"final"}]}})+"\n")
+        state={"state":"unknown","exitCode":0,"startedAt":1,"endedAt":2,
+               "endHead":"a"*40}
+        self.assertEqual(effective_execution(state,path)[0],"unknown")
+        metadata={"exit":"0","start":"1","end":"2","head":"a"*40}
+        self.assertEqual(effective_execution(state,path,terminal_meta=metadata)[0],"completed")
+        metadata["head"]="b"*40
+        self.assertEqual(effective_execution(state,path,terminal_meta=metadata)[0],"unknown")
+        metadata["head"]="a"*40
+        state["timedOut"]=True
+        self.assertEqual(effective_execution(state,path,terminal_meta=metadata)[0],"unknown")
+
+    def test_status_and_continue_recover_a_verified_legacy_unknown_without_rewriting_it(self):
+        repo=Repo(self.root,config=default_config());worktree=repo.worktree('legacy')
+        env=base_env(PI_DOUBLE_MODE='ok')
+        repo.start('legacy-unknown',worktree,env=env)
+        repo.wait_terminal('legacy-unknown',env=env)
+        state_path=repo.task_dir('legacy-unknown')/'rounds/1/round.state.json'
+        state=json.loads(state_path.read_text())
+        state['state']='unknown';state['executionEvidence']={"status":"unknown"}
+        state_path.write_text(json.dumps(state))
+        original=state_path.read_bytes()
+
+        status=cli_json('status','--repo',str(repo.root),'--task','legacy-unknown',env=env)
+        self.assertEqual(status['state'],'completed')
+        self.assertEqual(status['recordedState'],'unknown')
+        self.assertEqual(status['candidate']['head'],state['endHead'])
+        self.assertEqual(status['acceptance'],'not_verified')
+        self.assertEqual(state_path.read_bytes(),original)
+
+        continued=json.loads(repo.continue_task('legacy-unknown',env=env).stdout)
+        self.assertEqual(continued['round'],2)
+        self.assertEqual(repo.wait_terminal('legacy-unknown',env=env)['state'],'completed')
 
     def test_later_activity_and_stream_fault_cannot_reuse_an_earlier_answer(self):
         path=self.root/'stream.jsonl'

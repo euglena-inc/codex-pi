@@ -348,7 +348,7 @@ def cmd_phase_status(args) -> dict:
         result["baselineCommit"] = record.get("baselineCommit")
         result["settleQuotaUsed"] = settle_quota_path(task_dir, contract.get("phaseId")).exists()
         state = read_json(round_dir / "round.state.json", {}) or {}
-        if state.get("state") in TERMINAL_STATES:
+        if state.get("state") in TERMINAL_STATES or state.get("state") == "unknown":
             result["readiness"] = build_readiness(task_dir, frozen, number)
     else:
         result["briefOnly"] = True
@@ -563,6 +563,13 @@ def cmd_continue(args) -> dict:
             meta = candidate / "round.meta"
             if not isinstance(round_state, dict):
                 raise ValueError(f"round {value} has no state evidence; stale artifacts, inspect {candidate}")
+            if round_state.get("state") == "unknown" and meta.is_file() \
+                    and read_meta(meta).get("exit") == "0":
+                recovered, recovered_evidence = effective_execution(
+                    round_state, candidate / "round.jsonl", terminal_meta=read_meta(meta))
+                if recovered in TERMINAL_STATES:
+                    round_state = dict(round_state, state=recovered,
+                                       executionEvidence=recovered_evidence)
             if round_state.get("state") in ACTIVE_STATES or round_state.get("state") not in TERMINAL_STATES:
                 raise ValueError(f"round {value} is not terminal-known (state={round_state.get('state')!r}); "
                                  "never replay an unknown run")
@@ -572,7 +579,8 @@ def cmd_continue(args) -> dict:
                 raise ValueError(f"round {value} raw log is missing; stale artifacts, inspect {candidate}")
         latest_number, latest_dir = rounds[-1]
         latest_state = read_json(latest_dir / "round.state.json", {})
-        effective,execution_evidence=effective_execution(latest_state,latest_dir/'round.jsonl')
+        effective,execution_evidence=effective_execution(
+            latest_state,latest_dir/'round.jsonl',terminal_meta=read_meta(latest_dir/'round.meta'))
         if effective=='unknown':
             raise ValueError('last assistant completion is unverified; inspect the preserved stream before retry')
         latest_state=dict(latest_state,state=effective,executionEvidence=execution_evidence)
@@ -700,6 +708,10 @@ def round_compact(task_dir: Path, number: int, round_dir: Path, task_held: bool,
     got = effective_state(state, task_held, supervisor_alive, latest)
     if got == "completed":
         got, execution_evidence = effective_execution(state, round_dir / "round.jsonl")
+    elif (got == "unknown" and state.get("state") == "unknown" and not task_held
+          and not supervisor_alive):
+        got, execution_evidence = effective_execution(
+            state, round_dir / "round.jsonl", terminal_meta=read_meta(round_dir / "round.meta"))
     started = state.get("startedAt")
     ended = state.get("endedAt")
     return {"round": number, "state": got, "exitCode": state.get("exitCode"),
@@ -811,6 +823,11 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
     execution_evidence = state.get("executionEvidence")
     if effective == "completed":
         effective, execution_evidence = effective_execution(state, selected_dir / "round.jsonl")
+    elif (effective == "unknown" and raw_state == "unknown" and not task_held
+          and not supervisor_alive):
+        effective, execution_evidence = effective_execution(
+            state, selected_dir / "round.jsonl", terminal_meta=read_meta(selected_dir / "round.meta"))
+    normalized_state = dict(state, state=effective, executionEvidence=execution_evidence)
     current_head, head_problem = None, None
     if raw_state in ACTIVE_STATES:
         frozen_worktree = frozen.get("worktree")
@@ -891,7 +908,7 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
         readiness = None
         snapshot = None
         try:
-            snapshot = build_phase_snapshot(task_dir, frozen, selected_number, state=state,
+            snapshot = build_phase_snapshot(task_dir, frozen, selected_number, state=normalized_state,
                                             checks=checks, candidate=candidate_block)
             readiness = snapshot.get("readiness")
         except Exception as exc:  # noqa: BLE001 - status must not fail on one snapshot error

@@ -141,7 +141,16 @@ def adopt_runtime(repo,task_id,helper_files,source,dry_run=False):
         for path in [common/'codex-pi/.admission.lock',task_dir/'.task.lock',task_dir/'.supervisor.lock']:
             locks.append(lock_fd(path,blocking=False))
         rounds=sorted(int(p.name) for p in (task_dir/'rounds').iterdir() if p.name.isdigit())
-        state=read_json(task_dir/'rounds'/str(rounds[-1])/'round.state.json',{}) or {}
+        round_dir=task_dir/'rounds'/str(rounds[-1])
+        state=read_json(round_dir/'round.state.json',{}) or {}
+        if state.get('state')=='unknown':
+            from pi_execution import effective_execution
+            recovered,evidence=effective_execution(state,round_dir/'round.jsonl',
+                                                   terminal_meta=read_meta(round_dir/'round.meta'))
+            if recovered in ('completed','failed','cancelled','timed_out','interrupted'):
+                # Adoption consults the new bounded evidence in memory only;
+                # immutable round/task/helper records remain untouched.
+                state=dict(state,state=recovered,executionEvidence=evidence)
         if state.get('state') not in ('completed','failed','cancelled','timed_out','interrupted'):
             raise ValueError('runtime adoption needs a terminal-known round and released writers')
         groups={value for key in ['piPid','supervisorPid'] for value in [state.get(key)]
@@ -200,3 +209,8 @@ def adopt_runtime(repo,task_id,helper_files,source,dry_run=False):
 def review_policy_for(card):
     from pi_takeover import review_policy
     return review_policy(card)
+
+
+def read_meta(path):
+    from pi_summary import read_meta as read
+    return read(path)

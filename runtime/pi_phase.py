@@ -1338,7 +1338,12 @@ def build_readiness(task_dir: Path, task: dict, round_number: int) -> dict:
     round_dir = task_dir / "rounds" / str(round_number)
     state = read_json(round_dir / "round.state.json", {}) or {}
     from pi_execution import effective_execution
-    effective, execution_evidence = effective_execution(state, round_dir / "round.jsonl")
+    from pi_summary import read_meta
+    writer_free = (not lock_is_held(task_dir / ".task.lock")
+                   and not lock_is_held(task_dir / ".supervisor.lock"))
+    effective, execution_evidence = effective_execution(
+        state, round_dir / "round.jsonl",
+        terminal_meta=read_meta(round_dir / "round.meta") if writer_free else None)
     state = dict(state, state=effective, executionEvidence=execution_evidence)
     raw_state = state.get("state")
     current_head, head_problem = None, None

@@ -10,6 +10,10 @@ Sol-Luna 的 [项目用法](skills/sol-luna/references/projects.md)、[设计与
 
 新增原生 `sol-luna` Skill 和离线 `scripts/compare_routes.py`。对照按项目、基线和验收分组；缺少真实用量、模型核验或完整接受结果时不输出节省比例。现有 Pi 调度、hooks、守卫和冻结任务策略保留。源码交付与正式安装、真实费用对照分别验证。
 
+## 0.6.4 终态恢复
+
+大型 Pi `agent_end` 聚合记录不再挤掉前面的完整终态消息；旧 round 若只因旧读取器留下 `unknown`，新控制器会在 writer 已释放且 round metadata 与候选 HEAD 匹配时只读重判原始证据。状态文件、原始会话、冻结 helper 和预算保持不变；错误、截断、不完整消息及活动 writer 仍阻止完成或接续。
+
 ## 协作方式
 
 1. Codex 给 Pi 一个完整任务段，明确目标、范围、验收和资源上限。

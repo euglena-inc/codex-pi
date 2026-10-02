@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 from pathlib import Path
 
 MAX_TERMINAL_BYTES = 1_048_576
@@ -14,6 +16,26 @@ MAX_TERMINAL_BYTES = 1_048_576
 # Keep the evidence window fixed, but permit one bounded aggregate record so it
 # cannot evict the preceding message_end/turn_end evidence from that window.
 MAX_AGGREGATE_EVENT_BYTES = 2 * MAX_TERMINAL_BYTES
+
+
+def _terminal_meta_matches(state: dict, metadata: dict | None) -> bool:
+    if not isinstance(metadata, dict) or metadata.get("exit") != "0":
+        return False
+    started, ended = state.get("startedAt"), state.get("endedAt")
+    head = state.get("endHead") or state.get("head")
+    try:
+        meta_start, meta_end = float(metadata.get("start")), float(metadata.get("end"))
+        if (isinstance(started, bool) or isinstance(ended, bool)
+                or not math.isfinite(float(started)) or not math.isfinite(float(ended))
+                or not math.isfinite(meta_start) or not math.isfinite(meta_end)
+                or float(ended) < float(started) or meta_end < meta_start):
+            return False
+        if meta_end != float(ended):
+            return False
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (isinstance(head, str) and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head)
+            is not None and metadata.get("head") == head)
 
 
 def _terminal_lines(stream, size: int):
@@ -141,10 +163,18 @@ def terminal_evidence(log: Path) -> dict:
             "stopReason": stop, "error": None, "finalText": text[:1200]}
 
 
-def effective_execution(state: dict, log: Path) -> tuple[str | None, dict | None]:
+def effective_execution(state: dict, log: Path, *, terminal_meta: dict | None = None
+                        ) -> tuple[str | None, dict | None]:
     recorded = state.get("state")
     # Timeout, cancellation, ownership and nonzero process failures retain priority.
-    if recorded != "completed" or state.get("exitCode") != 0:
+    unknown_terminal = (
+        _terminal_meta_matches(state, terminal_meta)
+        and recorded == "unknown"
+        and state.get("exitCode") == 0
+        and not state.get("timedOut")
+        and not state.get("cancelled")
+    )
+    if (recorded != "completed" and not unknown_terminal) or state.get("exitCode") != 0:
         return recorded, state.get("executionEvidence")
     evidence = terminal_evidence(log)
     return evidence["status"], evidence
