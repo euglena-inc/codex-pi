@@ -96,3 +96,6 @@ Version 0.6.0. README, plugin manifest and IMPLEMENTATION.md are updated to matc
   - The decide hint is ≤ 200 bytes for typical paths. Very long install or repo paths can reach about 260 bytes. `decide` binding semantics are unchanged.
   - `SCOPE_ESCAPE` applies once `round.summary.json` carries `scope_escape`. Older rounds are not reinterpreted.
   - The forbidden-path check is a textual heuristic, not a sandbox.
+- Step 3 (accepted at `158f79c`, +264/−2813 lines):
+  - Pending legacy states are `armed`, `suspended`, `expired` and `needs_recovery`. A legacy binding file is retired by the user, because the runtime no longer has `release`.
+  - No legacy binding state injects recovery text. `hooks.json` keeps `Interrupt`, `SessionStart` and `UserPromptSubmit`.
