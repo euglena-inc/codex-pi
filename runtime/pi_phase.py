@@ -1334,6 +1334,9 @@ def build_readiness(task_dir: Path, task: dict, round_number: int) -> dict:
     """Readiness view built from the same normalized snapshot the board uses."""
     round_dir = task_dir / "rounds" / str(round_number)
     state = read_json(round_dir / "round.state.json", {}) or {}
+    from pi_execution import effective_execution
+    effective, execution_evidence = effective_execution(state, round_dir / "round.jsonl")
+    state = dict(state, state=effective, executionEvidence=execution_evidence)
     raw_state = state.get("state")
     current_head, head_problem = None, None
     if raw_state in ACTIVE_STATES:
@@ -1471,7 +1474,8 @@ def _phase_acceptance_on_board(main_task: dict, record: dict, latest_head):
     board_path = Path(common) / "codex-pi" / "board.json" if isinstance(common, str) else None
     if board_path is None or not board_path.exists():
         return None, "board state is missing; the phase gate needs the recorded decision authority"
-    board = read_json(board_path, None)
+    from pi_store import read_board
+    board,_problem = read_board(board_path)
     if not isinstance(board, dict):
         return None, "board state is unreadable; refusing to cross phases"
     card = (board.get("cards") or {}).get(task_id)

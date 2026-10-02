@@ -15,7 +15,7 @@ import uuid
 from pathlib import Path
 
 from pi_core import LockHeld, atomic, lock_fd, record_codex_io, terminate
-from pi_events import PROGRESS_EVENT_KIND, _decide_hint, _phase_event_stale, pending_events
+from pi_events import PROGRESS_EVENT_KIND, _decide_hint, _phase_event_stale, pending_events, find_event
 from pi_evidence import acceptance_line
 from pi_store import (
     BOARD_CLI,
@@ -31,6 +31,7 @@ from pi_store import (
     route_paused,
 )
 from pi_takeover import review_policy
+from pi_archive import Claims, QueueTasks, write_queue_store
 
 
 QUEUE_FILE = "board.queue.json"
@@ -65,6 +66,12 @@ def queue_paths(board_file):
 
 
 def read_queue(board_file):
+    marker,marker_problem=_read_bounded_json(board_file,262_144)
+    if isinstance(marker,dict) and marker.get("schemaVersion")==2:
+        try:
+            return {"schemaVersion":2,"tasks":QueueTasks(board_file)},None
+        except ValueError as exc:
+            return None,str(exc)
     path, _lock = queue_paths(board_file)
     if not path.exists():
         return {"schemaVersion": 1, "tasks": {}}, None
@@ -80,7 +87,7 @@ def read_queue(board_file):
 def _queue_entry(queue: dict, task_id: str) -> dict:
     entry = queue.setdefault("tasks", {}).setdefault(
         task_id, {"claims": {}, "failures": [], "lastStatus": "idle"})
-    if not isinstance(entry.get("claims"), dict):
+    if not isinstance(entry.get("claims"), (dict,Claims)):
         entry["claims"] = {}
     if not isinstance(entry.get("failures"), list):
         entry["failures"] = []
@@ -88,11 +95,12 @@ def _queue_entry(queue: dict, task_id: str) -> dict:
 
 
 def _write_queue(board_file, queue) -> None:
+    if isinstance(queue.get("tasks"),QueueTasks):
+        write_queue_store(board_file,queue)
+        return
     tasks = queue.get("tasks") or {}
     if len(tasks) > MAX_QUEUE_TASKS:
-        ordered = sorted(tasks.items(),
-                         key=lambda item: (item[1] or {}).get("updatedAt") or 0)
-        queue["tasks"] = dict(ordered[-MAX_QUEUE_TASKS:])
+        raise QueueOverflow("legacy queue task limit reached; recover-store without dropping claims")
     if len(_serialized(queue)) > MAX_QUEUE_BYTES:
         raise QueueOverflow(
             f"queue snapshot would exceed MAX_QUEUE_BYTES={MAX_QUEUE_BYTES}; refusing the write "
@@ -232,6 +240,8 @@ def _clear_queue_claims(board_file, task_id: str, event_id=None, now=None) -> di
             raise ValueError(f"queue state is {problem}")
         entry = _queue_entry(queue, task_id)
         claims = entry.setdefault("claims", {})
+        if isinstance(claims,Claims) and event_id is None and len(claims)>50:
+            raise ValueError("paged queue recovery needs an exact --event-id; no claims were cleared")
         cleared, refused, marked_uncertain = [], [], []
         targets = [event_id] if event_id is not None else list(claims)
         for target in targets:
@@ -281,9 +291,11 @@ def queue_view(board_file, task_id: str) -> dict:
     if not isinstance(entry, dict):
         return {"status": "idle", "queued": 0, "inflight": 0, "uncertain": 0, "failed": 0,
                 "lastDispatch": None, "failures": [], "limitations": [QUEUE_LIMITATION]}
-    claims = entry.get("claims") if isinstance(entry.get("claims"), dict) else {}
+    claims = entry.get("claims") if isinstance(entry.get("claims"), (dict,Claims)) else {}
     counts = {"queued": 0, "inflight": 0, "uncertain": 0, "failed": 0}
     now = time.time()
+    if isinstance(claims,Claims):
+        counts.update({key:value for key,value in claims.counts().items() if key in counts})
     for claim in claims.values():
         if not isinstance(claim, dict):
             continue
@@ -293,7 +305,10 @@ def queue_view(board_file, task_id: str) -> dict:
             if isinstance(at, bool) or not isinstance(at, (int, float)) \
                     or now - at > QUEUE_STALE_INFLIGHT_SECONDS:
                 status = "uncertain"  # a crashed in-flight claim is never auto-resent
-        if status in counts:
+        if isinstance(claims,Claims):
+            if claim.get("status")=="inflight" and status=="uncertain":
+                counts["inflight"]-=1;counts["uncertain"]+=1
+        elif status in counts:
             counts[status] += 1
     return {
         "status": entry.get("lastStatus") or "idle",
@@ -422,6 +437,8 @@ def _clip_bytes(text: str, limit: int) -> str:
 
 def _final_report(event: dict) -> str:
     """Pi's final report for the event's round, from the stored round summary."""
+    if event.get("kind")=="execution_failed":
+        return ""
     state_ref = (event.get("evidence") or {}).get("stateRef")
     if not isinstance(state_ref, str) or not state_ref:
         return ""
@@ -607,7 +624,27 @@ def dispatch_task(board_file, task_id: str, now=None, timeout=None, cli_runner=N
     try:
         argv[0] = _resolve_codex_bin(argv[0])
     except ValueError as exc:
+        _finish_queue(board_file,task_id,requested,
+                      {"status":"failed","notStarted":True,"error":str(exc)},now,packet_id)
         return {"ok": False, "dispatched": False, "status": "invalid-binary", "error": str(exc)}
+    # Claim acquisition and binary lookup can wait. Revalidate authority and
+    # exact unhandled events before starting the external queue command.
+    live,problem=read_board(board_file)
+    fresh=(live.get("cards") or {}).get(task_id) if live else None
+    paused,pause_problem=route_paused(thread)
+    valid=isinstance(fresh,dict) and fresh.get("ownerThread")==thread \
+        and fresh.get("transport")==TRANSPORT_CLI_QUEUE and not fresh.get("paused") \
+        and not paused and pause_problem is None
+    if valid:
+        valid=all((current:=find_event(fresh,e['id'])) is not None
+                  and not current.get('handled') and not _phase_event_stale(fresh,current)
+                  and current.get('candidate')==e.get('candidate') for e in included)
+    if not valid:
+        _finish_queue(board_file,task_id,requested,
+                      {"status":"failed","notStarted":True,"error":"authority changed before queue spawn"},
+                      now,packet_id)
+        return {"ok":False,"dispatched":False,"status":"not-started",
+                "reason":"pause, owner or event changed before queue spawn; no message sent"}
     result = (cli_runner or _run_queue_cli)(argv, timeout)
     if result.get("status") in ("queued", "uncertain"):
         # Size only: the card may have reached the owner (uncertain included).

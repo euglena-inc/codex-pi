@@ -51,6 +51,19 @@ python3 .../pi_board.py decide --repo REPO --task TASK --event-id EVENT --decisi
 
 Progress is Pi's self-report, never acceptance. Readiness compares the contract with real receipts bound to the candidate; a missing, failed, skipped or unknown item is never ready. Ordinary progress stays on the board; only a sustained unrepaired check failure may enqueue, at most twice per phase. `accept` binds phase, contract, candidate and the live round state, and refuses on any mismatch. A phase command timeout must not exceed `commandTimeoutSeconds`; declared `resourceLimits` stop only the owned process group on a known breach, and an incomplete measurement stays unknown.
 
+## Explicit 0.6 recovery
+
+```sh
+python3 .../pi_board.py recover-store --repo REPO
+python3 .../pi_board.py show --repo REPO --all [--cursor LAST_TASK]
+python3 .../pi_board.py events --repo REPO --task TASK [--cursor LAST_SEQ] [--pending]
+python3 .../pi_board.py decisions --repo REPO --task TASK [--cursor LAST_EVENT_ID]
+python3 .../pi_task.py adopt-runtime --repo REPO --task TASK --dry-run
+python3 .../pi_task.py adopt-runtime --repo REPO --task TASK
+```
+
+Use the newly installed CLI for control/recovery. Store conversion requires released writers and retains original JSON, events, decisions and delivery claims. Adoption prepares a separate immutable runtime for future 0.6 rounds, never edits old tools/task/rounds, never resumes, changes model or extends budget. Then only the owner main task may resolve execution incidents, explicitly resume a paused route and `continue` the same session/worktree with remaining budget. 0.5 workers are not adopted. A provider `execution_failed` incident is resolved separately from quality review; an exit-zero error cannot be accepted as a delivery. See [recovery verification](../../../docs/validation/recovery-0.6.1-20261002.md).
+
 ## Decisions
 
 ```sh

@@ -120,6 +120,7 @@ from pi_store import (
 )
 from pi_takeover import FAILURE_KINDS, _records as decision_records, review_policy
 from pi_task import build_status
+from pi_archive import Cards, initialize_store, event_page, STORE_FILE
 
 
 def refresh_with_status(board_file, task_id: str, status: dict, now=None, block: bool = True,
@@ -313,18 +314,22 @@ def compact_card(card: dict, max_events: int = 5) -> dict:
         "progressNotify": _notify_view(card),
         "attention": card.get("attention"), "codex": card.get("codex"),
         "pendingEvents": [compact_event(event) for event in pending[:max_events]],
-        "pendingCount": len(pending),
-        "handledCount": len(card.get("handled") or {}),
+        "pendingCount": card.pending_count() if hasattr(card,"pending_count") else len(pending),
+        "handledCount": card.handled_count() if hasattr(card,"handled_count") else len(card.get("handled") or {}),
         "overflow": card.get("overflow"),
         "recentHandled": [compact_event(event) for event in handled[-2:]],
     }
 
 
-def select_cards(board: dict, thread=None, task_id=None, include_all=False) -> list:
+def select_cards(board: dict, thread=None, task_id=None, include_all=False,cursor="") -> list:
     cards = board.get("cards") or {}
     if task_id is not None:
         card = cards.get(task_id)
         return [card] if isinstance(card, dict) else []
+    if isinstance(cards,Cards):
+        if not thread and not include_all:
+            raise ValueError("provide --task, --thread or --all")
+        return [cards[key] for key in cards.page(cursor,thread)]
     if thread:
         return [card for card in cards.values()
                 if isinstance(card, dict) and card.get("ownerThread") == thread]
@@ -397,6 +402,7 @@ def register_task(repo, task, thread=None, transport=TRANSPORT_OFFLINE, codex_bi
         if board is None:
             board = {"schemaVersion": SCHEMA_VERSION, "revision": 0,
                      "createdAt": now, "updatedAt": now, "cards": {}}
+            board = initialize_store(board_file,board)
         cards = board.setdefault("cards", {})
         card = cards.get(task_id)
         if not isinstance(card, dict):
@@ -431,11 +437,13 @@ def register_task(repo, task, thread=None, transport=TRANSPORT_OFFLINE, codex_bi
     route = None
     if transport == TRANSPORT_CLI_QUEUE:
         route = register_route(owner_thread, board_file, [task_id], transport, now)
+    refresh_error=None
     try:
         refresh_with_status(board_file, task_id, build_status(str(root), task_id), now,
                             block=True, source="register")
-    except (ValueError, OSError, LockHeld):
-        pass
+    except (ValueError, OSError, LockHeld) as exc:
+        refresh_error=f'{type(exc).__name__}: {exc}'
+        record_monitor_error(frozen,refresh_error)
     dispatch = None
     if transport == TRANSPORT_CLI_QUEUE:
         dispatch = dispatch_task(board_file, task_id, now=now)
@@ -450,11 +458,15 @@ def register_task(repo, task, thread=None, transport=TRANSPORT_OFFLINE, codex_bi
                    "nothing is delivered until the user authorizes: python3 "
                    f"{shlex.quote(str(Path(__file__).resolve()))} resume --repo {shlex.quote(str(root))} "
                    f"--task {task_id} --thread {owner_thread}, then register again")
+    if refresh_error:
+        warning=f'terminal projection failed: {refresh_error}; inspect recover-store and original evidence'
     return {
-        "ok": True, "taskId": task_id, "ownerThread": owner_thread,
+        "ok": refresh_error is None, "registered":True, "refreshError":refresh_error,
+        "taskId": task_id, "ownerThread": owner_thread,
         "routePaused": paused, "warning": warning,
         "mode": transport, "transport": transport, "codexBin": card.get("codexBin"),
-        "boardPath": str(board_file), "queuePath": str(queue_paths(board_file)[0]),
+        "boardPath": str(board_file), "queuePath": str(board_file.with_name(STORE_FILE))
+        if board.get('schemaVersion')==2 else str(queue_paths(board_file)[0]),
         "routePath": str(route_paths(owner_thread)[0]) if route else None,
         "revision": board.get("revision"),
         "queueArgvTemplate": ([card.get("codexBin") or DEFAULT_CODEX_BIN, "--disable",
@@ -540,6 +552,10 @@ def decide(repo, task, event_id, decision, reviewed_head=None, note=None, phase=
                              f"{history.get('decision')!r}; refusing to overwrite or replay it "
                              "with a different decision/reviewed head")
         kind = event.get("kind")
+        if kind=='execution_failed':
+            if failure_kind=='quality':
+                raise ValueError('execution incidents cannot be classified as quality deliveries')
+            effective_kind='execution' if mapped in ('rejected','changes_requested') else None
         event_phase = event.get("phaseId")
         if event.get("handled"):
             if event_phase and mapped == "accepted" and (phase != event_phase
@@ -556,6 +572,12 @@ def decide(repo, task, event_id, decision, reviewed_head=None, note=None, phase=
                                  "different reviewed head")
             raise ValueError(f"event {event_id} is already handled as "
                              f"{event.get('decision')!r}; refusing to overwrite a decision")
+        if kind in ("review_required","phase_blocked") and (
+                _common/'codex-pi/tasks'/task_id/'task.json').is_file():
+            live_execution=build_status(str(card.get('repo') or _root),task_id)
+            if (live_execution.get('executionEvidence') or {}).get('status') in ('failed','unknown'):
+                raise ValueError('this is incomplete execution, not a quality delivery; refresh '
+                                 'and resolve its execution_failed incident without counting a rejection')
         if event_phase or event.get("contractHash"):
             # Phase events are only meaningful for the exact installed contract and
             # current candidate/round. Stale evidence can never be accepted or sent
@@ -792,7 +814,8 @@ def cmd_show(args) -> dict:
     if board is None:
         raise ValueError(f"board state is {problem}: {board_file}")
     thread = _validate_thread(args.thread, required=False) if args.thread else None
-    cards = select_cards(board, thread=thread, task_id=args.task, include_all=args.all)
+    cards = select_cards(board, thread=thread, task_id=args.task, include_all=args.all,
+                         cursor=getattr(args,"cursor",None) or "")
     task_ids = [card.get("taskId") for card in cards]
     queues = {}
     for task_id in task_ids:
@@ -803,6 +826,7 @@ def cmd_show(args) -> dict:
             view = {key: value for key, value in view.items() if key != "limitations"}
         queues[task_id] = view
     return {"ok": True, "revision": board.get("revision"), "count": len(cards),
+            "nextCursor": cards[-1]["taskId"] if len(cards)==50 and not args.task else None,
             "cards": [compact_card(card) for card in cards],
             "monitor": _monitor_view(board_file, task_ids), "queue": queues}
 
@@ -870,6 +894,7 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("--thread")
     show.add_argument("--task")
     show.add_argument("--all", action="store_true")
+    show.add_argument("--cursor", help="task id after the previous bounded page")
     show.set_defaults(func=cmd_show)
 
     metrics = sub.add_parser("metrics", help="one compact JSON line per task: rounds, usage/cost, "
@@ -911,6 +936,31 @@ def build_parser() -> argparse.ArgumentParser:
     recover = sub.add_parser("recover", help="bounded recovery evidence for one thread route")
     recover.add_argument("--thread")
     recover.set_defaults(func=cmd_recover)
+
+    store=sub.add_parser("recover-store",help="archive legacy JSON and transactionally convert writer-free board/queue")
+    store.add_argument("--repo",required=True)
+    def recover_storage(args):
+        from pi_recovery import recover_store
+        return recover_store(args.repo)
+    store.set_defaults(func=recover_storage)
+
+    events=sub.add_parser("events",help="read a bounded page of retained events")
+    events.add_argument("--repo",required=True);events.add_argument("--task",required=True)
+    events.add_argument("--cursor",type=int,default=0);events.add_argument("--pending",action="store_true")
+    def read_events(args):
+        _root,_common,path=board_file_for_repo(args.repo)
+        result=event_page(path,require_task_arg(args.task),args.cursor,args.pending)
+        return dict(result,ok=True,task=args.task)
+    events.set_defaults(func=read_events)
+
+    decisions=sub.add_parser('decisions',help='read a bounded page of exact retained decisions')
+    decisions.add_argument('--repo',required=True);decisions.add_argument('--task',required=True)
+    decisions.add_argument('--cursor',default='')
+    def read_decisions(args):
+        from pi_archive import decision_page
+        _root,_common,path=board_file_for_repo(args.repo)
+        return dict(decision_page(path,require_task_arg(args.task),args.cursor),ok=True,task=args.task)
+    decisions.set_defaults(func=read_decisions)
     return parser
 
 
@@ -982,6 +1032,9 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
             if decision in ("rejected", "changes_requested"):
                 failure = row.get("failureKind", "quality")
                 failure_kinds[failure] = failure_kinds.get(failure, 0) + 1
+        if hasattr(card,'policy_base'):
+            from pi_archive import decision_metrics
+            by_kind,failure_kinds=decision_metrics(board_file,task_id)
         record.update(registered=True, decisions=by_kind, failureKinds=failure_kinds,
                       takeover=bool(review_policy(card).get("takeoverRequired")))
     else:

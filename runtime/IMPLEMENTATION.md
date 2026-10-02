@@ -1,6 +1,6 @@
 # Codex-Pi runtime implementation
 
-Version 0.6.0 (`runtime/VERSION`). It requires Pi >= 1.0.0 and does not migrate 0.5.x tasks; finish those with their own frozen helpers.
+Version 0.6.1 (`runtime/VERSION`). It requires Pi >= 1.0.0. Historical task/round snapshots remain immutable; 0.5.x workers cannot adopt a new runtime.
 
 Cross-project persistent Pi worker lifecycle for the Codex main session: **Codex main -> shell -> Python lifecycle scripts -> Pi CLI with one worker extension**. There is no MCP server and no package manifest. Python owns admission, persistence, evidence, model policy and process control. A single dependency-free TypeScript file (`runtime/pi_worker.ts`) runs inside Pi and guards and supports the worker. Current commands and rules are in [runtime guidance](../skills/collaborate/references/runtime.md), [handoff guidance](../skills/collaborate/references/handoff.md) and [the Skill](../skills/collaborate/SKILL.md).
 
@@ -30,6 +30,8 @@ Task side (lower modules never import the ones above them; `pi_task.py` is the C
 | `runtime/pi_task.py` | Admission, worktree claims, frozen helper snapshot, status/result building, CLI |
 | `runtime/pi_worker.ts` | In-process worker extension: guard, native tools `check`/`progress`/`readiness`, system prompt contract, settle continuation |
 | `runtime/pi_summary.py` | Bounded round summary, check-receipt aggregation, usage, reported-model check |
+| `runtime/pi_execution.py` | Bounded final assistant/stream inspection; shared by finish, status, result and readiness |
+| `runtime/pi_recovery.py` | Writer-free store conversion and separate immutable future-round helper generations |
 | `runtime/pi_check.py` | One-check receipt: true exit/signal/timeout, log sha256, HEAD/dirty, counts, `log_tail` on failure |
 | `runtime/pi_copy.py` / `pi_size.py` | Bounded evidence copying and byte scans without following symlinks |
 
@@ -38,6 +40,7 @@ Board side:
 | File | Role |
 | --- | --- |
 | `runtime/pi_store.py` | Board files, locks, monitor records, owner routes and route pause |
+| `runtime/pi_archive.py` | Plugin-owned transactional SQLite cards, events, decisions, phase quotas and queue claims; bounded windows and cursor pages |
 | `runtime/pi_events.py` | Card and event model, status projection, bounded progress echoes, decide hint |
 | `runtime/pi_queue.py` | Queue claims, the delivery card, one dispatch through `codex queue` |
 | `runtime/pi_board.py` | Registration, refresh, decisions, compact views, `metrics`, CLI |
@@ -111,7 +114,15 @@ A detached worker executes the **snapshot** `tools/pi_task.py`, so updating the 
 - `status` / `result` - bounded read-only snapshot / compact terminal view; `supervisorAlive` and `activeWorker` expose lock truth.
 - `cancel` - writes an explicit request for the live supervisor, which stops Pi's process group. If the supervisor is gone but an orphaned Pi still holds the task lock it returns `request: "orphaned"` without signaling an unverified PID.
 
-Exit code 0 means **completed execution only**; every result carries `acceptance: "not_verified"`.
+Exit code 0 is a process fact. Completion additionally requires a verified final assistant `stop`; an error, abort, incomplete turn or unreadable terminal tail cannot reuse an earlier answer. Every result carries `acceptance: "not_verified"`.
+
+## 0.6.1 storage and recovery
+
+`board.json` is a small format marker; `board.store.sqlite3` is this plugin's own indexed state, never the desktop app's queue database. Current per-task projections and record blobs are capped; reads select a task or a cursor page (50 entries), with an additional 256 KiB default event-window budget. Events, exact decisions, quota ledgers and prior claim transitions are retained. Durable history grows on disk. SQLite transactions, full synchronization and the existing short locks preserve event/card and claim updates together. A stale projection cannot commit over a newer revision.
+
+Explicit `recover-store` holds admission/board/queue locks, checks all registered and unregistered writer leases, archives original JSON bytes, imports a transaction and publishes the marker last. A rollback or interrupted marker publication is retryable with the same source fingerprint; changed/unverified inputs fail closed. Historical limits and takeover latches remain authoritative. Obsolete JSON-reading controls see pause sentinels; operators use the new installed board CLI.
+
+`adopt-runtime` checks the exact 0.6 task, released leases and recorded process groups. It writes only a new hash-bound `runtime.adoptions/<hash>/tools/` and pointer for future rounds. Existing task.json, tools, session, rounds, phase contract, quality decisions and budget anchor are unchanged. `continue` still requires explicit pause recovery, verified ownership and remaining budget; its spawned round uses that generation and the original absolute phase deadline. Unknown ownership, exhausted budget or provider availability is not repaired by switching executor or resetting a task.
 
 ## Lock and liveness model
 

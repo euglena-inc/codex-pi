@@ -36,8 +36,11 @@ from pi_phase import (
     read_phase_record,
     read_phase_state,
     write_phase_state,
+    phase_budget,
 )
 from pi_summary import compact, summarize
+from pi_execution import terminal_evidence
+from pi_recovery import round_tools
 
 
 def worker_env() -> dict:
@@ -51,7 +54,7 @@ def worker_env() -> dict:
 def spawn_worker(task_dir: Path, round_number: int, lock_fd_value: int, timeout_seconds: float) -> None:
     task = read_json(task_dir / "task.json", {}) or {}
     worktree = Path(task.get("worktree", "."))
-    script = task_dir / "tools" / "pi_task.py"
+    script = round_tools(task_dir,round_number) / "pi_task.py"
     argv = [sys.executable, str(script), "_worker", "--task-dir", str(task_dir),
             "--round", str(round_number), "--lock-fd", str(lock_fd_value),
             "--timeout-seconds", str(timeout_seconds)]
@@ -203,6 +206,7 @@ def run_worker(args) -> int:
     state.update(state="running", supervisorPid=os.getpid(), startedAt=time.time(),
                  startHead=start_head, timedOut=False, cancelled=False, exitCode=None,
                  workerScript=str(TASK_CLI), runtimeVersion=runtime_version())
+    state['deadlineAt']=state['startedAt']+timeout_seconds
     atomic(state_path, state)
 
     if cancel_requested(task_dir, round_number):
@@ -221,7 +225,7 @@ def run_worker(args) -> int:
     argv = [pi_bin, "-p", "--mode", "json", "--session-id", task["sessionId"],
             "--session-dir", task["sessionDir"], "--model", task["model"],
             "--thinking", task["thinking"], "--tools", tools,
-            "--no-extensions", "--no-approve", "-e", str(task_dir / "tools" / "pi_worker.ts"),
+            "--no-extensions", "--no-approve", "-e", str(round_tools(task_dir,round_number) / "pi_worker.ts"),
             "--no-skills", "--no-prompt-templates",
             "@" + str(round_dir / "brief.md")]
     worker_environment = worker_env()
@@ -266,6 +270,14 @@ def run_worker(args) -> int:
 
     previous = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
+        if isinstance(phase_record,dict):
+            budget=phase_budget(task_dir,phase_record)
+            remaining=budget.get('remainingSeconds')
+            if remaining is None or remaining<=0:
+                raise ValueError('phase deadline unavailable or exhausted before Pi spawn')
+            timeout_seconds=min(timeout_seconds,remaining)
+            state['deadlineAt']=min(state['deadlineAt'],budget['deadlineAt'])
+            atomic(state_path,state)
         with (round_dir / "round.jsonl").open("ab") as out, \
                 (round_dir / "round.err").open("ab") as err:
             # Pi inherits the task lock, so a SIGKILLed supervisor cannot free
@@ -275,7 +287,7 @@ def run_worker(args) -> int:
                                      env=worker_environment, pass_fds=(args.lock_fd,))
         state["piPid"] = child.pid
         atomic(state_path, state)
-        deadline = time.monotonic() + timeout_seconds
+        deadline = time.monotonic() + max(0,state['deadlineAt']-time.time())
         board_interval = board_refresh_seconds()
         last_board_refresh = time.monotonic() - board_interval
         resource_interval = _resource_scan_seconds()
@@ -336,6 +348,14 @@ def run_worker(args) -> int:
         error = error or f"{WORKER_NOT_LOADED}: the round ended without worker.ready"
         outcome = "failed"
         code = code if code not in (0, None) else 76
+    execution_evidence = None
+    if outcome == "completed" and code == 0:
+        execution_evidence = terminal_evidence(round_dir / "round.jsonl")
+        outcome = execution_evidence["status"]
+        error = execution_evidence.get("error")
+    elif outcome in ('failed','timed_out','cancelled','interrupted','unknown'):
+        execution_evidence={'status':'unknown' if outcome=='unknown' else 'failed','reason':outcome,'error':error or f'Pi process {outcome}, exit {code}',
+                            'processExitCode':code,'finalText':''}
     if cancelled:
         atomic(task_dir / "cancel.observed", {"round": round_number, "at": time.time()})
     resource_flags = {}
@@ -355,7 +375,7 @@ def run_worker(args) -> int:
             error = error or f"resource observation write failed: {write_error}"
     finish_round(task_dir, round_number, round_dir, task, state, outcome, code,
                  {"timedOut": timed_out, "cancelled": cancelled, "error": error,
-                  **resource_flags})
+                  "executionEvidence": execution_evidence, **resource_flags})
     try:
         record_phase_round(task, task_dir, round_number, round_dir, state, outcome)
     except Exception as exc:  # noqa: BLE001 - a phase-check error must still leave evidence

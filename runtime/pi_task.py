@@ -100,13 +100,15 @@ from pi_phase import (
 )
 from pi_summary import bounded, compact, read_meta, summarize
 from pi_supervisor import run_worker, spawn_worker
+from pi_execution import effective_execution
+from pi_recovery import adopt_runtime
 from pi_takeover import REVIEW_LIMIT
 
 
 HELPER_FILES = ("pi_task.py", "pi_core.py", "pi_evidence.py", "pi_phase.py", "pi_brief.py",
                 "pi_supervisor.py", "pi_summary.py", "pi_check.py", "pi_copy.py", "pi_size.py",
                 "pi_board.py", "pi_store.py", "pi_events.py", "pi_queue.py", "pi_takeover.py",
-                "pi_worker.ts", "VERSION")
+                "pi_execution.py", "pi_archive.py", "pi_recovery.py", "pi_worker.ts", "VERSION")
 
 
 def active_tasks(state: Path) -> list:
@@ -266,7 +268,8 @@ def _board_phase_info(task: dict) -> dict | None:
     task_id = task.get("task")
     if not isinstance(common, str):
         return None
-    board = read_json(Path(common) / "codex-pi" / "board.json", None)
+    from pi_store import read_board
+    board,_problem = read_board(Path(common) / "codex-pi" / "board.json")
     if not isinstance(board, dict):
         return None
     card = (board.get("cards") or {}).get(task_id)
@@ -540,6 +543,12 @@ def cmd_continue(args) -> dict:
                 time.sleep(0.05)
         if lock_is_held(task_dir / ".supervisor.lock"):
             raise ValueError("supervisor lease is still held; task is not terminal-known")
+        from pi_recovery import runtime_tools
+        selected_tools=runtime_tools(task_dir)
+        selected_version=(selected_tools/'VERSION').read_text().strip()
+        if selected_version!=runtime_version():
+            raise ValueError('the original runtime stays frozen; prepare adopt-runtime with the '
+                             'installed control CLI before continuing a recovered 0.6 task')
         paused, pause_reason = board_pause_active(frozen)
         if paused and pause_reason and pause_reason.startswith("Codex takeover required"):
             raise ValueError(pause_reason)
@@ -563,6 +572,10 @@ def cmd_continue(args) -> dict:
                 raise ValueError(f"round {value} raw log is missing; stale artifacts, inspect {candidate}")
         latest_number, latest_dir = rounds[-1]
         latest_state = read_json(latest_dir / "round.state.json", {})
+        effective,execution_evidence=effective_execution(latest_state,latest_dir/'round.jsonl')
+        if effective=='unknown':
+            raise ValueError('last assistant completion is unverified; inspect the preserved stream before retry')
+        latest_state=dict(latest_state,state=effective,executionEvidence=execution_evidence)
         busy = [name for name in active_tasks(state) if name != task]
         if len(busy) >= config["maxWorkers"]:
             raise ValueError(f"project maxWorkers={config['maxWorkers']} reached; active tasks: {busy}")
@@ -603,7 +616,7 @@ def cmd_continue(args) -> dict:
                 raise ValueError("phase budget is exhausted; the main session must accept, escalate "
                                  "or provide an explicit new phase contract revision instead of "
                                  "resetting the budget")
-            timeout_seconds = min(timeout_seconds, max(1.0, remaining))
+            timeout_seconds = min(timeout_seconds, remaining)
         prior = {"round": latest_number, "state": latest_state.get("state"),
                  "exitCode": latest_state.get("exitCode"), "endHead": latest_head}
         round_dir = ensure_round_inputs(task_dir, number, prompt, frozen, prior, installed_pi)
@@ -653,6 +666,8 @@ def evidence_paths(task_dir: Path, round_number: int | None) -> dict:
     if round_number is None:
         return result
     round_dir = task_dir / "rounds" / str(round_number)
+    from pi_recovery import round_tools
+    result['toolsDir']=str(round_tools(task_dir,round_number))
     result.update({"roundDir": str(round_dir), "brief": str(round_dir / "brief.md"),
                    "jsonl": str(round_dir / "round.jsonl"), "stderr": str(round_dir / "round.err"),
                    "meta": str(round_dir / "round.meta"), "state": str(round_dir / "round.state.json"),
@@ -680,6 +695,8 @@ def round_compact(task_dir: Path, number: int, round_dir: Path, task_held: bool,
                   supervisor_alive: bool, latest: bool) -> dict:
     state = read_json(round_dir / "round.state.json", {}) or {}
     got = effective_state(state, task_held, supervisor_alive, latest)
+    if got == "completed":
+        got, execution_evidence = effective_execution(state, round_dir / "round.jsonl")
     started = state.get("startedAt")
     ended = state.get("endedAt")
     return {"round": number, "state": got, "exitCode": state.get("exitCode"),
@@ -788,6 +805,9 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
         state = {}
     raw_state = state.get("state")
     effective = effective_state(state, task_held, supervisor_alive, selected_number == latest_number)
+    execution_evidence = state.get("executionEvidence")
+    if effective == "completed":
+        effective, execution_evidence = effective_execution(state, selected_dir / "round.jsonl")
     current_head, head_problem = None, None
     if raw_state in ACTIVE_STATES:
         frozen_worktree = frozen.get("worktree")
@@ -800,7 +820,9 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
     now = time.time()
     elapsed_ms = int(((ended if ended is not None else now) - started) * 1000) if started is not None else None
     timeout = _number(frozen.get("timeoutSeconds"))
-    deadline_at = started + timeout if started is not None and timeout is not None else None
+    deadline_at = _number(state.get('deadlineAt'))
+    if deadline_at is None:
+        deadline_at = started + timeout if started is not None and timeout is not None else None
     checks = _scan_checks(selected_dir / "round.checks")
     execution_activity = {}
     for label, name in (("roundJsonl", "round.jsonl"), ("roundErr", "round.err")):
@@ -897,14 +919,17 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
                                          selected_number)
         notes.append(f"phase contract state is {phase_problem}; phase readiness is unknown")
     progress = read_progress(selected_dir)
+    phase_deadline=((phase_info or {}).get('budget') or {}).get('deadlineAt')
+    if isinstance(phase_deadline,(int,float)) and not isinstance(phase_deadline,bool):
+        deadline_at=min(deadline_at,phase_deadline) if deadline_at is not None else phase_deadline
     return {
         "schemaVersion": 1, "task": task, "repo": frozen.get("repo") or str(root),
         "worktree": frozen.get("worktree"), "readOnly": bool(frozen.get("readOnly")),
         "model": frozen.get("model"), "thinking": frozen.get("thinking"),
-        "runtimeVersion": frozen.get("runtimeVersion"),
+        "runtimeVersion": frozen.get("runtimeVersion"), "roundRuntimeVersion": state.get('runtimeVersion'),
         "session": {"sessionId": frozen.get("sessionId"), "sessionDir": frozen.get("sessionDir")},
         "round": selected_number, "latestRound": latest_number,
-        "state": effective, "recordedState": raw_state,
+        "state": effective, "recordedState": raw_state, "executionEvidence": execution_evidence,
         "startedAt": started, "endedAt": ended, "elapsedMs": elapsed_ms, "deadlineAt": deadline_at,
         "exitCode": state.get("exitCode"), "timedOut": bool(state.get("timedOut")),
         "cancelled": bool(state.get("cancelled")),
@@ -989,7 +1014,8 @@ def build_result(repo_arg: str, task_arg: str, round_arg=None) -> dict:
         "usageComplete": bool(summary and summary.get("usage_complete")),
         "costUsd": (summary or {}).get("reported_cost_usd"),
         "checks": checks,
-        "final": ((summary or {}).get("final_excerpt") or "")[:COMPACT_FINAL_CHARS],
+        "final": ((summary or {}).get("final_excerpt") or "")[:COMPACT_FINAL_CHARS]
+        if selected_state["state"] == "completed" else "",
         "evidence": {"roundDir": evidence.get("roundDir"),
                      "summaryJson": evidence.get("summaryJson")},
         "notes": notes,
@@ -1148,6 +1174,12 @@ def build_parser() -> argparse.ArgumentParser:
     cont.add_argument("--contract-file", help="phase contract JSON; changing to a different phaseId "
                                                  "requires the previous phase to be accepted on the board")
     cont.set_defaults(func=cmd_continue)
+
+    adopt=sub.add_parser("adopt-runtime",help="prepare an immutable runtime for future 0.6 rounds; never resume")
+    add_repo_task(adopt)
+    adopt.add_argument("--dry-run",action="store_true")
+    adopt.set_defaults(func=lambda args:adopt_runtime(args.repo,args.task,HELPER_FILES,
+                                                     Path(__file__).parent,args.dry_run))
 
     result = sub.add_parser("result", help="bounded latest state and evidence pointers")
     add_repo_task(result)

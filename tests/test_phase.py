@@ -224,13 +224,13 @@ class PhaseTest(unittest.TestCase):
         return board_json("refresh", "--repo", str(repo.root), "--task", task, env=env)
 
     def card(self, repo: Repo, task: str) -> dict:
-        return json.loads((repo.state_dir / "board.json").read_text(encoding="utf-8"))["cards"][task]
+        return pi_store.read_board(repo.state_dir / "board.json")[0]["cards"][task]
 
     def phase_state(self, repo: Repo, task: str) -> dict:
         return json.loads((repo.task_dir(task) / "phase.state.json").read_text(encoding="utf-8"))
 
     def pending(self, repo: Repo, task: str, kind: str | None = None) -> list:
-        events = json.loads((repo.state_dir / "board.json").read_text(encoding="utf-8"))[
+        events = pi_store.read_board(repo.state_dir / "board.json")[0][
             "cards"][task]["events"]
         return [event for event in events
                 if not event.get("handled") and (kind is None or event.get("kind") == kind)]
@@ -349,7 +349,7 @@ class PhaseTest(unittest.TestCase):
             self.assertEqual(self.pending(repo, "progress-task"), [])
             self.assertFalse(self.fake_marker.exists(),
                              "ordinary progress must never invoke the queue CLI")
-            revision = json.loads((repo.state_dir / "board.json").read_text(encoding="utf-8"))["revision"]
+            revision = pi_store.read_board(repo.state_dir / "board.json")[0]["revision"]
             # A repairing update with evidence is a real milestone; it stays on
             # the board ledger only (never queued), and repeating the identical
             # write adds nothing. Refresh itself never dispatches.
@@ -357,7 +357,7 @@ class PhaseTest(unittest.TestCase):
                     "--activity", "repairing", "--next", "retry the check", "--blocker", "",
                     env=env, expect=0)
             self.refresh(repo, "progress-task", env)
-            self.assertGreater(json.loads((repo.state_dir / "board.json").read_text(encoding="utf-8"))["revision"],
+            self.assertGreater(pi_store.read_board(repo.state_dir / "board.json")[0]["revision"],
                                revision)
             self.assertEqual(self.pending(repo, "progress-task", "progress_update"), [])
             ledger = next(iter(self.card(repo, "progress-task")["notify"]["phases"].values()))
@@ -604,7 +604,7 @@ class PhaseTest(unittest.TestCase):
             self.refresh(repo, "local-timeout", env)
             self.refresh(repo, "local-timeout", env)
             kinds = {event["kind"] for event in
-                     json.loads((repo.state_dir / "board.json").read_text(encoding="utf-8"))[
+                     pi_store.read_board(repo.state_dir / "board.json")[0][
                          "cards"]["local-timeout"]["events"] if not event.get("handled")}
             self.assertEqual(kinds, set(), "a running self-repairable timeout must not wake GPT")
             self.assertFalse(self.fake_marker.exists(),
@@ -628,7 +628,7 @@ class PhaseTest(unittest.TestCase):
         self.register(repo, "fail-task", env)
         self.refresh(repo, "fail-task", env)
         self.assertEqual(self.pending(repo, "fail-task", "review_required"), [])
-        blocked = self.pending(repo, "fail-task", "phase_blocked")
+        blocked = self.pending(repo, "fail-task", "execution_failed")
         self.assertEqual(len(blocked), 1)
         self.assertEqual(blocked[0]["evidence"]["reason"], "round_execution_failed")
 
@@ -1343,11 +1343,10 @@ class PhaseTest(unittest.TestCase):
                          "superseded")
 
         # Unchanged repeated refreshes stay idempotent.
-        revision = json.loads((repo.state_dir / "board.json").read_text(encoding="utf-8"))["revision"]
+        revision = pi_store.read_board(repo.state_dir / "board.json")[0]["revision"]
         self.refresh(repo, task, env)
         self.assertEqual(len(self.pending(repo, task, "review_required")), 1)
-        self.assertEqual(json.loads((repo.state_dir / "board.json").read_text(
-            encoding="utf-8"))["revision"], revision)
+        self.assertEqual(pi_store.read_board(repo.state_dir / "board.json")[0]["revision"], revision)
 
         # The superseded event can never bind an accept; the renewed one can.
         run_board("decide", "--repo", str(repo.root), "--task", task,
@@ -1440,7 +1439,7 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(readiness["resource"]["status"], "breached")
         self.assertIn("resource", readiness["readinessReason"])
         self.refresh(repo, "res-breach", env)
-        blocked = self.pending(repo, "res-breach", "phase_blocked")
+        blocked = self.pending(repo, "res-breach", "execution_failed")
         self.assertEqual(len(blocked), 1)
         self.assertEqual(blocked[0]["evidence"]["reason"], "resource_breached")
         limit = blocked[0]["evidence"]["resource"]["limits"][0]
@@ -1476,7 +1475,7 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(readiness["status"], "not_ready")
         self.assertEqual(readiness["resource"]["status"], "escalated")
         self.refresh(repo, "res-unknown", env)
-        blocked = self.pending(repo, "res-unknown", "phase_blocked")
+        blocked = self.pending(repo, "res-unknown", "execution_failed")
         self.assertEqual(len(blocked), 1)
         self.assertEqual(blocked[0]["evidence"]["reason"], "resource_unknown")
 

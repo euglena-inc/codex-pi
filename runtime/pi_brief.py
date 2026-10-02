@@ -32,6 +32,8 @@ MUST_ASK_LINE = ("If the brief leaves a must-ask item open (see task packet), ch
 def compose_brief(task: dict, round_number: int, prompt: str, prior: dict | None) -> str:
     """The user prompt plus a fixed short header; the contract lives in the system prompt."""
     task_dir = Path(task["taskDir"])
+    from pi_recovery import runtime_tools
+    tools_dir = runtime_tools(task_dir)
     round_dir = task_dir / "rounds" / str(round_number)
     lines = ["---", "## Codex-Pi round header",
              f"task={task['task']} round={round_number}",
@@ -41,7 +43,7 @@ def compose_brief(task: dict, round_number: int, prompt: str, prior: dict | None
     if round_number > 1:
         lines.append(f"Round-1 brief: {task_dir / 'rounds' / '1' / 'brief.md'}")
     lines += ["Use the native tools `check` (recorded checks), `progress` and `readiness`.",
-              f'Only "{task_dir / "tools"}" and "{round_dir / "round.checks"}" may be written '
+              f'Only "{tools_dir}" and "{round_dir / "round.checks"}" may be written '
               "outside the worktree.",
               FORBIDDEN_RULE_TEXT]
     if prior:
@@ -68,6 +70,8 @@ def compose_contract(task: dict) -> str:
     read_only = bool(task["readOnly"])
     tools = READ_ONLY_TOOLS if read_only else WRITABLE_TOOLS
     task_dir = Path(task["taskDir"])
+    from pi_recovery import runtime_tools
+    tools_dir = runtime_tools(task_dir)
     lines = ["## Codex-Pi worker contract",
              "Do not execute the Codex CLI (`codex`), launch any Codex agent, or call an OpenAI "
              "model through Codex. The Codex main session reviews outcomes; this Pi session "
@@ -133,7 +137,7 @@ def compose_contract(task: dict) -> str:
         "- readiness(): read-only delivery check of the contract against the receipts.",
         "Every bash call has a finite timeout (a default is filled in and a ceiling clamps larger "
         "values). Close fixtures with try/finally; a catch-and-print is not verification.",
-        f'Only "{task_dir / "tools"}" and this round\'s checks directory may be written outside '
+        f'Only "{tools_dir}" and this round\'s checks directory may be written outside '
         "the worktree.",
         FORBIDDEN_RULE_TEXT,
         MUST_ASK_LINE,
@@ -158,7 +162,10 @@ WORKER_CONFIG_FILE = "worker.json"
 def write_worker_config(task_dir: Path, round_number: int, task: dict, contract_text: str) -> Path:
     """Write ``rounds/N/worker.json`` for the in-process worker extension."""
     round_dir = task_dir / "rounds" / str(round_number)
+    from pi_recovery import runtime_tools
+    tools_dir = runtime_tools(task_dir)
     forbidden, allowed = forbidden_checkouts(Path(task["worktree"]), task_dir, round_number)
+    allowed = [str(tools_dir) if root == str(task_dir / "tools") else root for root in allowed]
     phase_record, _problem = read_phase_record(task_dir)
     phase = isinstance(phase_record, dict)
     ceiling = BASH_CEILING_SECONDS
@@ -174,7 +181,7 @@ def write_worker_config(task_dir: Path, round_number: int, task: dict, contract_
         "bashDefaultTimeoutSeconds": min(BASH_DEFAULT_TIMEOUT_SECONDS, ceiling),
         "bashCeilingSeconds": ceiling,
         "checkTimeoutSeconds": check_timeout_seconds(task, phase_record),
-        "checksDir": str(round_dir / "round.checks"), "toolsDir": str(task_dir / "tools"),
+        "checksDir": str(round_dir / "round.checks"), "toolsDir": str(tools_dir),
         "python": sys.executable, "phase": phase,
         "settleQuotaPath": str(settle_quota_path(
             task_dir, (phase_record.get("contract") or {}).get("phaseId"))) if phase else None,

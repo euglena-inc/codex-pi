@@ -78,11 +78,20 @@ def review_policy(card: dict) -> dict:
     task_key = "task:" + str(card.get("taskId"))
     codex = card.get("codex") if isinstance(card.get("codex"), dict) else {}
     latch = codex.get("takeover")
-    latched = isinstance(latch, dict) and bool(latch.get("required"))
-    limit = REVIEW_LIMIT
-    failed, rounds = [], set()
+    seed = getattr(card, "policy_base", None)
+    latched = (isinstance(latch, dict) and bool(latch.get("required"))) or bool(
+        isinstance(seed,dict) and seed.get("takeoverRequired"))
+    pin = card.get("reviewPolicyPin") or {}
+    limit = (seed or {}).get("limit") or pin.get("qualityFailureLimit") or (
+        latch.get("limit") if isinstance(latch,dict) else None) or REVIEW_LIMIT
+    if isinstance(limit,bool) or not isinstance(limit,int) or limit not in (1,2,3):
+        raise ValueError("invalid frozen historical review limit")
+    failed = list((seed or {}).get("failedReports") or [])
+    rounds = {r.get("round") for r in failed}
     for record in sorted(_records(card).values(),
                          key=lambda row: (row.get("at") or 0, row.get("eventId") or "")):
+        if seed is not None and record == card.baseline_decisions.get(record.get("eventId")):
+            continue
         kind = record.get("eventKind")
         if kind not in DELIVERY_KINDS and not (kind is None and record.get("phaseId")):
             continue
@@ -108,8 +117,8 @@ def review_policy(card: dict) -> dict:
                        "at": record.get("at")})
     required = bool(latched) or len(failed) >= limit
     replan_required = bool(failed) and not required
-    if latched and not failed and isinstance(latch.get("failedReports"), list):
-        reports = list(latch.get("failedReports"))
+    if latched and not failed:
+        reports = list((latch or {}).get("failedReports") or (seed or {}).get('failedReports') or [])
     else:
         reports = failed[-limit:]
     outcome = None
@@ -117,8 +126,10 @@ def review_policy(card: dict) -> dict:
         last = failed[-1]
         outcome = {key: last.get(key) for key in ("phaseId", "contractHash", "round",
                                                   "eventId", "at")}
-    elif latched and isinstance(latch.get("outcome"), dict):
+    elif latched and isinstance(latch,dict) and isinstance(latch.get("outcome"), dict):
         outcome = dict(latch["outcome"])
+    elif latched:
+        outcome=(seed or {}).get('outcome')
     failed_count = max(len(failed), limit) if latched else len(failed)
     if required:
         reason = (f"quality-failure limit {limit} reached with {failed_count} distinct "

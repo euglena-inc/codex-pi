@@ -197,11 +197,12 @@ class BoardTest(unittest.TestCase):
         return json.loads(proc.stdout)
 
     def read_board(self, repo) -> dict:
-        return json.loads((repo.state_dir / "board.json").read_text(encoding="utf-8"))
+        return pi_store.read_board(repo.state_dir / "board.json")[0]
 
     def read_queue(self, repo) -> dict:
         path = repo.state_dir / "board.queue.json"
-        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"tasks": {}}
+        queue,_problem=pi_queue.read_queue(repo.state_dir / "board.json")
+        return {"schemaVersion":queue["schemaVersion"],"tasks":{k:dict(v,claims=dict(v.get("claims") or {})) for k,v in queue["tasks"].items()}}
 
     def card(self, repo, task: str) -> dict:
         return self.read_board(repo)["cards"][task]

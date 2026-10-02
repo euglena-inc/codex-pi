@@ -398,7 +398,8 @@ def board_pause_active(task: dict):
     board_path = Path(common) / "codex-pi" / "board.json"
     if not board_path.exists():
         return False, None
-    board = read_json(board_path, None)
+    from pi_store import read_board
+    board,problem = read_board(board_path)
     if not isinstance(board, dict):
         return True, "board state is unreadable"
     card = (board.get("cards") or {}).get(task_id)

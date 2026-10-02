@@ -18,6 +18,7 @@ import sys
 sys.dont_write_bytecode = True
 
 from pi_size import sanitize_snapshot
+from pi_execution import terminal_evidence
 
 RISKY = [
     (r"\bgit\s+push\b", "git push"), (r"\bgit\s+stash\b", "git stash"),
@@ -143,7 +144,9 @@ def summarize(log: Path, worktree: Path, run_dir: Path | None = None,
     full_usage = bool(assistant_messages) and all(usage_samples[k] == assistant_messages
                                                 for k in USAGE_KEYS[:-1])
     check_dir = checks_dir or (run_dir / (log.stem.replace("round-", "checks-") if log.stem.startswith("round-") else "checks"))
-    return {"schema_version": 1, "source": str(log.resolve()), "source_bytes": log.stat().st_size if log.exists() else 0,
+    terminal = terminal_evidence(log)
+    final = terminal.get("finalText") or ""
+    return {"schema_version": 1, "execution_evidence": terminal, "source": str(log.resolve()), "source_bytes": log.stat().st_size if log.exists() else 0,
             "turns": turns, "assistant_messages": assistant_messages, "models": dict(models),
             "expected_model": expected_model, "model_check": model_check,
             "usage": usage, "usage_complete": full_usage,

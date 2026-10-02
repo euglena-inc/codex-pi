@@ -123,6 +123,14 @@ def main() -> int:
         time.sleep(600)
         return 0
     write_ready()
+    if mode == "connection-error":
+        emit_success("earlier answer must not become the final delivery")
+        emit({"type": "message_end", "message": {
+            "role": "assistant", "provider": "deepseek", "model": "deepseek-flash",
+            "stopReason": "error", "errorMessage": "Connection error.", "content": []}})
+        emit({"type": "turn_end"})
+        emit({"type": "agent_end", "messages": []})
+        return 0
     if mode == "fail":
         provider, model = reported_model()
         emit({"type": "turn_start"})

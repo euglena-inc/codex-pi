@@ -175,6 +175,14 @@ def read_board(path):
     data, problem = _read_bounded_json(path, MAX_BOARD_BYTES)
     if problem is not None:
         return None, problem
+    if isinstance(data,dict) and data.get("schemaVersion") == 2:
+        if data.get("storage") != "sqlite" or data.get("storeFile") != "board.store.sqlite3":
+            return None,"invalid stored board marker"
+        try:
+            from pi_archive import read_store
+            return read_store(path),None
+        except (ValueError,OSError) as exc:
+            return None,str(exc)
     problem = validate_board(data)
     if problem:
         return None, problem
@@ -185,27 +193,16 @@ def _serialized(board) -> bytes:
     return (json.dumps(board, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 
-def _shrink_handled(board) -> None:
-    """Aggressive handled-history pruning only; never touches unhandled work."""
-    for card in (board.get("cards") or {}).values():
-        if not isinstance(card, dict):
-            continue
-        card["events"] = [event for event in card.get("events", [])
-                          if isinstance(event, dict) and not event.get("handled")]
-        handled = card.get("handled")
-        if isinstance(handled, dict) and len(handled) > MAX_HANDLED_IDS:
-            ordered = sorted(handled.items(), key=lambda item: (item[1] or {}).get("at") or 0)
-            card["handled"] = dict(ordered[-MAX_HANDLED_IDS:])
-
-
 def _write_board(board_file, board) -> None:
     """Refuse a write that would exceed the bounded snapshot; never drop pending."""
+    if board.get("schemaVersion") == 2:
+        from pi_archive import write_store
+        write_store(board_file,board)
+        return
     if len(_serialized(board)) > MAX_BOARD_BYTES:
-        _shrink_handled(board)
-        if len(_serialized(board)) > MAX_BOARD_BYTES:
-            raise BoardOverflow(
-                f"board snapshot would exceed MAX_BOARD_BYTES={MAX_BOARD_BYTES}; refusing the "
-                f"write instead of silently dropping unhandled events or decisions: {board_file}")
+        raise BoardOverflow(
+            f"legacy board would exceed MAX_BOARD_BYTES={MAX_BOARD_BYTES}; use the explicit "
+            f"writer-free recover-store command, never discard pending events or decisions: {board_file}")
     atomic(board_file, board)
 
 

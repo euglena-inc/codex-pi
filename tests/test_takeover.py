@@ -31,6 +31,7 @@ import pi_board
 import pi_events
 import pi_core
 import pi_task
+import pi_store
 from pi_takeover import REVIEW_LIMIT, review_policy
 
 
@@ -273,7 +274,7 @@ class TakeoverLifecycleTest(unittest.TestCase):
                          "--event-id", event_id, "--decision", decision, *extra, env=self.env)
 
     def board_card(self, task):
-        return json.loads((self.repo.state_dir / "board.json").read_text())["cards"][task]
+        return pi_store.read_board(self.repo.state_dir / "board.json")[0]["cards"][task]
 
     def review_event(self, task, number=None, kind="review_required"):
         events = [event for event in self.board_card(task)["events"] if event["kind"] == kind
@@ -389,7 +390,7 @@ class MissingEvidencePolicyTest(unittest.TestCase):
         self.env = base_env(CODEX_PI_HANDOFF_ROOT=str(self.tmp / "handoff"))
 
     def pending_blocked(self, task):
-        raw = json.loads((self.repo.state_dir / "board.json").read_text())["cards"][task]
+        raw = pi_store.read_board(self.repo.state_dir / "board.json")[0]["cards"][task]
         return [event for event in raw["events"] if event["kind"] == "phase_blocked"
                 and not event["handled"]]
 
@@ -405,7 +406,7 @@ class MissingEvidencePolicyTest(unittest.TestCase):
         board_cli("register", "--repo", self.repo.root, "--task", "missing-receipt",
                   "--transport", "offline", env=self.env)
         board_cli("refresh", "--repo", self.repo.root, "--task", "missing-receipt", env=self.env)
-        raw = json.loads((self.repo.state_dir / "board.json").read_text())[
+        raw = pi_store.read_board(self.repo.state_dir / "board.json")[0][
             "cards"]["missing-receipt"]
         shown = board_cli("show", "--repo", self.repo.root, "--task", "missing-receipt",
                           env=self.env)["cards"][0]

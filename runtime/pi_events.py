@@ -8,6 +8,7 @@ import hashlib
 import os
 import shlex
 import time
+from itertools import islice
 from pathlib import Path
 
 from pi_core import ACTIVE_STATES, TERMINAL_STATES
@@ -69,7 +70,8 @@ def find_event(card: dict, event_id: str):
     for event in card.get("events", []):
         if isinstance(event, dict) and event.get("id") == event_id:
             return event
-    return None
+    lookup=getattr(card,"lookup_event",None)
+    return lookup(event_id) if lookup else None
 
 
 def pending_events(card: dict) -> list:
@@ -79,19 +81,21 @@ def pending_events(card: dict) -> list:
 
 def _prune_events(card: dict) -> None:
     """Prune handled history only; unhandled events are never discarded."""
+    if hasattr(card,"policy_base"):
+        # The store persists every loaded/new event; only the next read window
+        # is bounded, never its durable records.
+        return
     events = [event for event in card.get("events", []) if isinstance(event, dict)]
     handled_map = card.setdefault("handled", {})
     handled = [event for event in events if event.get("handled")]
     for event in handled:
-        handled_map.setdefault(event.get("id"), {
+        handled_map[event['id']] = {**handled_map.get(event['id'],{}),**event,
             "at": event.get("handledAt") or 0, "decision": event.get("decision"),
-            "reviewedHead": event.get("reviewedHead"), "round": event.get("round")})
+            "eventKind":event.get('kind'),
+            "reviewedHead": event.get("reviewedHead"), "round": event.get("round")}
     unhandled = [event for event in events if not event.get("handled")]
     keep_handled = handled[-MAX_HANDLED_EVENTS:]
     card["events"] = sorted(unhandled + keep_handled, key=lambda event: event.get("seq") or 0)
-    if len(handled_map) > MAX_HANDLED_IDS:
-        ordered = sorted(handled_map.items(), key=lambda item: (item[1] or {}).get("at") or 0)
-        card["handled"] = dict(ordered[-MAX_HANDLED_IDS:])
 
 
 def _update_overflow(card: dict, now: float) -> None:
@@ -476,7 +480,17 @@ def _project_phase_events(card: dict, status: dict, now: float) -> list:
             "Decide whether to repair, cancel or extend the deadline; the round state is exact "
             "evidence.",
             {"receiptRef": _receipt_ref(checks, latest)})
-    if state in TERMINAL_STATES:
+    if state != "completed" and (status.get("executionEvidence") or {}).get("status") in ("failed", "unknown"):
+        _supersede_phase_kinds(card,now,("review_required","phase_blocked"))
+        fault = status["executionEvidence"]
+        add("execution_failed", f"execution:{fault.get('reason')}:{fault.get('tailSha256')}",
+            f"round {status.get('round')} execution incomplete: {fault.get('error')}",
+            "Resolve the execution incident separately from quality review. Inspect the preserved "
+            "stream; any authorized retry uses the same session, worktree and remaining budget.",
+            {"executionEvidence": fault,"reason":_phase_blocked_reason(readiness,status),
+             "resource":resource_evidence or None,"coverage":readiness.get('coverage'),
+             "gaps":readiness.get('gaps')})
+    elif state in TERMINAL_STATES:
         if readiness.get("status") == "ready" and state == "completed":
             _supersede_phase_kinds(card, now, ("phase_blocked",))
             event = add(
@@ -812,7 +826,7 @@ def _notify_view(card: dict):
     return {phase_id: {"count": entry.get("count"), "lastAt": entry.get("lastAt"),
                        "milestones": len(entry.get("milestones") or {}),
                        "abnormal": len(entry.get("abnormal") or {})}
-            for phase_id, entry in list(phases.items())[:5] if isinstance(entry, dict)}
+            for phase_id, entry in islice(phases.items(),5) if isinstance(entry, dict)}
 
 
 def project_events(card: dict, status: dict, now: float) -> list:
@@ -873,7 +887,16 @@ def _project_brief_only_events(card: dict, status: dict, now: float) -> list:
             {"guardPath": breach.get("path"), "observedBytes": breach.get("observedBytes"),
              "maxBytes": breach.get("maxBytes"), "source": breach.get("source"),
              "breachBasis": breach.get("breachBasis")})
-    if recorded in TERMINAL_STATES and state != "unknown":
+    fault = status.get("executionEvidence") or {}
+    if fault.get("status") in ("failed", "unknown"):
+        for old in pending_events(card):
+            if old.get("kind")=="review_required" and old.get("round")==status.get("round"):
+                _mark_superseded(card,old,now)
+        add("execution_failed", f"execution:{fault.get('reason')}:{fault.get('tailSha256')}",
+            f"round {status.get('round')} execution incomplete: {fault.get('error')}",
+            "Resolve the execution incident, not a quality delivery. Any authorized retry keeps "
+            "the same session, worktree and remaining deadline.", {"executionEvidence": fault})
+    elif recorded in TERMINAL_STATES and state != "unknown":
         add("review_required", f"{state}:{head}:{status.get('exitCode')}",
             f"round {status.get('round')} reached terminal state {state}",
             "Review the candidate and exact check receipts; accept or request changes. "

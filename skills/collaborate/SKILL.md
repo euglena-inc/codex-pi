@@ -45,13 +45,13 @@ The supervisor refreshes the board locally; unchanged state and ordinary progres
 
 ## Review and retain evidence
 
-A card is execution evidence, not a goal or acceptance. Read its task, round and event id, call `result` once, then inspect only the relevant diff, receipts and original evidence. Require the exact full candidate commit and the project's real checks; exit 0, summaries and model claims are insufficient.
+A card is execution evidence, not a goal or acceptance. Read its task, round and event id, call `result` once, then inspect only the relevant diff, receipts and original evidence. Require the exact full candidate commit and the project's real checks; exit 0, summaries and model claims are insufficient. `execution_failed` denotes incomplete execution (including exit-zero provider errors), not a quality delivery; resolve its incident without inventing a rejection or resetting usage. Explicit recovery/adoption preserves originals, owner, session, worktree, pinned policy and deadline ([commands](references/runtime.md)).
 
 On a material defect, trace reachable entries and state boundaries, name the shared cause, and classify related paths as reproduced, reachable but unverified, or excluded with a reason. Give the same Pi session one consolidated brief (reproduction, repair scope, affected checks, unknowns, downstream effect). Never infer a defect from a missing test. An active round keeps its immutable brief. Record the decision for the exact event with `decide`; keep failed attempts, logs and usage. Delivery, handling and acceptance are separate states.
 
 ## Two complete deliveries, then takeover
 
-A delivery is a completed report reviewed by the main task, not a tool call, red test, progress echo or round number. Every task allows **two complete Pi deliveries**. Revisions, renames, pause/resume, retries and config edits cannot raise it.
+A delivery is a completed report reviewed by the main task, not a tool call, red test, progress echo or round number. New tasks allow **two complete Pi deliveries**; retained historical pins and reached takeovers are preserved. Revisions, renames, pause/resume, retries and config edits cannot raise a pin.
 
 - Count one exact main decision per distinct round on a `review_required`/`phase_blocked` event decided `changes_requested` or `reject` with `--failure-kind quality` (the default). Duplicates, Pi's red tests, routine repairs, progress and the single in-round settle continuation never count. Only a genuine missing external prerequisite uses `--failure-kind external --note` naming the evidence and unlock condition; implementation or evidence defects are never external.
 - `reviewPolicy` (`limit`, `failedDeliveries`, `implementationOwner`, `reason`, `instruction`) derives from the exact decisions. After the first quality failure, finish the whole-task analysis and refine the route before the second delivery. At the limit the board emits `codex_takeover_required` and Pi implementation is refused; pause/resume and later acceptance cannot clear it. Acceptance before the limit starts a fresh count for the next phase; renaming never resets.
