@@ -47,9 +47,17 @@ test -r "$RETAINED/report.json"      # the probe process has already exited
 - `tests/test_codemode.py` 用合成 round 事件流验证：顶层与嵌套调用计数各一次、嵌套 bash 的退出观测保留、嵌套工具 usage 不叠加到 assistant usage、失败与取消不制造假的成功。
 - 既有 `tests/test_archive.py` 的采用测试继续验证采用不改 task/session/helpers；探针另外验证原生 resume 保留成功写入。
 
-## 限制
+## 主会话最终验收
+
+2026-10-03，主会话核对了最终候选的三项不可变回执：完整 Python 回归 300 项通过、真实 Pi/QuickJS 探针 9 项通过，均无跳过；隐私扫描退出 0、零发现，扫描文件数不作为测试数。回执的候选 HEAD、干净工作树和日志 SHA-256 均已核验。
+
+另外以候选 0.7.0 冻结运行时、Pi 1.0.0 和项目配置的 `deepseek/deepseek-flash` / `max` 运行了独立、三分钟限额的真实 worker 冒烟任务。原始事件确认两次 codemode 调用：第一次嵌套写入及读回固定字节文件，并观察 `typeof models` 为 `undefined`；第二次在提交后嵌套调用 `check`，固定字节断言与十秒等待成功，返回结构化成功结果和绑定该提交的回执。所有 writer 释放后，交付卡实际抵达原桌面聊天并由主会话审查接受。
+
+冒烟文件只留在独立验证工作树，没有整合进插件源码。实施候选经审查接受后整合到主分支，整合后的文件树与已验证候选一致；本节为后续文档补充。原始会话和回执保留在私有证据目录。未做对照性能实验，不声称固定 token 或时间降幅。
+
+## 验证边界
 
 - 守卫仍是工具边界上的路径 token 检查，不是 OS 沙箱；`bash` 保留本机能力，运行期拼出的路径不可见。
-- 探针的 provider 是本地脚本化输入，不能证明任意付费 provider 行为；主会话的真实 worker 冒烟与桌面投递需要单独执行。
-- 探针不验证桌面 queue 投递、hook 信任、发布或安装；这些边界保持未改动。
+- 探针的 provider 是本地脚本化输入；上述真实 worker 验证只覆盖本次配置的 provider，不证明所有 provider 行为。
+- 桌面 queue 投递由独立冒烟验证；未重新安装插件、发布或修改 hook 信任。
 - 未决：无。设计 API（Pi 1.0.0 `createCodemodeExtension`、嵌套 `parentToolCallId`、结构化结果）与实现一致。
