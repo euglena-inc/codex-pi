@@ -79,6 +79,61 @@ Frozen helper snapshots of existing tasks are untouched, because they run from t
 
 The runtime records those stdout byte counts in an append-only `codex-io.jsonl` under the task directory, as size only, never content. This makes "fewer Codex tokens" measurable between releases. It does not claim a saving without comparable runs.
 
+## Step 5 · In-process worker extension (Pi ≥ 1.0.0)
+
+Authorized on 2026-10-02 together with a real Pi validation. The machine runs a single Pi, 1.0.0. Verified Pi 1.0.0 facts:
+
+- `--no-extensions` still loads explicit `-e <path>` files.
+- A `tool_call` handler can block a call with `{block, reason}` or mutate its input. If the handler throws, the call is blocked.
+- `registerTool` returns structured results with `isError`.
+- `agent_before_settle` can return `{continue: true}` together with entries.
+- `before_agent_start` can adjust system prompt sections.
+- The bash tool accepts an optional `timeout`.
+- `--no-approve` skips project `.pi` resources in non-interactive runs.
+
+1. **Ship and freeze.** Add `runtime/pi_worker.ts`. It has no dependencies; it uses type-only imports from the host package and Node built-ins. Freeze it into `tools/` with the other helpers. The launch argv becomes `pi -p --mode json --no-extensions --no-approve -e <tools>/pi_worker.ts …` and keeps the existing flags.
+2. **Per-round config.** Before launch, the runtime writes `rounds/N/worker.json` and passes its path in `CODEX_PI_WORKER_CONFIG`. The file holds:
+   - task and round;
+   - the worktree;
+   - the forbidden roots and allowed roots computed in Step 2;
+   - the default bash timeout and its ceiling (Step 2 values);
+   - the checks dir and the tools dir;
+   - the Python executable;
+   - the phase flag;
+   - the persisted auto-continue quota path;
+   - the contract text.
+3. **Load proof.** On load, the extension atomically writes `rounds/N/worker.ready` containing `{piVersion, pid, at}`. The round fails with `WORKER_EXTENSION_NOT_LOADED` and is never treated as ready in either of two cases: the round ends without the marker, or a tool execution appears in the JSON stream before the marker. Any guard decision the extension cannot make blocks the call. It never allows by default.
+4. **`tool_call` guard.**
+   - `read`, `write`, `edit` and every path token of a `bash` command are resolved with the same rules as Step 2's `forbidden_reference` (realpath, relative to the worktree, allowed roots win).
+   - A forbidden path is blocked with this reason: `forbidden-path: <path> is outside this task's worktree <worktree>; work only inside it`.
+   - A `write`/`edit` outside the allowed roots is also blocked, with `outside-worktree`. A `read` outside the allowed roots that is not forbidden is allowed.
+   - A bash call without `timeout` gets the default; a larger value is clamped to the ceiling.
+   - Each block is appended to `rounds/N/worker-blocks.jsonl` as `{at, tool, rule, path}`.
+   - The Step 2 command guard and summary flags stay as the second line of defence.
+5. **Native tools.**
+   - `check(id, command, timeoutSeconds?, watchPath?, maxBytes?)` runs the frozen `pi_check.py` with the same arguments, so receipts are byte-compatible. It returns the receipt summary plus `log_tail`, and sets `isError` when the exit is nonzero, the check timed out or it was cancelled.
+   - `progress(...)` and `readiness()` call the frozen `pi_task.py` subcommands.
+   - The brief no longer prints long helper command templates. It names these tools.
+6. **Settle check.** In a phase task, `agent_before_settle` runs `readiness`. It returns `continue: true` with an entry listing the missing items only when all of these hold:
+   - every gap is missing evidence (not a failure or a design question);
+   - the existing persisted per-phase auto-continue quota is unused, in which case it consumes the quota.
+
+   The supervisor's post-round auto-continue reads the same quota, so the two together never exceed one continuation per phase.
+7. **Contract in the system prompt.** `before_agent_start` appends the worker contract (from `worker.json`) as a system prompt section on every run of the session. Every round's brief file becomes the user prompt plus the Step 2 short header. `contract.md` is still written each round.
+8. **Version gate.** `start` and `continue` refuse when `pi --version` is below 1.0.0 or cannot be read. The version is frozen in `task.json` as `piVersion`, and the actual version is recorded in each `round.meta`.
+9. **Tests.**
+   - Python tests drive the extension through Node: Node 22.18+/24 strips TypeScript types natively, with a fake `ExtensionAPI` harness in `tests/doubles/`.
+   - They cover: blocking with a reason for forbidden paths, including symlink aliases; allowing inside the worktree; blocking outside-worktree writes; filling and clamping the bash timeout; fail-closed on handler errors; `check` receipt compatibility and `isError`; settle continuing once and then not; the shared quota with the supervisor; the load-marker failure path; the version gate.
+   - The suite fails rather than skips when `node` is missing from `PATH`.
+10. **Real validation (main session, after acceptance).**
+    - Run one tiny real round with the pinned model in a synthetic temp repository that has a main checkout and a task worktree.
+    - The brief asks Pi to (a) `cat` a file in the main checkout, (b) write and commit one file in its worktree, and (c) run the `check` tool on a passing command and on a failing one.
+    - Expected results:
+      - the JSON stream shows the forbidden-path reason as a tool result;
+      - `worker.ready` exists;
+      - the receipts exist and the failing check returns `log_tail` with `isError`;
+      - the commit exists only in the worktree.
+
 ## Release
 
 Version 0.6.0. README, plugin manifest and IMPLEMENTATION.md are updated to match. The full suite and `scripts/check_public_privacy.py` pass. No push, no install, no cache edits. Desktop queue delivery after these changes needs its own real validation (README "Fast acceptance") before it is installed.
