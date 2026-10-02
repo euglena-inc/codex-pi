@@ -785,7 +785,10 @@ def _phase_projection(card: dict, status: dict, now: float):
         state = "rejected"
     elif readiness.get("status") == "ready" and status.get("state") == "completed":
         state = "review_ready"
-    elif auto.get("status") == "started":
+    elif (auto.get("status") == "started"
+          and isinstance(auto.get("round"), int)
+          and isinstance(status.get("round"), int)
+          and auto["round"] > status["round"]):
         state = "continuing"
     elif status.get("state") in ACTIVE_STATES:
         state = "executing"
@@ -1066,7 +1069,10 @@ def _project_phase_events(card: dict, status: dict, now: float) -> list:
                  "phaseId": phase_id, "contractHash": contract_hash})
             if event is not None:
                 card["phase"] = dict(card.get("phase") or {}, reviewEventId=event["id"])
-        elif auto.get("status") == "started":
+        elif (auto.get("status") == "started"
+          and isinstance(auto.get("round"), int)
+          and isinstance(status.get("round"), int)
+          and auto["round"] > status["round"]):
             # Local same-phase continuation owns the terminal round; no GPT wake-up.
             pass
         else:
