@@ -1,8 +1,16 @@
-"""Pinned review-limit policy: default one, explicit two, legacy three.
+"""Two complete deliveries, whole-task replan, then takeover.
 
-Every case runs against a temporary Git repository. The direct cases publish
-real board events and call the real ``pi_board.decide`` authority; the lifecycle
-cases start/continue the real CLI with the offline Pi double and real board
+New tasks pin two complete Pi deliveries. The first reviewed quality failure
+requires the same Codex main session to reassess the whole outcome and remaining
+plan and to record the repair in the existing design plus the next immutable
+brief; the second failure latches takeover for that same main session. Historical
+pins stay frozen: one keeps taking over after the first failure, two counts the
+same two failures, and an unpinned legacy task keeps the former limit of three.
+No plan schema, heading parser or model judge exists in the runtime.
+
+Every case runs against a temporary Git repository. The direct cases publish real
+board events and call the real ``pi_board.decide`` authority; the lifecycle cases
+start/continue the real CLI with the offline Pi double and real board
 registration. No model, network or real Codex queue is invoked.
 """
 from __future__ import annotations
@@ -24,7 +32,8 @@ sys.path.insert(0, str(RUNTIME))
 import pi_board
 import pi_task
 from pi_takeover import (EXPLICIT_REVIEW_LIMITS, LEGACY_FAILED_DELIVERY_LIMIT,
-                         NEW_TASK_DEFAULT_LIMIT, normalize_review_limit, review_policy)
+                         NEW_TASK_DEFAULT_LIMIT, NEW_TASK_REVIEW_LIMITS,
+                         normalize_review_limit, review_policy)
 
 
 def board_cli(*args, env: dict, expect: int = 0, timeout: float = 60):
@@ -108,66 +117,70 @@ class TakeoverPolicyTest(unittest.TestCase):
                 if event["kind"] == "codex_takeover_required"]
 
     # ------------------------------------------------------------------
-    # default one / explicit two / legacy three
+    # two complete deliveries / historical one / legacy three
     # ------------------------------------------------------------------
-    def test_default_one_failure_takes_over_and_stays_taken_over(self):
-        self.new_card(review_pin=pin(NEW_TASK_DEFAULT_LIMIT))
-        event = self.publish(1, phase="P1")
-        out = self.decide(event)
-        policy = out["reviewPolicy"]
-        self.assertEqual(policy["limit"], 1)
-        self.assertEqual(policy["limitSource"], "task-pin")
-        self.assertEqual(policy["failedDeliveries"], 1)
-        self.assertTrue(policy["takeoverRequired"])
-        self.assertEqual(policy["implementationOwner"], "codex")
-        self.assertIn("limit 1", policy["reason"])
-        self.assertEqual(policy["outcome"]["phaseId"], "P1")
-        self.assertIn("Codex takeover required", policy["instruction"])
-        self.assertEqual(len(self.takeover_events()), 1)
-        stored = self.takeover_events()[0]["evidence"]["reviewPolicy"]
-        self.assertEqual(stored["limit"], 1)
-        self.assertEqual(stored["failedDeliveries"], 1)
-        self.assertEqual(stored["implementationOwner"], "codex")
-        handled = self.card["handled"][event["id"]]
-        self.assertEqual(handled["eventKind"], "review_required")
-        self.assertEqual(handled["failureKind"], "quality")
-        self.assertTrue(self.card["codex"]["takeover"]["required"])
-        # A duplicate decision for this exact event never double-counts.
-        self.decide(event)
-        self.assertEqual(review_policy(self.card)["failedDeliveries"], 1)
-
-    def test_explicit_two_counts_two_distinct_failed_rounds(self):
+    def test_two_deliveries_replan_then_takeover_on_second_failure(self):
         self.new_card(review_pin=pin(2))
         first = self.decide(self.publish(1, phase="P1"))
-        self.assertEqual(first["reviewPolicy"]["limit"], 2)
-        self.assertEqual(first["reviewPolicy"]["failedDeliveries"], 1)
-        self.assertFalse(first["reviewPolicy"]["takeoverRequired"])
-        self.assertEqual(first["reviewPolicy"]["implementationOwner"], "pi")
-        self.assertIsNone(first["reviewPolicy"]["instruction"])
+        policy = first["reviewPolicy"]
+        self.assertEqual(policy["limit"], 2)
+        self.assertEqual(policy["limitSource"], "task-pin")
+        self.assertEqual(policy["failedDeliveries"], 1)
+        self.assertFalse(policy["takeoverRequired"])
+        self.assertEqual(policy["implementationOwner"], "pi")
+        self.assertIn("whole-task", policy["instruction"])
+        self.assertIn("same Codex main session", policy["instruction"])
+        self.assertIn("second complete Pi delivery", policy["instruction"])
+        self.assertEqual(policy["outcome"]["phaseId"], "P1")
+        self.assertEqual(self.takeover_events(), [])
         second = self.decide(self.publish(2, phase="P1", contract="b" * 64))
-        self.assertEqual(second["reviewPolicy"]["failedDeliveries"], 2)
-        self.assertTrue(second["reviewPolicy"]["takeoverRequired"])
+        policy = second["reviewPolicy"]
+        self.assertEqual(policy["failedDeliveries"], 2)
+        self.assertEqual(policy["failedReports"][-1]["contractHash"], "b" * 64)
+        self.assertTrue(policy["takeoverRequired"])
+        self.assertEqual(policy["implementationOwner"], "codex")
+        self.assertIn("Codex takeover required", policy["instruction"])
+        self.assertIn("all affected paths", policy["instruction"])
         self.assertEqual(len(self.takeover_events()), 1)
 
-    def test_legacy_card_without_a_pin_keeps_three(self):
+    def test_historical_one_pin_still_takes_over_after_first_failure(self):
+        self.new_card(review_pin=pin(1))
+        out = self.decide(self.publish(1, phase="P1"))
+        policy = out["reviewPolicy"]
+        self.assertEqual(policy["limit"], 1)
+        self.assertEqual(policy["failedDeliveries"], 1)
+        self.assertTrue(policy["takeoverRequired"])
+        self.assertIn("Codex takeover required", policy["instruction"])
+        self.assertNotIn("whole-task", policy["instruction"])
+        self.assertEqual(len(self.takeover_events()), 1)
+
+    def test_legacy_card_without_a_pin_keeps_three_and_old_instruction(self):
         self.new_card(review_pin=None)
         self.assertEqual(review_policy(self.card)["limit"], LEGACY_FAILED_DELIVERY_LIMIT)
         self.assertEqual(review_policy(self.card)["limitSource"], "legacy-default")
-        for number in (1, 2):
-            out = self.decide(self.publish(number, phase="P1"))
-            self.assertEqual(out["reviewPolicy"]["failedDeliveries"], number)
-            self.assertFalse(out["reviewPolicy"]["takeoverRequired"])
-        out = self.decide(self.publish(3, phase="P1"))
-        self.assertEqual(out["reviewPolicy"]["failedDeliveries"], 3)
-        self.assertTrue(out["reviewPolicy"]["takeoverRequired"])
-        self.assertEqual(out["reviewPolicy"]["limit"], 3)
+        first = self.decide(self.publish(1, phase="P1"))
+        self.assertEqual(first["reviewPolicy"]["failedDeliveries"], 1)
+        self.assertFalse(first["reviewPolicy"]["takeoverRequired"])
+        # Frozen historical behavior: only the two-delivery pin adds the replan
+        # requirement; the legacy limit explains counting but is not migrated.
+        self.assertIsNone(first["reviewPolicy"]["instruction"])
+        second = self.decide(self.publish(2, phase="P1"))
+        self.assertEqual(second["reviewPolicy"]["failedDeliveries"], 2)
+        self.assertFalse(second["reviewPolicy"]["takeoverRequired"])
+        third = self.decide(self.publish(3, phase="P1"))
+        self.assertEqual(third["reviewPolicy"]["failedDeliveries"], 3)
+        self.assertTrue(third["reviewPolicy"]["takeoverRequired"])
+        self.assertEqual(third["reviewPolicy"]["limit"], 3)
 
-    def test_dispatch_time_limit_validation_accepts_only_one_or_two(self):
-        self.assertEqual(normalize_review_limit(NEW_TASK_DEFAULT_LIMIT), 1)
+    def test_dispatch_time_choices_fix_new_tasks_at_two(self):
+        self.assertEqual(NEW_TASK_DEFAULT_LIMIT, 2)
+        self.assertEqual(tuple(NEW_TASK_REVIEW_LIMITS), (2,))
+        # Historical pins of one and two stay parseable by the shared reader.
+        self.assertEqual(tuple(EXPLICIT_REVIEW_LIMITS), (1, 2))
+        self.assertEqual(normalize_review_limit(1), 1)
         self.assertEqual(normalize_review_limit(2), 2)
         for value in (0, 3, 4, -1, True, "2", None):
             self.assertIsNone(normalize_review_limit(value))
-        self.assertEqual(tuple(EXPLICIT_REVIEW_LIMITS), (1, 2))
 
     # ------------------------------------------------------------------
     # counting resistance
@@ -217,14 +230,15 @@ class TakeoverPolicyTest(unittest.TestCase):
 
     def test_accepted_outcome_resets_count_before_takeover(self):
         self.new_card(review_pin=pin(2))
-        self.decide(self.publish(1))
-        self.assertFalse(review_policy(self.card)["takeoverRequired"])
+        first = self.decide(self.publish(1))
+        self.assertFalse(first["reviewPolicy"]["takeoverRequired"])
         accepted = self.decide(self.publish(2), decision="accept", reviewed_head=self.head)
         self.assertEqual(accepted["decision"], "accepted")
         policy = accepted["reviewPolicy"]
         self.assertEqual(policy["failedDeliveries"], 0)
         self.assertFalse(policy["takeoverRequired"])
         self.assertEqual(policy["implementationOwner"], "pi")
+        self.assertIsNone(policy["instruction"])
         # A fresh accepted outcome starts its own pinned count.
         out = self.decide(self.publish(3))
         self.assertEqual(out["reviewPolicy"]["failedDeliveries"], 1)
@@ -241,7 +255,7 @@ class TakeoverPolicyTest(unittest.TestCase):
         self.assertTrue(accepted["reviewPolicy"]["takeoverRequired"])
         self.assertTrue(self.card["codex"]["takeover"]["required"])
 
-    def test_invalid_task_pin_never_relaxes_to_legacy_three(self):
+    def test_invalid_task_pin_never_relaxes_to_legacy_three_or_two(self):
         self.new_card(review_pin=pin(1))
         self.card["reviewPolicyPin"] = {"qualityFailureLimit": "invalid"}
         self.write()
@@ -251,9 +265,18 @@ class TakeoverPolicyTest(unittest.TestCase):
         self.assertEqual(policy["limitSource"], "invalid-task-pin-fail-closed")
         out = self.decide(self.publish(1))
         self.assertTrue(out["reviewPolicy"]["takeoverRequired"])
+        # A damaged two-delivery pin falls back to the conservative one, never
+        # silently to the larger new-task default.
+        self.new_card(review_pin=pin(2))
+        self.card["reviewPolicyPin"] = {"qualityFailureLimit": 5}
+        self.write()
+        self.reload()
+        policy = review_policy(self.card)
+        self.assertEqual(policy["limit"], 1)
+        self.assertEqual(policy["limitSource"], "invalid-task-pin-fail-closed")
 
     def test_external_blocker_never_counts_and_classification_is_immutable(self):
-        self.new_card(review_pin=pin(1))
+        self.new_card(review_pin=pin(2))
         event = self.publish(1, kind="phase_blocked")
         with self.assertRaisesRegex(ValueError, "external blockers require"):
             pi_board.decide(self.repo.root, "task", event["id"], "changes_requested",
@@ -262,6 +285,7 @@ class TakeoverPolicyTest(unittest.TestCase):
                           note="needs the user's dashboard export; unlock when provided")
         self.assertEqual(out["reviewPolicy"]["failedDeliveries"], 0)
         self.assertFalse(out["reviewPolicy"]["takeoverRequired"])
+        self.assertIsNone(out["reviewPolicy"]["instruction"])
         with self.assertRaisesRegex(ValueError, "classification is immutable"):
             self.decide(event, failure_kind="quality")
 
@@ -279,7 +303,7 @@ class TakeoverPolicyTest(unittest.TestCase):
         self.assertEqual(len(self.takeover_events()), 1)
 
     def test_non_delivery_decisions_never_count(self):
-        self.new_card(review_pin=pin(1))
+        self.new_card(review_pin=pin(2))
         self.card["handled"] = {
             str(number): {"decision": "changes_requested", "phaseId": "P1",
                           "eventKind": "ownership_unknown", "round": number, "at": number}
@@ -315,9 +339,11 @@ class TakeoverLifecycleTest(unittest.TestCase):
         return board_cli("decide", "--repo", self.repo.root, "--task", task,
                          "--event-id", event_id, "--decision", decision, *extra, env=self.env)
 
+    def board_card(self, task):
+        return json.loads((self.repo.state_dir / "board.json").read_text())["cards"][task]
+
     def review_event(self, task, number=None, kind="review_required"):
-        card = json.loads((self.repo.state_dir / "board.json").read_text())["cards"][task]
-        events = [event for event in card["events"] if event["kind"] == kind
+        events = [event for event in self.board_card(task)["events"] if event["kind"] == kind
                   and (number is None or event["round"] == number)]
         self.assertTrue(events, f"no {kind} event for round {number} in {task}")
         return events[-1]
@@ -327,85 +353,93 @@ class TakeoverLifecycleTest(unittest.TestCase):
         self.assertEqual(shown["count"], 1)
         return shown["cards"][0]
 
-    def test_new_task_pins_one_and_refuses_pi_after_one_quality_failure(self):
-        started = json.loads(self.start("one-failure").stdout)
-        self.assertEqual(started["reviewPolicy"]["qualityFailureLimit"], 1)
-        frozen = json.loads((self.repo.task_dir("one-failure") / "task.json").read_text())
-        self.assertEqual(frozen["reviewPolicy"]["qualityFailureLimit"], 1)
-        self.assertEqual(self.repo.wait_terminal("one-failure")["state"], "completed")
-        registered = self.register("one-failure")
-        self.assertEqual(registered["mode"], "offline")
-        self.refresh("one-failure")
-        raw = json.loads((self.repo.state_dir / "board.json").read_text())["cards"]["one-failure"]
-        self.assertEqual(raw["reviewPolicyPin"]["qualityFailureLimit"], 1)
-        card = self.card_view("one-failure")
-        self.assertEqual(card["reviewPolicy"]["limit"], 1)
-        self.assertEqual(card["reviewPolicy"]["failedDeliveries"], 0)
-        event = self.review_event("one-failure")
-        review_packet = board_cli("packet", "--repo", self.repo.root, "--task", "one-failure",
-                                  env=self.env)
-        self.assertIn("reviewPolicy=limit:1,failed:0,owner:pi", review_packet["packet"])
-        self.assertIn("0 of 1 pinned reviewed quality failure allowance used",
-                      review_packet["packet"])
-        decided = self.decide("one-failure", event["id"], "changes_requested")
-        self.assertEqual(decided["reviewPolicy"]["failedDeliveries"], 1)
-        self.assertTrue(decided["reviewPolicy"]["takeoverRequired"])
-        self.assertEqual(decided["reviewPolicy"]["implementationOwner"], "codex")
-        # The compact board view and the queued packet both show the pinned
-        # limit, the counted failures, the owner and the reason.
-        packet = board_cli("packet", "--repo", self.repo.root, "--task", "one-failure",
-                           env=self.env)
-        self.assertIn("reviewPolicy=limit:1,failed:1,owner:codex", packet["packet"])
-        self.assertIn("pinned quality-failure limit 1 reached", packet["packet"])
-        # Pi can no longer continue, even after an explicit resume, and no
-        # round or worker may be created.
-        trap, marker = make_pi_trap(Path(self.temp.name) / "traps")
-        self.env["PI_BIN"] = str(trap)
-        board_cli("resume", "--repo", self.repo.root, "--task", "one-failure", env=self.env)
-        result = run_cli("continue", "--repo", self.repo.root, "--task", "one-failure",
-                         "--prompt", "must not run", env=self.env, expect=2)
-        self.assertIn("Codex takeover required", result.stderr)
-        self.assertFalse(marker.exists())
-        self.assertEqual(sorted((self.repo.task_dir("one-failure") / "rounds").iterdir()),
-                         [self.repo.task_dir("one-failure") / "rounds" / "1"])
-        # The automatic continuation and the internal worker refuse the same outcome.
-        frozen = json.loads((self.repo.task_dir("one-failure") / "task.json").read_text())
-        auto = pi_task.evaluate_auto_continue(
-            frozen, self.repo.task_dir("one-failure"), 1,
-            {"contract": {"phaseId": "P1"}, "contractSha256": "a" * 64},
-            {"status": "missing", "items": [{"id": "check", "status": "missing"}],
-             "budget": {"remainingSeconds": 600}})
-        self.assertEqual(auto["action"], "escalate")
-        self.assertIn("Codex takeover required", auto["detail"])
-        with self.assertRaisesRegex(ValueError, "Codex takeover required"):
-            pi_task.run_worker(SimpleNamespace(task_dir=self.repo.task_dir("one-failure"),
-                                               round=1, timeout_seconds=30))
-
-    def test_explicit_two_allows_one_local_repair_then_takes_over(self):
-        started = json.loads(self.start("two-failure", "--review-limit", "2").stdout)
+    def test_new_task_takes_two_complete_deliveries_then_takes_over(self):
+        trace = Path(self.temp.name) / "session-trace.jsonl"
+        self.env["PI_DOUBLE_TRACE"] = str(trace)
+        started = json.loads(self.start("two-delivery").stdout)
         self.assertEqual(started["reviewPolicy"]["qualityFailureLimit"], 2)
-        self.assertEqual(self.repo.wait_terminal("two-failure")["state"], "completed")
-        self.register("two-failure")
-        self.refresh("two-failure")
-        first = self.decide("two-failure", self.review_event("two-failure", 1)["id"],
+        self.assertEqual(NEW_TASK_DEFAULT_LIMIT, 2)
+        frozen = json.loads((self.repo.task_dir("two-delivery") / "task.json").read_text())
+        self.assertEqual(frozen["reviewPolicy"]["qualityFailureLimit"], 2)
+        self.assertNotIn("globalReplan", frozen["reviewPolicy"])
+        self.assertEqual(self.repo.wait_terminal("two-delivery")["state"], "completed")
+        self.register("two-delivery")
+        self.refresh("two-delivery")
+        raw = self.board_card("two-delivery")
+        self.assertEqual(raw["reviewPolicyPin"]["qualityFailureLimit"], 2)
+        self.assertNotIn("globalReplan", raw["reviewPolicyPin"])
+        first = self.decide("two-delivery", self.review_event("two-delivery", 1)["id"],
                             "changes_requested")
-        self.assertEqual(first["reviewPolicy"]["failedDeliveries"], 1)
-        self.assertFalse(first["reviewPolicy"]["takeoverRequired"])
-        # The one remaining local repair is allowed.
-        run_cli("continue", "--repo", self.repo.root, "--task", "two-failure",
-                "--prompt", "repair the complete outcome", env=self.env)
-        self.assertEqual(self.repo.wait_terminal("two-failure")["state"], "completed")
-        self.refresh("two-failure")
-        second = self.decide("two-failure", self.review_event("two-failure", 2)["id"],
+        policy = first["reviewPolicy"]
+        self.assertEqual(policy["failedDeliveries"], 1)
+        self.assertFalse(policy["takeoverRequired"])
+        self.assertEqual(policy["implementationOwner"], "pi")
+        self.assertIn("whole-task", policy["instruction"])
+        self.assertEqual([event for event in self.board_card("two-delivery")["events"]
+                          if event["kind"] == "codex_takeover_required"], [])
+        # The same frozen Pi session and worktree take the second complete
+        # delivery after the main session records its whole-task replan in the
+        # next immutable brief. The runtime adds no plan gate or new model.
+        run_cli("continue", "--repo", self.repo.root, "--task", "two-delivery",
+                "--prompt", "Second complete delivery after the main-session replan.",
+                env=self.env)
+        self.assertEqual(self.repo.wait_terminal("two-delivery")["state"], "completed")
+        sessions = [json.loads(line)["sessionId"] for line in trace.read_text().splitlines()]
+        self.assertEqual(sessions, ["two-delivery", "two-delivery"])
+        self.refresh("two-delivery")
+        second = self.decide("two-delivery", self.review_event("two-delivery", 2)["id"],
                              "changes_requested")
-        self.assertEqual(second["reviewPolicy"]["failedDeliveries"], 2)
-        self.assertTrue(second["reviewPolicy"]["takeoverRequired"])
-        refused = run_cli("continue", "--repo", self.repo.root, "--task", "two-failure",
+        policy = second["reviewPolicy"]
+        self.assertEqual(policy["failedDeliveries"], 2)
+        self.assertTrue(policy["takeoverRequired"])
+        self.assertEqual(policy["implementationOwner"], "codex")
+        self.assertIn("all affected paths", policy["instruction"])
+        refused = run_cli("continue", "--repo", self.repo.root, "--task", "two-delivery",
                           "--prompt", "must not run", env=self.env, expect=2)
         self.assertIn("Codex takeover required", refused.stderr)
         self.assertEqual(sorted(entry.name for entry in
-                                (self.repo.task_dir("two-failure") / "rounds").iterdir()),
+                                (self.repo.task_dir("two-delivery") / "rounds").iterdir()),
                          ["1", "2"])
+
+    def test_historical_one_failure_pin_stays_frozen(self):
+        self.start("old-one-pin")
+        self.assertEqual(self.repo.wait_terminal("old-one-pin")["state"], "completed")
+        task_json = self.repo.task_dir("old-one-pin") / "task.json"
+        frozen = json.loads(task_json.read_text())
+        frozen["reviewPolicy"]["qualityFailureLimit"] = 1  # a task pinned before 0.5.3
+        task_json.write_text(json.dumps(frozen))
+        self.register("old-one-pin")
+        self.refresh("old-one-pin")
+        self.assertEqual(self.board_card("old-one-pin")["reviewPolicyPin"]["qualityFailureLimit"], 1)
+        decided = self.decide("old-one-pin", self.review_event("old-one-pin")["id"],
+                              "changes_requested")
+        self.assertEqual(decided["reviewPolicy"]["failedDeliveries"], 1)
+        self.assertTrue(decided["reviewPolicy"]["takeoverRequired"])
+        refused = run_cli("continue", "--repo", self.repo.root, "--task", "old-one-pin",
+                          "--prompt", "must not run", env=self.env, expect=2)
+        self.assertIn("Codex takeover required", refused.stderr)
+
+    def test_registration_never_raises_a_pinned_limit(self):
+        self.start("pinned-task")
+        self.assertEqual(self.repo.wait_terminal("pinned-task")["state"], "completed")
+        self.register("pinned-task")
+        task_json_path = self.repo.task_dir("pinned-task") / "task.json"
+        frozen = json.loads(task_json_path.read_text())
+        frozen["reviewPolicy"]["qualityFailureLimit"] = 3  # tamper after the pin
+        task_json_path.write_text(json.dumps(frozen))
+        self.register("pinned-task")
+        raw = self.board_card("pinned-task")
+        self.assertEqual(raw["reviewPolicyPin"]["qualityFailureLimit"], 2)
+        self.assertEqual(self.card_view("pinned-task")["reviewPolicy"]["limit"], 2)
+
+    def test_review_limit_flag_is_fixed_at_two(self):
+        started = json.loads(self.start("pinned-two", "--review-limit", "2").stdout)
+        self.assertEqual(started["reviewPolicy"]["qualityFailureLimit"], 2)
+        self.assertEqual(self.repo.wait_terminal("pinned-two")["state"], "completed")
+        rejected = self.start("pinned-one", "--review-limit", "1", expect=2)
+        self.assertIn("--review-limit", rejected.stderr)
+        self.assertIn("invalid choice", rejected.stderr)
+        self.assertFalse((self.repo.task_dir("pinned-one")).exists())
 
     def test_legacy_task_without_a_pin_registers_as_three(self):
         self.start("legacy-task")
@@ -416,7 +450,7 @@ class TakeoverLifecycleTest(unittest.TestCase):
         task_json_path.write_text(json.dumps(frozen))
         self.register("legacy-task")
         self.refresh("legacy-task")
-        raw = json.loads((self.repo.state_dir / "board.json").read_text())["cards"]["legacy-task"]
+        raw = self.board_card("legacy-task")
         self.assertNotIn("reviewPolicyPin", raw)
         card = self.card_view("legacy-task")
         self.assertEqual(card["reviewPolicy"]["limit"], LEGACY_FAILED_DELIVERY_LIMIT)
@@ -425,27 +459,23 @@ class TakeoverLifecycleTest(unittest.TestCase):
                               "changes_requested")
         self.assertEqual(decided["reviewPolicy"]["failedDeliveries"], 1)
         self.assertFalse(decided["reviewPolicy"]["takeoverRequired"])
+        self.assertIsNone(decided["reviewPolicy"]["instruction"])
 
-    def test_registration_never_raises_a_pinned_limit(self):
-        self.start("pinned-task")
-        self.assertEqual(self.repo.wait_terminal("pinned-task")["state"], "completed")
-        self.register("pinned-task")
-        task_json_path = self.repo.task_dir("pinned-task") / "task.json"
-        frozen = json.loads(task_json_path.read_text())
-        frozen["reviewPolicy"]["qualityFailureLimit"] = 2  # tamper after the pin
-        task_json_path.write_text(json.dumps(frozen))
-        self.register("pinned-task")
-        raw = json.loads((self.repo.state_dir / "board.json").read_text())["cards"]["pinned-task"]
-        self.assertEqual(raw["reviewPolicyPin"]["qualityFailureLimit"], 1)
-        self.assertEqual(self.card_view("pinned-task")["reviewPolicy"]["limit"], 1)
-
-    def test_pause_then_resume_keeps_a_reached_limit(self):
+    def test_pause_then_resume_keeps_a_reached_takeover(self):
         self.start("paused-takeover")
         self.assertEqual(self.repo.wait_terminal("paused-takeover")["state"], "completed")
         self.register("paused-takeover")
         self.refresh("paused-takeover")
-        self.decide("paused-takeover", self.review_event("paused-takeover")["id"],
-                    "changes_requested")
+        first = self.decide("paused-takeover",
+                            self.review_event("paused-takeover", 1)["id"], "changes_requested")
+        self.assertFalse(first["reviewPolicy"]["takeoverRequired"])
+        run_cli("continue", "--repo", self.repo.root, "--task", "paused-takeover",
+                "--prompt", "second complete delivery", env=self.env)
+        self.assertEqual(self.repo.wait_terminal("paused-takeover")["state"], "completed")
+        self.refresh("paused-takeover")
+        second = self.decide("paused-takeover",
+                             self.review_event("paused-takeover", 2)["id"], "changes_requested")
+        self.assertTrue(second["reviewPolicy"]["takeoverRequired"])
         board_cli("pause", "--repo", self.repo.root, "--task", "paused-takeover",
                   "--note", "user paused", env=self.env)
         self.refresh("paused-takeover")
@@ -454,7 +484,7 @@ class TakeoverLifecycleTest(unittest.TestCase):
         board_cli("resume", "--repo", self.repo.root, "--task", "paused-takeover", env=self.env)
         resumed = self.card_view("paused-takeover")["reviewPolicy"]
         self.assertTrue(resumed["takeoverRequired"])
-        self.assertEqual(resumed["failedDeliveries"], 1)
+        self.assertEqual(resumed["failedDeliveries"], 2)
         refused = run_cli("continue", "--repo", self.repo.root, "--task", "paused-takeover",
                           "--prompt", "must not run", env=self.env, expect=2)
         self.assertIn("Codex takeover required", refused.stderr)
@@ -507,7 +537,12 @@ class AutoContinuePolicyTest(unittest.TestCase):
             time.sleep(0.1)
         raise AssertionError(f"timed out waiting for {what}")
 
-    def test_missing_receipt_continuation_does_not_count_but_later_failure_does(self):
+    def pending_blocked(self, task):
+        raw = json.loads((self.repo.state_dir / "board.json").read_text())["cards"][task]
+        return [event for event in raw["events"] if event["kind"] == "phase_blocked"
+                and not event["handled"]]
+
+    def test_missing_receipt_continuation_does_not_count_but_two_failures_do(self):
         run_cli("start", "--repo", self.repo.root, "--task", "missing-receipt",
                 "--worktree", self.wt, "--prompt", "Implement the phase.",
                 "--contract-file", self.contract_path, env=self.env)
@@ -524,24 +559,37 @@ class AutoContinuePolicyTest(unittest.TestCase):
         board_cli("refresh", "--repo", self.repo.root, "--task", "missing-receipt", env=self.env)
         raw = json.loads((self.repo.state_dir / "board.json").read_text())[
             "cards"]["missing-receipt"]
-        self.assertEqual(raw["reviewPolicyPin"]["qualityFailureLimit"], 1)
+        self.assertEqual(raw["reviewPolicyPin"]["qualityFailureLimit"], 2)
         shown = board_cli("show", "--repo", self.repo.root, "--task", "missing-receipt",
                           env=self.env)["cards"][0]
         self.assertEqual(shown["reviewPolicy"]["failedDeliveries"], 0)
         self.assertFalse(shown["reviewPolicy"]["takeoverRequired"])
-        blocked = [event for event in raw["events"] if event["kind"] == "phase_blocked"
-                   and not event["handled"]]
+        blocked = self.pending_blocked("missing-receipt")
         self.assertEqual(len(blocked), 1)
         self.assertEqual(blocked[0]["evidence"]["reason"], "auto_continue_used")
         self.assertFalse(any(event["kind"] == "review_required" and not event["handled"]
                              for event in raw["events"]))
-        # The main reviewer records a real quality failure for that outcome;
-        # the pinned limit of one then applies exactly once.
-        decided = board_cli("decide", "--repo", self.repo.root, "--task", "missing-receipt",
-                            "--event-id", blocked[0]["id"], "--decision", "changes_requested",
-                            env=self.env)
-        self.assertEqual(decided["reviewPolicy"]["failedDeliveries"], 1)
-        self.assertTrue(decided["reviewPolicy"]["takeoverRequired"])
+        # First real quality failure: the same main session must replan before
+        # the second complete delivery, and explicit continuation is still the
+        # same committed Pi session/worktree (limit 2 is not reached).
+        first = board_cli("decide", "--repo", self.repo.root, "--task", "missing-receipt",
+                          "--event-id", blocked[0]["id"], "--decision", "changes_requested",
+                          env=self.env)
+        self.assertEqual(first["reviewPolicy"]["failedDeliveries"], 1)
+        self.assertFalse(first["reviewPolicy"]["takeoverRequired"])
+        self.assertIn("whole-task", first["reviewPolicy"]["instruction"])
+        run_cli("continue", "--repo", self.repo.root, "--task", "missing-receipt",
+                "--prompt", "Second complete delivery after the global replan.", env=self.env)
+        self.repo.wait_terminal("missing-receipt", round=3)
+        board_cli("refresh", "--repo", self.repo.root, "--task", "missing-receipt", env=self.env)
+        blocked = self.pending_blocked("missing-receipt")
+        self.assertEqual(len(blocked), 1)
+        # Second real quality failure reaches the pinned limit and latches.
+        second = board_cli("decide", "--repo", self.repo.root, "--task", "missing-receipt",
+                           "--event-id", blocked[0]["id"], "--decision", "changes_requested",
+                           env=self.env)
+        self.assertEqual(second["reviewPolicy"]["failedDeliveries"], 2)
+        self.assertTrue(second["reviewPolicy"]["takeoverRequired"])
         refused = run_cli("continue", "--repo", self.repo.root, "--task", "missing-receipt",
                           "--prompt", "must not run", env=self.env, expect=2)
         self.assertIn("Codex takeover required", refused.stderr)

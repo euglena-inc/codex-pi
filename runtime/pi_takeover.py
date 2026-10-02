@@ -1,30 +1,45 @@
 """Review-based implementation handoff; never a model launcher or acceptance owner.
 
-The board's exact main-session decisions are the authority. A new task pins its
-quality-failure limit when it is created; legacy tasks without a pin keep the
-former limit of three. Counting is task-scoped since the last accepted outcome:
-one exact negative quality decision per reported round counts, while duplicate
-events, contract revisions, phase renames, ordinary checks, progress and
-explicitly external blockers do not. A real acceptance starts a fresh count and
-resets failures before takeover. A reached takeover remains latched for that
-task; a later outcome needs a separate dispatch.
+The board's exact main-session decisions are the authority. A new task pins two
+complete deliveries at creation: after the first reviewed quality failure the
+same Codex main session reassesses the whole outcome and the remaining plan and
+records the repair in the existing design plus the next immutable brief, then the
+SAME Pi session delivers once more; the second failure transfers implementation
+to that main session. Historical one/two pins stay frozen and unpinned legacy
+tasks keep the former limit of three. Counting is task-scoped since the last
+accepted outcome: one exact negative quality decision per reported round counts,
+while duplicate events, contract revisions, phase renames, ordinary checks,
+progress and explicitly external blockers do not. A real acceptance starts a
+fresh count and resets failures before takeover. A reached takeover remains
+latched for that task; a later outcome needs a separate dispatch.
 """
 from __future__ import annotations
 
-NEW_TASK_DEFAULT_LIMIT = 1
+NEW_TASK_DEFAULT_LIMIT = 2
 EXPLICIT_REVIEW_LIMITS = (1, 2)
+NEW_TASK_REVIEW_LIMITS = (2,)
 LEGACY_FAILED_DELIVERY_LIMIT = 3
+MALFORMED_PIN_FAIL_CLOSED_LIMIT = 1
 DELIVERY_KINDS = frozenset(("review_required", "phase_blocked"))
 FAILURE_KINDS = ("quality", "external")
 TAKEOVER_PREFIX = "Codex takeover required"
+REPLAN_INSTRUCTION = (
+    "Codex whole-task replan required before the second complete Pi delivery: the same "
+    "Codex main session must reassess the complete outcome and the remaining authorized "
+    "plan, including reachable affected paths, shared causes, relevant state/ordering "
+    "boundaries, evaluation validity and downstream dependencies, then record one coherent "
+    "repair solution in the existing design and the next immutable brief. Continue the SAME "
+    "Pi session and worktree for that second complete delivery. The runtime only counts "
+    "exact review decisions; it cannot prove the analysis quality."
+)
 
 
 def normalize_review_limit(value):
-    """A valid explicit dispatch-time quality-failure limit, else ``None``.
+    """A valid pinned quality-failure limit, else ``None``.
 
-    Only the new-task default and the single explicit local-repair choice are
-    accepted. The legacy limit is never selectable for a newly created task; it
-    is the fallback for tasks that predate the pinned policy.
+    One and two remain readable so historical pins keep working; a new dispatch
+    selects only the fixed two-delivery default. The legacy limit is never
+    selectable for a newly created task.
     """
     if isinstance(value, bool) or not isinstance(value, int):
         return None
@@ -56,9 +71,9 @@ def takeover_message(limit: int, failed: int) -> str:
         f"{TAKEOVER_PREFIX}: the pinned review policy allows {limit} reviewed quality {noun} "
         f"for this outcome and {failed} distinct failed {recorded} have been recorded. "
         "Do not continue Pi or reset the count by changing contract/task identity. "
-        "Wait for verified writer release, reassess the complete outcome, design and evidence, "
-        "then the existing Codex main session implements and validates. "
-        "Resume does not return this work to Pi."
+        "Wait for verified writer release, reassess the complete outcome, all affected paths, "
+        "the remaining plan, design and evidence, then the existing Codex main session "
+        "implements and validates. Resume does not return this work to Pi."
     )
 
 
@@ -102,10 +117,10 @@ def review_policy(card: dict) -> dict:
     limit = pin["qualityFailureLimit"] if pin else None
     limit_source = "task-pin" if pin else None
     if limit is None and "reviewPolicyPin" in card:
-        # A malformed pin must never silently turn a new one-delivery task into
-        # a three-delivery legacy task. The creation-time pin is authoritative;
-        # its loss is conservative until the board can be repaired from it.
-        limit = NEW_TASK_DEFAULT_LIMIT
+        # A malformed pin must never silently increase the allowance, not even
+        # to the two-delivery default. The creation-time pin is authoritative;
+        # its loss fails closed until the board can be repaired from it.
+        limit = MALFORMED_PIN_FAIL_CLOSED_LIMIT
         limit_source = "invalid-task-pin-fail-closed"
     if limit is None and latched:
         limit = normalize_review_limit(latch.get("limit"))
@@ -141,6 +156,7 @@ def review_policy(card: dict) -> dict:
                        "contractHash": record.get("contractHash"),
                        "at": record.get("at")})
     required = bool(latched) or len(failed) >= limit
+    replan_required = bool(failed) and not required and limit == NEW_TASK_DEFAULT_LIMIT
     if latched and not failed and isinstance(latch.get("failedReports"), list):
         reports = list(latch.get("failedReports"))
     else:
@@ -156,6 +172,10 @@ def review_policy(card: dict) -> dict:
     if required:
         reason = (f"pinned quality-failure limit {limit} reached with {failed_count} distinct "
                   f"failed deliver{'y' if failed_count == 1 else 'ies'}")
+    elif replan_required:
+        reason = (f"{failed_count} of {limit} pinned reviewed quality failure allowance used; "
+                  "the same Codex main session must complete the whole-task replan before "
+                  "the second complete delivery")
     else:
         reason = (f"{failed_count} of {limit} pinned reviewed quality failure allowance used; "
                   "implementation stays with Pi")
@@ -170,5 +190,6 @@ def review_policy(card: dict) -> dict:
         "takeoverRequired": required,
         "implementationOwner": "codex" if required else "pi",
         "reason": reason,
-        "instruction": takeover_message(limit, failed_count) if required else None,
+        "instruction": takeover_message(limit, failed_count) if required else (
+            REPLAN_INSTRUCTION if replan_required else None),
     }

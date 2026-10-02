@@ -106,19 +106,13 @@ See [handoff and recovery](handoff.md) for event decisions, uncertain delivery, 
 
 ## Review failure and direct Codex implementation
 
-If a large outcome has a staged, objectively reviewable intermediate result, dispatch it as a new task with the default pinned limit:
+Dispatch a new task with the fixed two-delivery pin:
 
 ```sh
 python3 runtime/pi_task.py start --repo REPO --task TASK --worktree WT --prompt-file BRIEF
 ```
 
-A new task allows one reviewed quality failure. Only when the task is narrowly scoped and the local repair path is known at dispatch, pin two local failures instead:
-
-```sh
-python3 runtime/pi_task.py start --repo REPO --task TASK --review-limit 2 --worktree WT --prompt-file BRIEF
-```
-
-The choice is frozen in `task.json` and copied to the board at registration; `start` accepts only 1 (default) or 2. Tasks without a pin keep the former limit of three. Contract revisions, phase renames, pause/resume, retries and later config edits never raise it or erase counted failures.
+A new task pins two complete Pi deliveries; `start` accepts only `--review-limit 2` (the default), and historical pins are not migrated. The pin is frozen in `task.json` and copied to the board at registration; contract revisions, phase renames, pause/resume, retries and later config edits never raise it or erase counted failures.
 
 Record negative delivery decisions as quality failures. For example:
 
@@ -126,9 +120,9 @@ Record negative delivery decisions as quality failures. For example:
 python3 runtime/pi_board.py decide --repo REPO --task TASK --event-id EVENT --decision changes_requested --failure-kind quality --note "Actual outcome failed the bound acceptance check"
 ```
 
-Only genuine missing external evidence/authority uses `--failure-kind external` with a nonempty `--note` naming the unlock condition. `reviewPolicy` in `decide`/`show` exposes the pinned `limit`/`limitSource`, distinct failed rounds, `implementationOwner` and `reason`. Counting is task-scoped since the last accepted outcome: one main decision per distinct round; exact replays, duplicate events for one round, `--failure-kind external`, checks, progress and the single missing-receipt auto-continuation do not increment. A contract edit or phase rename cannot reset the count. Old phase-bound negative decisions count unless explicitly classified otherwise; inspect their actual reports before drawing a model-capability conclusion. No PID/log activity, raw test failure or queue delivery increments the counter by itself.
+Only genuine missing external evidence/authority uses `--failure-kind external` with a nonempty `--note` naming the unlock condition. `reviewPolicy` in `decide`/`show` exposes the pinned `limit`/`limitSource`, distinct failed rounds, `implementationOwner`, `reason` and `instruction`. Counting is task-scoped since the last accepted outcome: one main decision per distinct round; exact replays, duplicate events for one round, `--failure-kind external`, checks, progress and the single missing-receipt auto-continuation do not increment. A contract edit or phase rename cannot reset the count. Old phase-bound negative decisions count unless explicitly classified otherwise; inspect their actual reports before drawing a model-capability conclusion. No PID/log activity, raw test failure or queue delivery increments the counter by itself.
 
-At the pinned limit, `codex_takeover_required` is emitted and Pi continuation is refused, including after board resume. Acceptance before the limit resets the count for an authorized next phase; a reached takeover remains latched for the same task. Takeover transfers the remaining outcome to the existing main task; it does not launch a model or grant write ownership. First prove the worker/supervisor/descendants stopped, then follow the Skill's whole-outcome reassessment, coherent design and direct Codex implementation. Preserve task evidence and use project-level checks/acceptance for the new code. Do not accept the old Pi candidate as evidence for Codex's later implementation. Keep the completed Pi task as a retained handoff record; a future independently authorized outcome is a separate dispatch, never a disguised retry.
+After the first reviewed quality failure the derived instruction requires the same Codex main session to reassess the complete outcome and the remaining authorized plan and to record one coherent repair in the existing design and the next immutable brief; then continue the SAME Pi session/worktree for the second complete delivery. The runtime deliberately has no plan file, heading parser or plan hash gate: scripts count exact decisions and control ownership, they cannot prove reasoning quality. At the pinned limit `codex_takeover_required` is emitted and Pi continuation is refused, including after board resume. Acceptance before the limit resets the count for an authorized next phase; a reached takeover remains latched for the same task. Takeover transfers the remaining outcome to the existing main task; it does not launch a model or grant write ownership. The main session repeats the whole-task analysis, proves the worker/supervisor/descendants stopped, then directly implements and verifies. Preserve task evidence and use project-level checks/acceptance for the new code. Do not accept the old Pi candidate as evidence for Codex's later implementation. Keep the completed Pi task as a retained handoff record; a future independently authorized outcome is a separate dispatch, never a disguised retry.
 
 ## Owned command protection (2026-10-01)
 

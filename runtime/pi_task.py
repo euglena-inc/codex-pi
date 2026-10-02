@@ -40,8 +40,8 @@ from pi_command_guard import CommandGuard
 from pi_phase import contract_hash, contract_view, load_contract, validate_contract
 from pi_size import measure, sanitize_snapshot
 from pi_summary import bounded, compact, read_meta, summarize
-from pi_takeover import (EXPLICIT_REVIEW_LIMITS, LEGACY_FAILED_DELIVERY_LIMIT,
-                         NEW_TASK_DEFAULT_LIMIT, normalize_review_limit, review_policy)
+from pi_takeover import (LEGACY_FAILED_DELIVERY_LIMIT, NEW_TASK_DEFAULT_LIMIT,
+                         NEW_TASK_REVIEW_LIMITS, review_policy)
 
 SCHEMA_VERSION = 1
 DEFAULT_MODEL = "deepseek/deepseek-flash"
@@ -2544,10 +2544,11 @@ def cmd_start(args) -> dict:
     task = require_task_arg(args.task)
     review_limit = NEW_TASK_DEFAULT_LIMIT if args.review_limit is None \
         else int(args.review_limit)
-    if normalize_review_limit(review_limit) is None:
-        raise ValueError(f"--review-limit must be one of {list(EXPLICIT_REVIEW_LIMITS)} "
-                         "(the new-task default or the explicit bounded local-repair limit); "
-                         "legacy tasks without a pin keep the former limit")
+    if review_limit not in NEW_TASK_REVIEW_LIMITS:
+        raise ValueError(f"--review-limit is fixed at {NEW_TASK_DEFAULT_LIMIT} for new tasks "
+                         "(two complete deliveries with a whole-task Codex replan after the "
+                         "first reviewed quality failure); historical pins 1/2 and unpinned "
+                         "legacy tasks keep their frozen limit")
     worktree, start_head = validate_worktree(common, root, args.worktree)
     prompt = read_prompt(args)
     contract_raw = None
@@ -4052,12 +4053,15 @@ def cmd_project(args) -> dict:
                                       "rejected without substitution",
                        "reviewPolicy": {
                            "newTaskDefaultLimit": NEW_TASK_DEFAULT_LIMIT,
-                           "explicitLocalLimit": 2,
                            "legacyTaskLimit": LEGACY_FAILED_DELIVERY_LIMIT,
-                           "note": "the limit is pinned in task.json at start and copied to the "
-                                   "board at registration; contract revisions, phase renames, "
-                                   "pauses, resumes and later config changes never raise it or "
-                                   "reset counted failures"},
+                           "note": "a new task pins two complete deliveries; after the first "
+                                   "reviewed quality failure the same Codex main session "
+                                   "reassesses the complete outcome and the remaining plan "
+                                   "before the second Pi delivery, and a second failure "
+                                   "transfers implementation to that main session. Historical "
+                                   "pins stay frozen; contract revisions, phase renames, "
+                                   "pauses, resumes and later config changes never raise the "
+                                   "limit or reset counted failures"},
                        "readOnlyIsNotASecuritySandbox": True, "codexCliInvocations": 0},
             "activeTasks": busy[:20], "activeTaskCount": len(busy),
             "note": "configuration references are instructions only; this runtime executes no configured commands"}
@@ -4086,10 +4090,11 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--prompt-file")
     start.add_argument("--prompt")
     start.add_argument("--read-only", action="store_true")
-    start.add_argument("--review-limit", type=int, choices=EXPLICIT_REVIEW_LIMITS,
-                       help="dispatch-time quality-failure limit pinned with this new task; "
-                            "1 (default) or an explicit 2 for a narrowly scoped local repair "
-                            "path. Legacy tasks without a pin keep 3.")
+    start.add_argument("--review-limit", type=int, choices=NEW_TASK_REVIEW_LIMITS,
+                       help="fixed at 2 for new tasks: two complete deliveries with a "
+                            "whole-task Codex main-session replan after the first reviewed "
+                            "quality failure and takeover after the second. Historical pins "
+                            "and unpinned legacy tasks keep their frozen limit.")
     start.add_argument("--contract-file", help="frozen phase contract JSON (optional; legacy tasks "
                                                   "start without one)")
     start.set_defaults(func=cmd_start)
