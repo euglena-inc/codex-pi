@@ -47,8 +47,7 @@ class CodexIoTest(unittest.TestCase):
     def test_status_and_result_record_sizes_only(self):
         before = len(io_lines(self.task_dir))
         status = run_cli("status", "--repo", self.repo.root, "--task", "t1", env=self.env)
-        result = run_cli("result", "--repo", self.repo.root, "--task", "t1", "--full",
-                         env=self.env)
+        result = run_cli("result", "--repo", self.repo.root, "--task", "t1", env=self.env)
         lines = io_lines(self.task_dir)[before:]
         self.assertEqual([line["command"] for line in lines], ["status", "result"])
         self.assertEqual(lines[0]["bytes"], len(status.stdout.encode("utf-8")))

@@ -79,7 +79,7 @@ class StatusTest(unittest.TestCase):
             self.assertNotIn("summary", data)
             self.assertNotIn("summaryText", data)
             self.assertIsNone(data["checks"]["running"])
-            self.assertIsNone(data["checks"]["legacyCandidate"])
+            self.assertIsNone(data["checks"]["unreceiptedLog"])
             self.assertEqual(data["notes"], [], "fixed explanatory notes are not repeated")
             self.assertIn("never useful progress", data["executionActivity"]["note"])
             self.assertTrue(data["evidence"]["state"].endswith("round.state.json"))
@@ -125,7 +125,7 @@ class StatusTest(unittest.TestCase):
         data = self.status(repo, "checking", env=env)
         self.assertEqual(data["checks"]["receipts"]["scanned"], 1)
         self.assertEqual(data["checks"]["receipts"]["latest"]["id"], "live-check")
-        self.assertIsNone(data["checks"]["legacyCandidate"],
+        self.assertIsNone(data["checks"]["unreceiptedLog"],
                           "a real pi_check receipt must cover its own log")
 
     def test_status_legacy_unreceipted_log_is_uncertain_and_bounded(self):
@@ -146,7 +146,7 @@ class StatusTest(unittest.TestCase):
             data = self.status(repo, "legacy", env=env)
             elapsed = time.monotonic() - started
             self.assertLess(elapsed, 8, "status must bound directory and log reads")
-            candidate = data["checks"]["legacyCandidate"]
+            candidate = data["checks"]["unreceiptedLog"]
             self.assertIsNotNone(candidate)
             self.assertEqual(candidate["log"], "legacy-run-0001.log")
             self.assertTrue(candidate["uncertain"])
@@ -330,7 +330,7 @@ class StatusTest(unittest.TestCase):
             data = self.status(repo, "precedence", env=env)
             self.assertIsNone(data["checks"]["running"],
                               "a valid final receipt must supersede its stale running marker")
-            self.assertEqual(data["checks"]["legacyCandidate"]["log"], log_b.name,
+            self.assertEqual(data["checks"]["unreceiptedLog"]["log"], log_b.name,
                              "invalid .json must not suppress a legitimate unreceipted log")
             self.assertEqual(data["checks"]["receipts"]["total"], 2)
             self.assertEqual(data["checks"]["receipts"]["scanned"], 1)

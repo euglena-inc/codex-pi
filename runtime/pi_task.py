@@ -36,12 +36,10 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 
 import pi_phase
-from pi_command_guard import CommandGuard
 from pi_phase import contract_hash, contract_view, load_contract, validate_contract
 from pi_size import measure, sanitize_snapshot
 from pi_summary import bounded, compact, read_meta, summarize
-from pi_takeover import (LEGACY_FAILED_DELIVERY_LIMIT, NEW_TASK_DEFAULT_LIMIT,
-                         NEW_TASK_REVIEW_LIMITS, review_policy)
+from pi_takeover import REVIEW_LIMIT, review_policy
 
 SCHEMA_VERSION = 1
 DEFAULT_MODEL = "deepseek/deepseek-flash"
@@ -51,15 +49,14 @@ DEFAULT_TIMEOUT = 14400
 MAX_TIMEOUT = 604800
 MAX_PROMPT_BYTES = 2_000_000
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
-READ_ONLY_TOOLS = "read,grep,find,ls"
-WRITABLE_TOOLS = "read,write,edit,bash"
+NATIVE_TOOLS = "check,progress,readiness"
+READ_ONLY_TOOLS = "read,grep,find,ls," + NATIVE_TOOLS
+WRITABLE_TOOLS = "read,write,edit,bash," + NATIVE_TOOLS
 TASK_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}\Z")
 TERMINAL_STATES = ("completed", "failed", "timed_out", "cancelled", "interrupted")
 ACTIVE_STATES = ("starting", "running")
 PHASE_FILE = "phase.json"
 PHASE_STATE_FILE = "phase.state.json"
-PHASE_AUTO_FILE = "phase-auto.json"
-PHASE_AUTO_LOCK = ".phase-auto.lock"
 PROGRESS_FILE = "progress.json"
 PROGRESS_LOCK = ".progress.lock"
 PROGRESS_ACTIVITIES = ("implementing", "checking", "repairing", "blocked")
@@ -72,7 +69,7 @@ MAX_READINESS_ITEMS = 100
 MAX_VERIFY_LOG_BYTES = 33_554_432
 MAX_VERIFY_TOTAL_BYTES = 67_108_864
 MAX_SCOPE_DIFF_FILES = 600
-MIN_AUTO_CONTINUE_SECONDS = 60.0
+MIN_SETTLE_SECONDS = 60.0
 RESOURCE_STATE_FILE = "resource.state.json"
 RESOURCE_SCAN_SECONDS = 15.0
 RESOURCE_SCAN_BUDGET_SECONDS = 10.0
@@ -80,11 +77,10 @@ RESOURCE_MAX_SECONDS_PER_LIMIT = 5.0
 RESOURCE_MAX_LIMIT_ENTRIES = 64
 RESOURCE_UNKNOWN_SECONDS = 120.0
 FULL_OID_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
-PHASE_TERMINAL_STATES = ("completed", "failed", "timed_out", "cancelled", "interrupted")
 CONFIG_KEYS = ("schemaVersion", "model", "thinking", "constraints", "checks",
                "maxWorkers", "timeoutSeconds")
 HELPER_FILES = ("pi_task.py", "pi_phase.py", "pi_summary.py", "pi_check.py", "pi_copy.py",
-                "pi_size.py", "pi_board.py", "pi_takeover.py", "pi_command_guard.py", "VERSION")
+                "pi_size.py", "pi_board.py", "pi_takeover.py", "pi_worker.ts", "VERSION")
 REFERENCE_EXTENSIONS = ("md", "markdown", "txt", "json", "sh", "bash", "zsh", "py",
                         "js", "mjs", "cjs", "ts", "tsx", "yaml", "yml", "toml", "cfg", "ini")
 
@@ -501,7 +497,7 @@ def validate_worktree(common: Path, root: Path, worktree_arg: str):
 
 
 # ---------------------------------------------------------------------------
-# phase contract, structured progress, readiness and one auto-continuation
+# phase contract, structured progress, readiness and the settle-continue view
 # ---------------------------------------------------------------------------
 
 def phase_path(task_dir: Path) -> Path:
@@ -510,10 +506,6 @@ def phase_path(task_dir: Path) -> Path:
 
 def phase_state_path(task_dir: Path) -> Path:
     return task_dir / PHASE_STATE_FILE
-
-
-def phase_auto_path(task_dir: Path) -> Path:
-    return task_dir / PHASE_AUTO_FILE
 
 
 def read_phase_record(task_dir: Path):
@@ -557,18 +549,6 @@ def read_phase_state(task_dir: Path) -> dict:
 
 def write_phase_state(task_dir: Path, state: dict) -> None:
     atomic(phase_state_path(task_dir), state)
-
-
-def read_phase_auto(task_dir: Path):
-    """Read the per-task auto-continue ledger; corrupt content is unknown."""
-    path = phase_auto_path(task_dir)
-    if not path.exists():
-        return {"schemaVersion": 1, "phases": {}}, None
-    data = read_json(path, None)
-    if not isinstance(data, dict) or data.get("schemaVersion") != 1 \
-            or not isinstance(data.get("phases"), dict):
-        return None, "unrecognized"
-    return data, None
 
 
 def _resolve_baseline(worktree: Path, baseline: str) -> str:
@@ -800,13 +780,6 @@ def evaluate_resource_evidence(round_dir: Path, contract: dict, round_number: in
             "limitsSignature": expected_signature}
 
 
-def read_resource_state(round_dir: Path):
-    path = round_dir / RESOURCE_STATE_FILE
-    if not path.is_file():
-        return None
-    return _sanitize_resource_state(read_json(path, None))
-
-
 class PhaseResourceMonitor:
     """Durable per-round observer for the contract's declared resource limits.
 
@@ -1000,7 +973,6 @@ def install_phase_contract(task_dir: Path, raw, root: Path, worktree: Path,
              "budgetSeconds": contract["budgetSeconds"],
              "deadlineAt": started + contract["budgetSeconds"],
              "rounds": previous.get("rounds") if same_phase and isinstance(previous.get("rounds"), list) else [],
-             "autoContinue": previous.get("autoContinue") if same_phase else None,
              "updatedAt": time.time()}
     write_phase_state(task_dir, state)
     return record
@@ -1035,7 +1007,7 @@ def phase_budget(task_dir: Path, record: dict | None = None) -> dict:
 
 
 def board_pause_active(task: dict):
-    """(paused, reason) for auto-continue: board card or route interrupt pause.
+    """(paused, reason): board card or route interrupt pause.
 
     A missing board means the offline path; an unreadable board is conservative
     and blocks the script-driven continuation instead of guessing.
@@ -1251,13 +1223,12 @@ def cmd_phase_status(args) -> dict:
     number = _select_round(task_dir, args.round)
     round_dir = task_dir / "rounds" / str(number)
     record, problem = read_phase_record(task_dir)
-    ledger, ledger_problem = read_phase_auto(task_dir)
     result = {
         "ok": True, "task": task, "round": number, "phaseInstalled": isinstance(record, dict),
         "phaseProblem": problem, "contract": None, "contractSha256": None,
         "baselineCommit": None, "budget": phase_budget(task_dir, record if isinstance(record, dict) else None),
-        "phaseState": read_phase_state(task_dir), "autoContinue": None,
-        "autoContinueProblem": ledger_problem, "progress": read_progress(round_dir),
+        "phaseState": read_phase_state(task_dir), "settleQuotaUsed": None,
+        "progress": read_progress(round_dir),
         "readiness": None, "board": _board_phase_info(frozen),
         "acceptance": "not_verified",
         "note": "read-only phase projection; readiness ready still only means deliverable to main "
@@ -1268,14 +1239,13 @@ def cmd_phase_status(args) -> dict:
         result["contract"] = contract_view(contract)
         result["contractSha256"] = record.get("contractSha256")
         result["baselineCommit"] = record.get("baselineCommit")
-        if ledger is not None:
-            result["autoContinue"] = (ledger.get("phases") or {}).get(contract.get("phaseId"))
+        result["settleQuotaUsed"] = settle_quota_path(task_dir, contract.get("phaseId")).exists()
         state = read_json(round_dir / "round.state.json", {}) or {}
         if state.get("state") in TERMINAL_STATES:
             result["readiness"] = build_readiness(task_dir, frozen, number)
     else:
-        result["legacy"] = True
-        result["note"] += "; no phase contract is installed, so the legacy review path applies"
+        result["briefOnly"] = True
+        result["note"] += "; no phase contract is installed, so the brief-only review path applies"
     return result
 
 
@@ -1668,12 +1638,6 @@ def build_phase_snapshot(task_dir: Path, task: dict, round_number: int, *, state
     items, coverage, gaps, budget = evaluate_acceptance_items(contract, candidate_head,
                                                               checks, checks_dir)
     scope = _scope_check(task_dir, record, candidate_head)
-    summary_record = read_json(round_dir / "round.summary.json", None)
-    escape = (summary_record or {}).get("scope_escape") if isinstance(summary_record, dict) else None
-    escape_writes = escape.get("write_edit_count") if isinstance(escape, dict) else 0
-    escape_writes = escape_writes if isinstance(escape_writes, int) \
-        and not isinstance(escape_writes, bool) and escape_writes > 0 else 0
-    escape_reads = escape.get("read_count") if isinstance(escape, dict) else 0
     writer_free = (not lock_is_held(task_dir / ".task.lock")
                    and not lock_is_held(task_dir / ".supervisor.lock"))
     progress_record = read_progress(round_dir)
@@ -1697,10 +1661,6 @@ def build_phase_snapshot(task_dir: Path, task: dict, round_number: int, *, state
         reason = execution_reason
     elif scope.get("status") == "violation":
         status, reason = "not_ready", "files outside the declared phase scope"
-    elif escape_writes:
-        status = "not_ready"
-        reason = (f"SCOPE_ESCAPE: {escape_writes} write/edit tool call(s) outside the round "
-                  "worktree and allowed directories")
     elif any(item["status"] in ("failed", "skipped", "unknown", "missing") for item in items):
         status, reason = "not_ready", "required acceptance evidence is not fully covered"
     elif scope.get("status") == "unknown":
@@ -1722,14 +1682,6 @@ def build_phase_snapshot(task_dir: Path, task: dict, round_number: int, *, state
         gaps.append({"id": "scope", "checkId": None, "status": "violation",
                      "reason": "files outside the declared phase scope: "
                      + ", ".join(scope.get("outOfScope") or [])[:300], "receiptRef": None})
-    if escape_writes:
-        gaps.append({"id": "SCOPE_ESCAPE", "checkId": None, "status": "violation",
-                     "reason": f"{escape_writes} write/edit tool call(s) outside allowed "
-                               "directories (see round.summary.json scope_escape)",
-                     "receiptRef": None})
-    if isinstance(escape_reads, int) and not isinstance(escape_reads, bool) and escape_reads > 0:
-        notes.append(f"{escape_reads} read tool call(s) outside allowed directories were counted; "
-                     "reads do not block readiness")
     ready_for_review = status == "ready" and writer_free
     if status == "ready" and not writer_free:
         notes.append("coverage is complete but a writer lock is still held; the final supervisor "
@@ -1826,8 +1778,9 @@ def build_readiness(task_dir: Path, task: dict, round_number: int) -> dict:
                 "generatedAt": time.time(), "readyForReview": False,
                 "readinessReason": snapshot.get("reason"),
                 "evidenceLevels": {"gptAcceptance": False},
+                "settle": {"eligible": False, "reason": "no_contract", "missing": []},
                 "notes": [f"no phase contract is installed ({snapshot.get('reason')}); "
-                          "legacy review applies"]}
+                          "brief-only review applies"]}
     result = {
         "schemaVersion": 1, "command": "readiness", "task": task.get("task"),
         "round": round_number, "phaseId": snapshot.get("phaseId"),
@@ -1853,122 +1806,71 @@ def build_readiness(task_dir: Path, task: dict, round_number: int) -> dict:
     if head_problem is not None:
         result["notes"].append(f"active HEAD probe failed ({head_problem}); the candidate is "
                                "unknown")
+    result["settle"] = settle_view(task, task_dir, result)
     return result
 
 
-def _claim_auto_continue(task_dir: Path, phase_id: str, contract_sha: str,
-                         round_number: int, reason: str, task: dict):
-    """Atomic one-per-phase claim. Returns (entry, None) or (None, existing/error)."""
-    fd = lock_fd(task_dir / PHASE_AUTO_LOCK, blocking=True, timeout=5)
-    try:
-        ledger, problem = read_phase_auto(task_dir)
-        if ledger is None:
-            return None, {"error": f"auto-continue ledger is {problem}; refusing to guess"}
-        entries = ledger.setdefault("phases", {})
-        existing = entries.get(phase_id)
-        if isinstance(existing, dict) and existing:
-            return None, existing
-        entry = {
-            "phaseId": phase_id, "contractSha256": contract_sha, "used": True,
-            "status": "claimed", "round": round_number + 1, "claimedAt": time.time(),
-            "reason": reason, "sessionId": task.get("sessionId"),
-            "worktree": task.get("worktree"), "attempt": 1,
-        }
-        entries[phase_id] = entry
-        ledger["schemaVersion"] = 1
-        atomic(phase_auto_path(task_dir), ledger)
-        return entry, None
-    finally:
-        os.close(fd)
-
-
-def evaluate_auto_continue(task: dict, task_dir: Path, round_number: int,
-                           record: dict, readiness: dict) -> dict:
-    """Classify one normally completed round and claim the single continuation.
-
-    Detection and decision are separated: the readiness facts decide first, and
-    only a mechanically missing-evidence result with an unused phase quota, an
-    available budget and no active pause can claim the continuation.
-    """
+def classify_readiness(readiness: dict, record: dict) -> dict:
+    """Post-round classification of one normally completed round (facts only, no side effects)."""
     contract = record.get("contract") or {}
-    phase_id = contract.get("phaseId")
-    contract_sha = record.get("contractSha256")
-    budget = readiness.get("budget") or phase_budget(task_dir, record)
-    items = readiness.get("items") or []
-    decision = {"action": "escalate", "reason": "delivery_gap", "phaseId": phase_id,
-                "contractSha256": contract_sha, "gaps": [], "timeoutSeconds": None,
-                "autoContinue": None, "detail": None}
+    base = {"phaseId": contract.get("phaseId"), "contractSha256": record.get("contractSha256")}
     if readiness.get("status") == "ready":
-        return {**decision, "action": "review", "reason": "ready"}
+        return {**base, "action": "review", "reason": "ready"}
     resource = readiness.get("resource") or {}
     if resource.get("status") == "breached":
-        return {**decision, "action": "escalate", "reason": "resource_breached",
-                "detail": resource}
+        return {**base, "action": "escalate", "reason": "resource_breached"}
     if resource.get("status") in ("unknown", "escalated"):
-        return {**decision, "action": "escalate", "reason": "resource_unknown",
-                "detail": resource}
-    scope = readiness.get("scope") or {}
-    if scope.get("status") == "violation":
-        return {**decision, "action": "escalate", "reason": "scope_violation",
-                "detail": scope.get("outOfScope")}
-    blocking = [item for item in items if item.get("status") in ("failed", "skipped", "unknown")]
-    if blocking:
-        decision.update(gaps=blocking)
-        return {**decision, "action": "escalate", "reason": "required_check_failed",
-                "detail": [f"{item.get('id')}:{item.get('status')}:{item.get('reason')}"
-                           for item in blocking[:10]]}
+        return {**base, "action": "escalate", "reason": "resource_unknown"}
+    if (readiness.get("scope") or {}).get("status") == "violation":
+        return {**base, "action": "escalate", "reason": "scope_violation"}
+    statuses = {item.get("status") for item in readiness.get("items") or []}
+    if statuses & {"failed", "skipped", "unknown"}:
+        return {**base, "action": "escalate", "reason": "required_check_failed"}
+    if "missing" in statuses:
+        return {**base, "action": "escalate", "reason": "missing_checks"}
+    return {**base, "action": "escalate", "reason": "unknown_delivery_state"}
+
+
+def settle_view(task: dict, task_dir: Path, readiness: dict) -> dict:
+    """Whether the worker extension may continue once at settle time.
+
+    Eligible only when every gap is missing evidence (no failure, skip or unknown),
+    scope and resources are fine, budget remains, no pause is active and the
+    one-per-phase quota file does not exist yet. The extension claims the quota.
+    """
+    def no(reason: str) -> dict:
+        return {"eligible": False, "reason": reason, "missing": []}
+
+    phase_id = readiness.get("phaseId")
+    if not phase_id:
+        return no("no_contract")
+    resource = readiness.get("resource") or {}
+    if resource.get("status") in ("breached", "unknown", "escalated"):
+        return no("resource_" + str(resource.get("status")))
+    if (readiness.get("scope") or {}).get("status") == "violation":
+        return no("scope_violation")
+    items = readiness.get("items") or []
+    if any(item.get("status") in ("failed", "skipped", "unknown") for item in items):
+        return no("required_check_not_missing")
     missing = [item for item in items if item.get("status") == "missing"]
-    decision["gaps"] = missing
-    if not missing and readiness.get("status") != "ready":
-        return {**decision, "action": "escalate", "reason": "unknown_delivery_state",
-                "detail": readiness.get("notes")}
-    remaining = budget.get("remainingSeconds")
-    if remaining is None or remaining < MIN_AUTO_CONTINUE_SECONDS:
-        return {**decision, "action": "escalate", "reason": "budget_exhausted",
-                "detail": {"remainingSeconds": remaining}}
-    paused, pause_reason = board_pause_active(task)
+    if not missing:
+        return no("nothing_missing")
+    remaining = (readiness.get("budget") or {}).get("remainingSeconds")
+    if remaining is None or remaining < MIN_SETTLE_SECONDS:
+        return no("budget_exhausted")
+    paused, _reason = board_pause_active(task)
     if paused:
-        return {**decision, "action": "escalate", "reason": "paused", "detail": pause_reason}
-    entry, existing = _claim_auto_continue(task_dir, phase_id, contract_sha, round_number,
-                                           "missing_checks", task)
-    if entry is None:
-        reason = "auto_continue_used"
-        if isinstance(existing, dict) and existing.get("status") == "claimed":
-            reason = "auto_continue_unknown"
-        elif isinstance(existing, dict) and existing.get("error"):
-            reason = "auto_continue_ledger_unknown"
-        return {**decision, "action": "escalate", "reason": reason, "detail": existing}
-    timeout = min(float(task.get("timeoutSeconds") or 0) or remaining,
-                  max(1.0, remaining - 5.0))
-    return {**decision, "action": "auto_continue", "reason": "missing_checks",
-            "timeoutSeconds": timeout, "autoContinue": entry}
-
-
-def compose_gap_prompt(task: dict, record: dict, gaps: list) -> str:
-    contract = record.get("contract") or {}
-    lines = [
-        f"Phase {contract.get('phaseId')} delivery gap repair (script continuation; same phase, "
-        "same Pi session and same worktree).",
-        "The previous Pi process exited normally but the mechanical delivery check found missing "
-        "acceptance evidence for the current candidate. Do not change the phase scope and do not "
-        "start another phase.",
-        f"Contract: {phase_path(Path(task['taskDir']))} "
-        f"sha256={record.get('contractSha256')} (authoritative).",
-        f"Design: {contract.get('designRef')} sha256={contract.get('designSha256')}.",
-        "Missing acceptance items (no applicable receipt for the current candidate):",
-    ]
-    for item in gaps[:20]:
-        spec = next((entry for entry in contract.get("acceptanceItems") or []
-                     if entry.get("id") == item.get("id")), {})
-        lines.append(f"- {item.get('id')}: run `{spec.get('command')}`; pass condition: "
-                     f"{spec.get('passCondition')}; evidence: {spec.get('evidence')}")
-    lines += [
-        "Record structured progress with the frozen helper's `progress` command and run each "
-        "check with the frozen `pi_check.py` helper so the receipt binds the exact candidate.",
-        "Commit only in-scope work, keep the existing session/worktree, and end with a short "
-        "report of what changed and the exact receipts.",
-    ]
-    return "\n".join(lines) + "\n"
+        return no("paused")
+    if settle_quota_path(task_dir, phase_id).exists():
+        return no("quota_used")
+    record, _problem = read_phase_record(task_dir)
+    specs = {entry.get("id"): entry for entry in
+             ((record or {}).get("contract") or {}).get("acceptanceItems") or []}
+    return {"eligible": True, "reason": "missing_checks",
+            "missing": [{"id": item.get("id"),
+                         "command": (specs.get(item.get("id")) or {}).get("command"),
+                         "passCondition": (specs.get(item.get("id")) or {}).get("passCondition")}
+                        for item in missing[:20]]}
 
 
 def _phase_acceptance_on_board(main_task: dict, record: dict, latest_head):
@@ -2024,135 +1926,81 @@ def snapshot_helpers(source: Path, destination: Path) -> dict:
     return hashes
 
 
-FORBIDDEN_RULE_TEXT = ("Do not run commands that reference the repository's main checkout or another "
-                       "worktree of this repository: the supervisor terminates such an owned bash "
-                       "command (rule forbidden-path). Use only your round worktree.")
+FORBIDDEN_RULE_TEXT = ("Do not reference the repository's main checkout or another worktree of this "
+                       "repository in any tool call: the worker guard blocks such a call (rule "
+                       "forbidden-path). Use only your round worktree.")
 MUST_ASK_LINE = ("If the brief leaves a must-ask item open (see task packet), choose the conservative "
                  "reading and report it as a spec gap.")
-CONTRACT_MARK_RE = re.compile(r"^worker_contract=full contract_hash=(\S+)", re.M)
-
-
-def worker_contract_key(task_dir: Path) -> str:
-    """Hash that decides whether a round must carry the full worker contract."""
-    record, _problem = read_phase_record(task_dir)
-    if isinstance(record, dict) and record.get("contractSha256"):
-        return str(record["contractSha256"])
-    return "none"
-
-
-def last_full_contract(task_dir: Path, before_round: int):
-    """``(round, contract_hash)`` of the latest earlier round whose brief carried the full contract."""
-    for number in range(before_round - 1, 0, -1):
-        brief = task_dir / "rounds" / str(number) / "brief.md"
-        try:
-            match = CONTRACT_MARK_RE.search(brief.read_text(encoding="utf-8"))
-        except OSError:
-            continue
-        if match:
-            return number, match.group(1)
-    return None
-
-
-def compose_short_contract(task: dict, round_number: int, prior: dict | None, key: str,
-                           carried_round: int) -> list:
-    """At most 15 lines: identity, frozen pi_check template, boundary, pointer to the full contract."""
-    task_dir = Path(task["taskDir"])
-    round_dir = task_dir / "rounds" / str(round_number)
-    helper = task_dir / "tools" / "pi_check.py"
-    checks_dir = round_dir / "round.checks"
-    phase_record, _problem = read_phase_record(task_dir)
-    timeout = task["timeoutSeconds"]
-    if isinstance(phase_record, dict):
-        value = (phase_record.get("contract") or {}).get("commandTimeoutSeconds")
-        if isinstance(value, (int, float)) and not isinstance(value, bool) \
-                and math.isfinite(float(value)) and float(value) > 0:
-            timeout = float(value)
-    lines = ["---", "## Appended Codex-Pi worker contract (short)",
-             f"worker_contract=short contract_hash={key} task={task['task']} round={round_number}",
-             f"Same worker contract as round {carried_round}; it still applies. "
-             f"Full text: {round_dir / 'contract.md'}",
-             f"Round-1 brief: {task_dir / 'rounds' / '1' / 'brief.md'}",
-             f'Check template: python3 "{helper}" --output-dir "{checks_dir}" --id <safe-id> '
-             f'--timeout-seconds {float(timeout):g} -- <real check command>',
-             f'Only "{task_dir / "tools"}" and "{checks_dir}" may be written outside the worktree.',
-             FORBIDDEN_RULE_TEXT]
-    if prior:
-        lines.append(f"Previous round {prior.get('round')}: outcome={prior.get('state')} "
-                     f"exit={prior.get('exitCode')} head={prior.get('endHead')}; execution "
-                     "evidence only.")
-    lines.append("End with a concise report; never claim acceptance PASS.")
-    return lines
-
-
-def compose_round_texts(task: dict, round_number: int, prompt: str, prior: dict | None) -> tuple:
-    """``(brief text, full contract text)``; the brief carries the contract once per session.
-
-    The full worker contract is written to ``rounds/N/contract.md`` every round
-    for audit. The brief carries it in round 1 and in any round whose phase
-    contract hash differs from the last round that carried it; every other
-    round gets the short header.
-    """
-    task_dir = Path(task["taskDir"])
-    key = worker_contract_key(task_dir)
-    contract = "\n".join(_full_contract_lines(task, round_number, prior, key)) + "\n"
-    carried = last_full_contract(task_dir, round_number)
-    if carried is not None and carried[1] == key:
-        body = "\n".join(compose_short_contract(task, round_number, prior, key, carried[0])) + "\n"
-    else:
-        body = "---\n" + contract
-    return prompt.rstrip() + "\n\n" + body, contract
 
 
 def compose_brief(task: dict, round_number: int, prompt: str, prior: dict | None) -> str:
-    return compose_round_texts(task, round_number, prompt, prior)[0]
+    """The user prompt plus a fixed short header; the contract lives in the system prompt."""
+    task_dir = Path(task["taskDir"])
+    round_dir = task_dir / "rounds" / str(round_number)
+    lines = ["---", "## Codex-Pi round header",
+             f"task={task['task']} round={round_number}",
+             "The worker contract (model policy, tools, boundaries, phase contract) is the system "
+             f"prompt section codex_pi_worker, also in {round_dir / 'contract.md'}; it applies to "
+             "every round of this session."]
+    if round_number > 1:
+        lines.append(f"Round-1 brief: {task_dir / 'rounds' / '1' / 'brief.md'}")
+    lines += ["Use the native tools `check` (recorded checks), `progress` and `readiness`.",
+              f'Only "{task_dir / "tools"}" and "{round_dir / "round.checks"}" may be written '
+              "outside the worktree.",
+              FORBIDDEN_RULE_TEXT]
+    if prior:
+        lines.append(f"Previous round {prior.get('round')}: outcome={prior.get('state')} "
+                     f"exit={prior.get('exitCode')} head={prior.get('endHead')}; execution "
+                     "evidence only, read its summary before continuing.")
+    lines.append("End with a concise report; never claim acceptance PASS.")
+    return prompt.rstrip() + "\n\n" + "\n".join(lines) + "\n"
 
 
-def _full_contract_lines(task: dict, round_number: int, prior: dict | None, key: str) -> list:
+def check_timeout_seconds(task: dict, phase_record) -> float:
+    """Per-command cap for ``check``: the phase contract's cap, else the project round timeout."""
+    value = task["timeoutSeconds"]
+    if isinstance(phase_record, dict):
+        cap = (phase_record.get("contract") or {}).get("commandTimeoutSeconds")
+        if isinstance(cap, (int, float)) and not isinstance(cap, bool) \
+                and math.isfinite(float(cap)) and float(cap) > 0:
+            value = cap
+    return float(value)
+
+
+def compose_contract(task: dict) -> str:
+    """The worker contract injected into the system prompt and written to ``contract.md``."""
     read_only = bool(task["readOnly"])
     tools = READ_ONLY_TOOLS if read_only else WRITABLE_TOOLS
     task_dir = Path(task["taskDir"])
-    round_dir = task_dir / "rounds" / str(round_number)
-    helper = task_dir / "tools" / "pi_check.py"
-    checks_dir = round_dir / "round.checks"
-    lines = ["## Appended Codex-Pi worker contract",
-             f"worker_contract=full contract_hash={key} round={round_number}", "",
-             "User directive: do not execute the Codex CLI (`codex`), do not launch any Codex",
-             "agent, and do not call an OpenAI model through Codex. The Codex main session",
-             "reviews outcomes; this Pi session implements and reports. Never run `codex`.",
-             "",
-             f"Model policy: this task is pinned to `{task['model']}` at task creation. Do not call,",
-             "delegate to, or spawn any nested agent/model on another provider or model, and do",
-             "not fall back automatically. If the pinned model is unavailable, stop and report it.",
-             "",
-             f"Mode: {'read-only' if read_only else 'writable'}; allowed tools: {tools}.",
-             ("Read-only is a tool allowlist, not a security sandbox."
-              if read_only else
-              "This is explicitly not a security sandbox; bash has full local capability."),
-             "",
-             "Applicable AGENTS.md files discovered from the worktree remain authoritative.",
-             "Prompt templates, skills and extensions are disabled for this session."]
+    lines = ["## Codex-Pi worker contract",
+             "Do not execute the Codex CLI (`codex`), launch any Codex agent, or call an OpenAI "
+             "model through Codex. The Codex main session reviews outcomes; this Pi session "
+             "implements and reports.",
+             f"Model policy: this task is pinned to `{task['model']}`. Do not call, delegate to, "
+             "or spawn any nested agent/model on another provider or model, and do not fall back "
+             "automatically. If the pinned model is unavailable, stop and report it.",
+             f"Mode: {'read-only' if read_only else 'writable'}; allowed tools: {tools}. This is a "
+             "worker guard, not a security sandbox.",
+             "Applicable AGENTS.md files discovered from the worktree remain authoritative. "
+             "Prompt templates, skills and project extensions are disabled."]
     constraints = task.get("constraints") or []
     if constraints:
-        lines += ["", "Project constraints (references/instructions; the runtime never executes them):"]
+        lines += ["Project constraints (references; the runtime never executes them):"]
         lines += [f"  - {entry}" for entry in constraints]
     checks = task.get("checks") or []
     if checks:
-        lines += ["", "Project checks (references/instructions only; never invent acceptance):"]
+        lines += ["Project checks (references only; never invent acceptance):"]
         lines += [f"  - {entry}" for entry in checks]
-    task_dir = Path(task["taskDir"])
     phase_record, phase_problem = read_phase_record(task_dir)
     if isinstance(phase_record, dict):
         contract = phase_record.get("contract") or {}
-        items = contract.get("acceptanceItems") or []
-        lines += ["", "## Phase contract (machine-readable execution snapshot; the main session "
-                  "remains the design authority)",
+        lines += ["## Phase contract (machine-readable snapshot; the main session remains the "
+                  "design authority)",
                   f"phase_id={contract.get('phaseId')}",
                   f"contract_ref={phase_path(task_dir)}",
                   f"contract_sha256={phase_record.get('contractSha256')}",
-                  f"baseline={contract.get('baseline')} "
-                  f"(resolved {phase_record.get('baselineCommit')})",
-                  f"design_ref={contract.get('designRef')} "
-                  f"design_sha256={contract.get('designSha256')}",
+                  f"baseline={contract.get('baseline')} (resolved {phase_record.get('baselineCommit')})",
+                  f"design_ref={contract.get('designRef')} design_sha256={contract.get('designSha256')}",
                   f"phase_budget_seconds={contract.get('budgetSeconds')}",
                   f"scope={', '.join(contract.get('scope') or [])}"]
         if contract.get("commandTimeoutSeconds"):
@@ -2160,7 +2008,7 @@ def _full_contract_lines(task: dict, round_number: int, prior: dict | None, key:
         for limit in contract.get("resourceLimits") or []:
             lines.append(f"resource_limit: path={limit.get('path')} max_bytes={limit.get('maxBytes')}")
         lines.append("acceptance_items:")
-        for item in items:
+        for item in contract.get("acceptanceItems") or []:
             lines.append(f"  - id={item.get('id')} check_id={item.get('checkId')}"
                          + (f" min_run={item.get('minRun')}" if item.get('minRun') is not None else "")
                          + (" forbid_skip=true" if item.get("forbidSkip") else ""))
@@ -2171,66 +2019,31 @@ def _full_contract_lines(task: dict, round_number: int, prior: dict | None, key:
         lines += [f"  - {entry}" for entry in contract.get("autonomousRepair") or []]
         lines.append("escalate_when:")
         lines += [f"  - {entry}" for entry in contract.get("escalateWhen") or []]
-        lines += [
-            "Structured progress (short command; validated, atomic, never a queue notification):",
-            f'  python3 "{task_dir / "tools" / "pi_task.py"}" progress --repo REPO --task '
-            f'{task["task"]} --round {round_number} --activity implementing \\',
-            '      --step "..." --next "..." --completed-criteria ITEM_ID --evidence-ref PATH',
-            "Delivery readiness check (read-only; missing/failed/skipped/unknown are never ready):",
-            f'  python3 "{task_dir / "tools" / "pi_task.py"}" readiness --repo REPO --task '
-            f'{task["task"]} --round {round_number}',
-            "Rules: stay inside the declared scope; keep the phase budget; run checks only through "
-            "pi_check.py so each receipt binds the candidate; a normal exit with missing evidence "
-            "may be continued once automatically in this same phase/session/worktree.",
-        ]
+        lines.append("Rules: stay inside the declared scope and the phase budget; run every "
+                     "acceptance check through the `check` tool with the item's exact command so "
+                     "the receipt binds the candidate. When the round ends with only evidence "
+                     "missing you may be asked once to continue in this same session.")
     elif phase_problem not in (None, "absent"):
-        lines += ["", f"Phase contract state is {phase_problem}; treat phase-wide readiness as "
-                       "unknown and report it instead of inventing coverage."]
-    if prior:
-        lines += ["", f"Previous round {prior.get('round')}: outcome={prior.get('state')} "
-                      f"exit={prior.get('exitCode')} head={prior.get('endHead')}. "
-                      "That is execution evidence only; read its summary before continuing."]
-    lines += ["Every temporary bash probe must have a finite timeout; default supervisor ceiling is 600 seconds plus cleanup grace. Use try/finally to close the complete fixture, not only its product core. Propagate HTTP/assertion errors as nonzero exits; catch-and-print is not verification. Formal pi_check retains its owned declared wrapper deadline. Unknown process ownership is reported and never blindly signalled."]
-    command_timeout = task["timeoutSeconds"]
-    if isinstance(phase_record, dict):
-        contract_timeout = (phase_record.get("contract") or {}).get("commandTimeoutSeconds")
-        if isinstance(contract_timeout, (int, float)) and not isinstance(contract_timeout, bool) \
-                and math.isfinite(float(contract_timeout)) and float(contract_timeout) > 0:
-            command_timeout = float(contract_timeout)
-        timeout_literal = f"{float(command_timeout):g}"
-        timeout_note = ("The helper --timeout-seconds above is the phase contract's per-command "
-                        "cap; the whole-round supervisor timeout is separate. Phase acceptance "
-                        "receipts must use the item's declared command and a wrapper deadline "
-                        "within that cap.")
-    else:
-        timeout_literal = str(int(command_timeout))
-        timeout_note = ("The helper --timeout-seconds above is the project round timeout; legacy "
-                        "tasks without a phase contract keep this example.")
+        lines.append(f"Phase contract state is {phase_problem}; treat phase-wide readiness as "
+                     "unknown and report it instead of inventing coverage.")
     lines += [
-        "",
-        "Record real check evidence with this task's frozen helper:",
-        f'  python3 "{helper}" --output-dir "{checks_dir}" --id <safe-id> \\',
-        f'      --timeout-seconds {timeout_literal} -- <real check command>',
-        timeout_note,
-        "Receipts capture the true exit/signal/timeout, log sha256, HEAD and dirty state.",
-        "Optional declared directory budget for that check (path and budget required together):",
-        f'  python3 "{helper}" --output-dir "{checks_dir}" --id <safe-id> \\',
-        f'      --watch-path PATH --max-bytes N [--health-interval-seconds 15] -- <real check command>',
-        "The guard counts regular-file bytes under PATH without following symlinks; incomplete "
-        "measurements stay unknown, and a known breach stops only that owned check process group.",
-        "Safe evidence copy (symlinks are preserved literally and never followed; DEST must be new):",
-        f'  python3 "{task_dir / "tools" / "pi_copy.py"}" SOURCE DEST --max-bytes N',
-        "Opt-in board projection (only when main registered this task; refresh is read-only over",
-        "existing evidence and never copies logs into the board):",
-        f'  python3 "{task_dir / "tools" / "pi_board.py"}" refresh --repo REPO --task TASK',
-        f'Only "{task_dir / "tools"}" and "{checks_dir}" may be written outside the worktree.',
+        "## Native tools",
+        "- check(id, command, timeoutSeconds?, watchPath?, maxBytes?): run a verification command "
+        "through the task's frozen pi_check helper; receipts capture the true exit, log hash, HEAD "
+        "and dirty state. A failing check returns the log tail. Use it instead of bash for every "
+        "recorded check; with a phase contract the command must be the declared one.",
+        "- progress(activity, step?, next?, blocker?, completedCriteria?, evidenceRefs?): "
+        "self-reported progress, never acceptance.",
+        "- readiness(): read-only delivery check of the contract against the receipts.",
+        "Every bash call has a finite timeout (a default is filled in and a ceiling clamps larger "
+        "values). Close fixtures with try/finally; a catch-and-print is not verification.",
+        f'Only "{task_dir / "tools"}" and this round\'s checks directory may be written outside '
+        "the worktree.",
         FORBIDDEN_RULE_TEXT,
         MUST_ASK_LINE,
-        "",
-        "End with a concise report of changes and evidence. Never claim acceptance PASS;",
-        "a zero exit code only proves execution finished.",
-    ]
-    return lines
+        "End with a concise report of changes and evidence. Never claim acceptance PASS; a zero "
+        "exit code only proves execution finished."]
+    return "\n".join(lines) + "\n"
 
 
 def write_brief(path: Path, text: str) -> str:
@@ -2238,6 +2051,28 @@ def write_brief(path: Path, text: str) -> str:
         stream.write(text)
     os.chmod(path, 0o444)
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+MIN_PI_VERSION = (1, 0, 0)
+
+
+def pi_version() -> str:
+    """Installed Pi version; refuses a missing, unreadable or too old Pi (needs >= 1.0.0)."""
+    pi_bin = os.environ.get("PI_BIN") or "pi"
+    need = ".".join(str(part) for part in MIN_PI_VERSION)
+    try:
+        proc = subprocess.run([pi_bin, "--version"], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(f"cannot read the Pi version ({exc}); Pi >= {need} is required") from None
+    found = re.search(r"(\d+)\.(\d+)\.(\d+)", (proc.stdout or "") + (proc.stderr or ""))
+    if proc.returncode != 0 or not found:
+        raise ValueError(f"cannot read the Pi version (`{pi_bin} --version` exited "
+                         f"{proc.returncode}); Pi >= {need} is required")
+    parts = tuple(int(part) for part in found.groups())
+    if parts < MIN_PI_VERSION:
+        raise ValueError(f"Pi {'.'.join(found.groups())} is too old; Pi >= {need} is required")
+    return ".".join(found.groups())
 
 
 def worker_env() -> dict:
@@ -2324,124 +2159,36 @@ def finish_round(task_dir: Path, round_number: int, round_dir: Path, task: dict,
         atomic(round_dir / "round.state.json", state)
 
 
-def _board_pause_lock(task: dict):
-    """Hold the board lock when a board exists, so a concurrent pause cannot
-    interleave with the auto-continuation start decision.
-
-    Returns ``(fd, board_path, problem)``: ``fd`` is None for an offline task
-    or when the lock could not be acquired (then ``problem`` is set and the
-    caller must fail closed).
-    """
-    common = task.get("commonDir") if isinstance(task, dict) else None
-    if not isinstance(common, str):
-        return None, None, None
-    board = Path(common) / "codex-pi" / "board.json"
-    if not board.is_file():
-        return None, None, None
-    try:
-        from pi_board import BOARD_LOCK
-    except Exception as exc:  # noqa: BLE001 - fail closed when the lock identity is unknown
-        return None, board, f"board lock identity unavailable: {type(exc).__name__}: {exc}"
-    try:
-        return lock_fd(board.with_name(BOARD_LOCK), blocking=True, timeout=5), board, None
-    except LockHeld:
-        return None, board, "board lock was held; pause state is unknown"
-
-
-def post_round_phase(task: dict, task_dir: Path, round_number: int, round_dir: Path,
-                    state: dict, outcome: str):
-    """Decide review/escalate/auto-continue after one finished round.
-
-    Returns ``{"round": N, "timeoutSeconds": T, "decision": ...}`` when the
-    single same-phase continuation was claimed and started, else ``None`` so the
-    caller performs the normal bounded final board projection.
-    """
-    task_id = task.get("task")
+def record_phase_round(task: dict, task_dir: Path, round_number: int, round_dir: Path,
+                       state: dict, outcome: str) -> None:
+    """Record the phase round log, the readiness snapshot and the post-round classification."""
     record, _problem = read_phase_record(task_dir)
     if not isinstance(record, dict):
-        return None
+        return
     contract = record.get("contract") or {}
-    phase_id = contract.get("phaseId")
     phase_state = read_phase_state(task_dir)
     rounds_log = phase_state.get("rounds") if isinstance(phase_state.get("rounds"), list) else []
     rounds_log = (rounds_log + [{"round": round_number, "state": outcome,
                                  "exitCode": state.get("exitCode"),
                                  "endedAt": state.get("endedAt") or time.time()}])[-50:]
-    phase_state.update({"phaseId": phase_id, "contractSha256": record.get("contractSha256"),
+    phase_state.update({"phaseId": contract.get("phaseId"),
+                        "contractSha256": record.get("contractSha256"),
                         "rounds": rounds_log, "updatedAt": time.time()})
+    if outcome == "completed" and state.get("exitCode") == 0:
+        readiness = build_readiness(task_dir, task, round_number)
+        atomic(round_dir / READINESS_FILE, readiness)
+        decision = classify_readiness(readiness, record)
+        phase_state["lastReadiness"] = {"status": readiness.get("status"),
+                                        "phaseId": readiness.get("phaseId"),
+                                        "candidate": readiness.get("candidate"),
+                                        "coverage": readiness.get("coverage"),
+                                        "generatedAt": readiness.get("generatedAt")}
+        phase_state["lastDecision"] = {"action": decision.get("action"),
+                                        "reason": decision.get("reason"), "at": time.time()}
+    write_phase_state(task_dir, phase_state)
 
-    def mark_auto(status: str, **extra) -> None:
-        try:
-            ledger, problem = read_phase_auto(task_dir)
-            if ledger is None:
-                return
-            entry = (ledger.get("phases") or {}).get(phase_id)
-            if not isinstance(entry, dict):
-                return
-            entry.update({"status": status, "updatedAt": time.time(), **extra})
-            atomic(phase_auto_path(task_dir), ledger)
-            phase_state["autoContinue"] = dict(entry)
-        except OSError:
-            pass
 
-    if outcome != "completed" or state.get("exitCode") != 0:
-        mark_auto("exhausted", exhaustedAt=time.time(), exhaustedReason=f"round_{outcome}")
-        write_phase_state(task_dir, phase_state)
-        return None
-    readiness = build_readiness(task_dir, task, round_number)
-    atomic(round_dir / READINESS_FILE, readiness)
-    decision = evaluate_auto_continue(task, task_dir, round_number, record, readiness)
-    phase_state["lastReadiness"] = {"status": readiness.get("status"),
-                                    "phaseId": readiness.get("phaseId"),
-                                    "candidate": readiness.get("candidate"),
-                                    "coverage": readiness.get("coverage"),
-                                    "generatedAt": readiness.get("generatedAt")}
-    phase_state["lastDecision"] = {"action": decision.get("action"),
-                                    "reason": decision.get("reason"), "at": time.time()}
-    if decision.get("action") != "auto_continue":
-        if decision.get("reason") == "auto_continue_used":
-            mark_auto("exhausted", exhaustedAt=time.time(),
-                      exhaustedReason="second round still missing required evidence")
-        write_phase_state(task_dir, phase_state)
-        return None
-    # Fail closed on a pause that arrived between the decision read and the
-    # start. The board lock is held across the final pause check and the round
-    # creation, so an explicit pause is either already visible here or is
-    # serialized after the start (existing pause/cancel semantics then apply).
-    board_lock, board_path, lock_problem = _board_pause_lock(task)
-    if lock_problem:
-        mark_auto("blocked", blockedAt=time.time(), reason="pause_state_unknown",
-                  detail=lock_problem)
-        phase_state["lastDecision"] = {"action": "escalate", "reason": "pause_state_unknown",
-                                        "at": time.time()}
-        write_phase_state(task_dir, phase_state)
-        return None
-    try:
-        if board_path is not None:
-            paused_now, pause_reason = board_pause_active(task)
-            if paused_now:
-                mark_auto("blocked", blockedAt=time.time(), reason="paused", detail=pause_reason)
-                phase_state["lastDecision"] = {"action": "escalate", "reason": "paused",
-                                                "at": time.time()}
-                write_phase_state(task_dir, phase_state)
-                return None
-        next_number = round_number + 1
-        try:
-            prompt = compose_gap_prompt(task, record, decision.get("gaps") or [])
-            prior = {"round": round_number, "state": outcome, "exitCode": state.get("exitCode"),
-                     "endHead": state.get("endHead")}
-            ensure_round_inputs(task_dir, next_number, prompt, task, prior)
-        except Exception as exc:  # noqa: BLE001 - unknown start must escalate, never retry
-            mark_auto("unknown", startError=f"{type(exc).__name__}: {exc}")
-            write_phase_state(task_dir, phase_state)
-            return None
-        mark_auto("started", startedAt=time.time())
-        write_phase_state(task_dir, phase_state)
-        return {"round": next_number, "timeoutSeconds": decision.get("timeoutSeconds"),
-                "decision": decision}
-    finally:
-        if board_lock is not None:
-            os.close(board_lock)
+WORKER_NOT_LOADED = "WORKER_EXTENSION_NOT_LOADED"
 
 
 def run_worker(args) -> int:
@@ -2475,178 +2222,181 @@ def run_worker(args) -> int:
         return 1
     worktree = Path(task["worktree"])
 
-    while True:
-        blocked, reason = board_pause_active(task)
-        if blocked and reason and reason.startswith("Codex takeover required"):
-            raise ValueError(reason)
-        round_dir = task_dir / "rounds" / str(round_number)
-        if not round_dir.is_dir():
-            raise ValueError(f"round directory is missing: {round_dir}")
-        for name in ("round.jsonl", "round.err"):
-            (round_dir / name).touch(exist_ok=True)
+    round_dir = task_dir / "rounds" / str(round_number)
+    if not round_dir.is_dir():
+        raise ValueError(f"round directory is missing: {round_dir}")
+    for name in ("round.jsonl", "round.err"):
+        (round_dir / name).touch(exist_ok=True)
 
-        state_path = round_dir / "round.state.json"
-        state = read_json(state_path, {}) or {}
-        state.update(taskDir=str(task_dir), round=round_number)
-        try:
-            start_head = git(worktree, "rev-parse", "HEAD")
-        except subprocess.CalledProcessError:
-            start_head = None
-        state.update(state="running", supervisorPid=os.getpid(), startedAt=time.time(),
-                     startHead=start_head, timedOut=False, cancelled=False, exitCode=None,
-                     workerScript=str(Path(__file__).resolve()), runtimeVersion=runtime_version())
+    state_path = round_dir / "round.state.json"
+    state = read_json(state_path, {}) or {}
+    state.update(taskDir=str(task_dir), round=round_number)
+    try:
+        start_head = git(worktree, "rev-parse", "HEAD")
+    except subprocess.CalledProcessError:
+        start_head = None
+    state.update(state="running", supervisorPid=os.getpid(), startedAt=time.time(),
+                 startHead=start_head, timedOut=False, cancelled=False, exitCode=None,
+                 workerScript=str(Path(__file__).resolve()), runtimeVersion=runtime_version())
+    atomic(state_path, state)
+
+    if cancel_requested(task_dir, round_number):
+        atomic(task_dir / "cancel.observed", {"round": round_number, "at": time.time(),
+                                              "beforeSpawn": True})
+        finish_round(task_dir, round_number, round_dir, task, state, "cancelled", None,
+                     {"timedOut": False, "cancelled": True,
+                      "note": "cancellation was requested before Pi started"})
+        # The pre-spawn cancel is a terminal exit too: make the same final
+        # board notification/dispatch as every other terminal path.
+        refresh_board_best_effort(task)
+        return 0
+
+    tools = READ_ONLY_TOOLS if task["readOnly"] else WRITABLE_TOOLS
+    pi_bin = os.environ.get("PI_BIN") or "pi"
+    argv = [pi_bin, "-p", "--mode", "json", "--session-id", task["sessionId"],
+            "--session-dir", task["sessionDir"], "--model", task["model"],
+            "--thinking", task["thinking"], "--tools", tools,
+            "--no-extensions", "--no-approve", "-e", str(task_dir / "tools" / "pi_worker.ts"),
+            "--no-skills", "--no-prompt-templates",
+            "@" + str(round_dir / "brief.md")]
+    worker_environment = worker_env()
+    worker_environment["CODEX_PI_WORKER_CONFIG"] = str(round_dir / WORKER_CONFIG_FILE)
+
+    resource_monitor = None
+    phase_record, _phase_problem = read_phase_record(task_dir)
+    if isinstance(phase_record, dict):
+        resource_contract = phase_record.get("contract") or {}
+        declared_limits = resource_contract.get("resourceLimits") or []
+        if declared_limits:
+            resource_monitor = PhaseResourceMonitor(
+                round_dir, worktree, declared_limits,
+                resource_contract.get("phaseId"), phase_record.get("contractSha256"),
+                round_number, _resource_unknown_seconds())
+
+    child = None
+    outcome, code = "failed", 1
+    timed_out = cancelled = False
+    error = None
+    resource_stop_reason = None
+    caught = {"signal": None}
+    ready_marker = round_dir / WORKER_READY_FILE
+    log_offset = 0
+
+    def interrupted(sig, _frame):
+        caught["signal"] = sig
+        raise KeyboardInterrupt
+
+    def tool_ran_before_ready() -> bool:
+        """True when the JSON stream shows a tool execution but no load proof exists.
+
+        The stream is read first and the marker second: the extension writes the
+        marker before Pi can emit any tool event, so this order cannot misfire.
+        """
+        nonlocal log_offset
+        with (round_dir / "round.jsonl").open("rb") as stream:
+            stream.seek(log_offset)
+            chunk = stream.read(1 << 20)
+            log_offset += len(chunk)
+        return b'"tool_execution_start"' in chunk and not ready_marker.is_file()
+
+    previous = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        with (round_dir / "round.jsonl").open("ab") as out, \
+                (round_dir / "round.err").open("ab") as err:
+            # Pi inherits the task lock, so a SIGKILLed supervisor cannot free
+            # capacity while its Pi child is still running.
+            child = subprocess.Popen(argv, cwd=str(worktree), stdin=subprocess.DEVNULL,
+                                     stdout=out, stderr=err, start_new_session=True,
+                                     env=worker_environment, pass_fds=(args.lock_fd,))
+        state["piPid"] = child.pid
         atomic(state_path, state)
-
-        if cancel_requested(task_dir, round_number):
-            atomic(task_dir / "cancel.observed", {"round": round_number, "at": time.time(),
-                                                  "beforeSpawn": True})
-            finish_round(task_dir, round_number, round_dir, task, state, "cancelled", None,
-                         {"timedOut": False, "cancelled": True,
-                          "note": "cancellation was requested before Pi started"})
-            # The pre-spawn cancel is a terminal exit too: make the same final
-            # board notification/dispatch as every other terminal path.
-            refresh_board_best_effort(task)
-            return 0
-
-        tools = READ_ONLY_TOOLS if task["readOnly"] else WRITABLE_TOOLS
-        pi_bin = os.environ.get("PI_BIN") or "pi"
-        argv = [pi_bin, "-p", "--mode", "json", "--session-id", task["sessionId"],
-                "--session-dir", task["sessionDir"], "--model", task["model"],
-                "--thinking", task["thinking"], "--tools", tools,
-                "--no-extensions", "--no-skills", "--no-prompt-templates",
-                "@" + str(round_dir / "brief.md")]
-
-        resource_monitor = None
-        phase_record, _phase_problem = read_phase_record(task_dir)
-        if isinstance(phase_record, dict):
-            resource_contract = phase_record.get("contract") or {}
-            declared_limits = resource_contract.get("resourceLimits") or []
-            if declared_limits:
-                resource_monitor = PhaseResourceMonitor(
-                    round_dir, worktree, declared_limits,
-                    resource_contract.get("phaseId"), phase_record.get("contractSha256"),
-                    round_number, _resource_unknown_seconds())
-
-        child = None
-        outcome, code = "failed", 1
-        timed_out = cancelled = False
-        error = None
-        resource_stop_reason = None
-        caught = {"signal": None}
-
-        def interrupted(sig, _frame):
-            caught["signal"] = sig
-            raise KeyboardInterrupt
-
-        previous = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGINT, signal.SIGTERM)}
-        try:
-            with (round_dir / "round.jsonl").open("ab") as out, \
-                    (round_dir / "round.err").open("ab") as err:
-                # Pi inherits the task lock, so a SIGKILLed supervisor cannot free
-                # capacity while its Pi child is still running.
-                child = subprocess.Popen(argv, cwd=str(worktree), stdin=subprocess.DEVNULL,
-                                         stdout=out, stderr=err, start_new_session=True,
-                                         env=worker_env(), pass_fds=(args.lock_fd,))
-            state["piPid"] = child.pid
-            atomic(state_path, state)
-            forbidden_roots, allowed_roots = forbidden_checkouts(worktree, task_dir, round_number)
-            command_guard = CommandGuard(round_dir, child.pid,
-                ceiling=float((phase_record or {}).get("contract", {}).get("commandTimeoutSeconds") or 3600),
-                forbidden=forbidden_roots, allowed=allowed_roots, cwd=worktree)
-            last_command_scan = 0.0
-            deadline = time.monotonic() + timeout_seconds
-            board_interval = board_refresh_seconds()
-            last_board_refresh = time.monotonic() - board_interval
-            resource_interval = _resource_scan_seconds()
-            last_resource_scan = time.monotonic() - resource_interval
-            while True:
-                raw = child.poll()
-                if raw is not None:
-                    code = raw if raw >= 0 else 128 - raw
-                    outcome = "completed" if code == 0 else "failed"
-                    break
-                if cancel_requested(task_dir, round_number):
-                    cancelled, outcome = True, "cancelled"
-                    break
-                if time.monotonic() >= deadline:
-                    timed_out, outcome, code = True, "timed_out", 124
-                    break
-                now = time.monotonic()
-                if now - last_command_scan >= 1.0:
-                    last_command_scan = now
-                    try:
-                        if not board_pause_active(task)[0]:
-                            command_guard.scan()
-                    except Exception as exc:
-                        # Failed observation never authorizes worker cancellation.
-                        detail = f"{type(exc).__name__}: {exc}"
-                        if state.get("commandProtectionError") != detail:
-                            state["commandProtectionError"] = detail
-                            atomic(state_path, state)
-                if resource_monitor is not None \
-                        and now - last_resource_scan >= resource_interval:
-                    last_resource_scan = now
-                    stop_reason = resource_monitor.scan()
-                    if stop_reason:
-                        resource_stop_reason = stop_reason
-                        error = error or stop_reason
-                        terminate(child)
-                        outcome, code = "failed", 75
-                        break
-                if now - last_board_refresh >= board_interval:
-                    last_board_refresh = now
-                    refresh_board_best_effort(task)
-                time.sleep(0.2)
-        except KeyboardInterrupt:
-            outcome, code = "interrupted", 128 + (caught["signal"] or signal.SIGINT)
-        except Exception as exc:
-            error = str(exc)
-            outcome, code = "unknown", None
-        finally:
-            for sig in previous:
-                signal.signal(sig, signal.SIG_IGN)
-            if child is not None:
+        deadline = time.monotonic() + timeout_seconds
+        board_interval = board_refresh_seconds()
+        last_board_refresh = time.monotonic() - board_interval
+        resource_interval = _resource_scan_seconds()
+        last_resource_scan = time.monotonic() - resource_interval
+        while True:
+            raw = child.poll()
+            if raw is not None:
+                code = raw if raw >= 0 else 128 - raw
+                outcome = "completed" if code == 0 else "failed"
+                break
+            if cancel_requested(task_dir, round_number):
+                cancelled, outcome = True, "cancelled"
+                break
+            if time.monotonic() >= deadline:
+                timed_out, outcome, code = True, "timed_out", 124
+                break
+            now = time.monotonic()
+            if not ready_marker.is_file() and tool_ran_before_ready():
+                error = f"{WORKER_NOT_LOADED}: a tool execution appeared before worker.ready"
                 terminate(child)
-                raw = child.returncode
-                if outcome == "completed":
-                    code = raw if raw is not None and raw >= 0 else code
-                elif outcome in ("cancelled", "timed_out", "interrupted") and raw is not None:
-                    if outcome != "timed_out":
-                        code = raw if raw >= 0 else 128 - raw
-            for sig, handler in previous.items():
-                signal.signal(sig, handler)
+                outcome, code = "failed", 76
+                break
+            if resource_monitor is not None \
+                    and now - last_resource_scan >= resource_interval:
+                last_resource_scan = now
+                stop_reason = resource_monitor.scan()
+                if stop_reason:
+                    resource_stop_reason = stop_reason
+                    error = error or stop_reason
+                    terminate(child)
+                    outcome, code = "failed", 75
+                    break
+            if now - last_board_refresh >= board_interval:
+                last_board_refresh = now
+                refresh_board_best_effort(task)
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        outcome, code = "interrupted", 128 + (caught["signal"] or signal.SIGINT)
+    except Exception as exc:
+        error = str(exc)
+        outcome, code = "unknown", None
+    finally:
+        for sig in previous:
+            signal.signal(sig, signal.SIG_IGN)
+        if child is not None:
+            terminate(child)
+            raw = child.returncode
+            if outcome == "completed":
+                code = raw if raw is not None and raw >= 0 else code
+            elif outcome in ("cancelled", "timed_out", "interrupted") and raw is not None:
+                if outcome != "timed_out":
+                    code = raw if raw >= 0 else 128 - raw
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
-        if cancelled:
-            atomic(task_dir / "cancel.observed", {"round": round_number, "at": time.time()})
-        resource_flags = {}
-        if resource_monitor is not None:
-            final_stop = resource_monitor.final_scan()
-            resource_state = resource_monitor.state()
-            if resource_state.get("status") == "breached":
-                resource_flags["resourceBreached"] = True
-            if resource_state.get("status") in ("unknown", "escalated"):
-                resource_flags["resourceUnknown"] = True
-            if resource_stop_reason or final_stop:
-                resource_flags["resourceReason"] = resource_stop_reason or final_stop
-                error = error or resource_flags["resourceReason"]
-            write_error = resource_state.get("writeError")
-            if write_error:
-                resource_flags["resourceWriteError"] = write_error
-                error = error or f"resource observation write failed: {write_error}"
-        finish_round(task_dir, round_number, round_dir, task, state, outcome, code,
-                     {"timedOut": timed_out, "cancelled": cancelled, "error": error,
-                      **resource_flags})
-        next_round = None
-        try:
-            next_round = post_round_phase(task, task_dir, round_number, round_dir, state, outcome)
-        except Exception as exc:  # noqa: BLE001 - a phase-check error must still leave evidence
-            error = error or f"phase delivery check failed: {type(exc).__name__}: {exc}"
-            state.update(error=error)
-            atomic(state_path, state)
-        if not isinstance(next_round, dict):
-            break
-        round_number = int(next_round["round"])
-        timeout_seconds = float(next_round.get("timeoutSeconds") or timeout_seconds)
+    if outcome in ("completed", "failed") and not ready_marker.is_file():
+        # Never ready: without the load proof no guard decision was ever made.
+        error = error or f"{WORKER_NOT_LOADED}: the round ended without worker.ready"
+        outcome = "failed"
+        code = code if code not in (0, None) else 76
+    if cancelled:
+        atomic(task_dir / "cancel.observed", {"round": round_number, "at": time.time()})
+    resource_flags = {}
+    if resource_monitor is not None:
+        final_stop = resource_monitor.final_scan()
+        resource_state = resource_monitor.state()
+        if resource_state.get("status") == "breached":
+            resource_flags["resourceBreached"] = True
+        if resource_state.get("status") in ("unknown", "escalated"):
+            resource_flags["resourceUnknown"] = True
+        if resource_stop_reason or final_stop:
+            resource_flags["resourceReason"] = resource_stop_reason or final_stop
+            error = error or resource_flags["resourceReason"]
+        write_error = resource_state.get("writeError")
+        if write_error:
+            resource_flags["resourceWriteError"] = write_error
+            error = error or f"resource observation write failed: {write_error}"
+    finish_round(task_dir, round_number, round_dir, task, state, outcome, code,
+                 {"timedOut": timed_out, "cancelled": cancelled, "error": error,
+                  **resource_flags})
+    try:
+        record_phase_round(task, task_dir, round_number, round_dir, state, outcome)
+    except Exception as exc:  # noqa: BLE001 - a phase-check error must still leave evidence
+        error = error or f"phase delivery check failed: {type(exc).__name__}: {exc}"
+        state.update(error=error)
+        atomic(state_path, state)
     # One bounded final projection so terminal outcomes reach a registered card
     # without any external poller; ordinary progress already refreshed above.
     refresh_board_best_effort(task)
@@ -2664,8 +2414,50 @@ def project_context(repo_arg: str):
     return root, config, common
 
 
+BASH_DEFAULT_TIMEOUT_SECONDS = 600.0
+BASH_CEILING_SECONDS = 3600.0
+WORKER_READY_FILE = "worker.ready"
+WORKER_CONFIG_FILE = "worker.json"
+
+
+def settle_quota_path(task_dir: Path, phase_id) -> Path:
+    """One-shot settle-continue claim file for a phase (created exclusively by the extension)."""
+    digest = hashlib.sha256(str(phase_id).encode("utf-8")).hexdigest()[:24]
+    return task_dir / "settle" / f"{digest}.claim"
+
+
+def write_worker_config(task_dir: Path, round_number: int, task: dict, contract_text: str) -> Path:
+    """Write ``rounds/N/worker.json`` for the in-process worker extension."""
+    round_dir = task_dir / "rounds" / str(round_number)
+    forbidden, allowed = forbidden_checkouts(Path(task["worktree"]), task_dir, round_number)
+    phase_record, _problem = read_phase_record(task_dir)
+    phase = isinstance(phase_record, dict)
+    ceiling = BASH_CEILING_SECONDS
+    if phase:
+        cap = (phase_record.get("contract") or {}).get("commandTimeoutSeconds")
+        if isinstance(cap, (int, float)) and not isinstance(cap, bool) \
+                and math.isfinite(float(cap)) and float(cap) > 0:
+            ceiling = float(cap)
+    config = {
+        "schemaVersion": 1, "task": task["task"], "round": round_number,
+        "repo": task["repo"], "worktree": task["worktree"],
+        "forbiddenRoots": forbidden, "allowedRoots": allowed,
+        "bashDefaultTimeoutSeconds": min(BASH_DEFAULT_TIMEOUT_SECONDS, ceiling),
+        "bashCeilingSeconds": ceiling,
+        "checkTimeoutSeconds": check_timeout_seconds(task, phase_record),
+        "checksDir": str(round_dir / "round.checks"), "toolsDir": str(task_dir / "tools"),
+        "python": sys.executable, "phase": phase,
+        "settleQuotaPath": str(settle_quota_path(
+            task_dir, (phase_record.get("contract") or {}).get("phaseId"))) if phase else None,
+        "roundDir": str(round_dir), "contract": contract_text,
+    }
+    path = round_dir / WORKER_CONFIG_FILE
+    atomic(path, config)
+    return path
+
+
 def ensure_round_inputs(task_dir: Path, round_number: int, prompt: str, task: dict,
-                        prior: dict | None) -> Path:
+                        prior: dict | None, pi_version: str = "unknown") -> Path:
     if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
         raise ValueError(f"prompt exceeds {MAX_PROMPT_BYTES} bytes")
     if not prompt.strip():
@@ -2676,9 +2468,11 @@ def ensure_round_inputs(task_dir: Path, round_number: int, prompt: str, task: di
     try:
         if (round_dir / "brief.md").exists():
             raise ValueError(f"round {round_number} already has a brief; never overwrite evidence")
-        brief_text, contract_text = compose_round_texts(task, round_number, prompt, prior)
-        digest = write_brief(round_dir / "brief.md", brief_text)
+        contract_text = compose_contract(task)
+        digest = write_brief(round_dir / "brief.md", compose_brief(task, round_number, prompt, prior))
         write_brief(round_dir / "contract.md", contract_text)
+        (round_dir / "round.checks").mkdir(exist_ok=True)
+        write_worker_config(task_dir, round_number, task, contract_text)
     except FileExistsError:
         raise ValueError(f"round {round_number} already has a brief; never overwrite evidence") from None
     atomic(round_dir / "round.state.json",
@@ -2688,7 +2482,7 @@ def ensure_round_inputs(task_dir: Path, round_number: int, prompt: str, task: di
     with (round_dir / "round.meta").open("a", encoding="utf-8") as meta:
         meta.write(f"task={task['task']} round={round_number} model={task['model']} "
                    f"thinking={task['thinking']}\nworktree={task['worktree']}\n"
-                   f"start={time.time()}\nbrief_sha256={digest}\n")
+                   f"start={time.time()}\nbrief_sha256={digest}\npi_version={pi_version}\n")
     return round_dir
 
 
@@ -2703,15 +2497,9 @@ def cmd_start(args) -> dict:
     root, config, common = project_context(args.repo)
     require_allowed_model(config["model"], "config")
     task = require_task_arg(args.task)
-    review_limit = NEW_TASK_DEFAULT_LIMIT if args.review_limit is None \
-        else int(args.review_limit)
-    if review_limit not in NEW_TASK_REVIEW_LIMITS:
-        raise ValueError(f"--review-limit is fixed at {NEW_TASK_DEFAULT_LIMIT} for new tasks "
-                         "(two complete deliveries with a whole-task Codex replan after the "
-                         "first reviewed quality failure); historical pins 1/2 and unpinned "
-                         "legacy tasks keep their frozen limit")
     worktree, start_head = validate_worktree(common, root, args.worktree)
     prompt = read_prompt(args)
+    installed_pi = pi_version()
     contract_raw = None
     if args.contract_file:
         contract_raw = load_contract(args.contract_file)
@@ -2751,9 +2539,8 @@ def cmd_start(args) -> dict:
             "constraints": config["constraints"], "checks": config["checks"],
             "maxWorkers": config["maxWorkers"], "timeoutSeconds": config["timeoutSeconds"],
             "createdAt": created_at, "startHead": start_head,
-            "reviewPolicy": {"schemaVersion": 1, "qualityFailureLimit": review_limit,
-                             "pinnedAt": created_at, "pinnedBy": "start"},
             "runtimeVersion": runtime_version(), "helperHashes": hashes,
+            "piVersion": installed_pi,
             "sessionId": task, "sessionDir": str(task_dir / "session"),
         }
         atomic(task_dir / "task.json", task_json)
@@ -2761,7 +2548,7 @@ def cmd_start(args) -> dict:
         if contract_raw is not None:
             install_phase_contract(task_dir, contract_raw, root, worktree)
             timeout_seconds = min(timeout_seconds, float(contract_raw["budgetSeconds"]))
-        ensure_round_inputs(task_dir, 1, prompt, task_json, None)
+        ensure_round_inputs(task_dir, 1, prompt, task_json, None, installed_pi)
         spawn_worker(task_dir, 1, lock_value, timeout_seconds)
     except Exception as exc:
         if lock_value is not None:
@@ -2785,7 +2572,6 @@ def cmd_start(args) -> dict:
     return {"ok": True, "task": task, "round": 1, "state": "starting",
             "repo": str(root), "worktree": str(worktree),
             "readOnly": bool(args.read_only), "model": config["model"], "thinking": config["thinking"],
-            "reviewPolicy": task_json["reviewPolicy"],
             "sessionId": task, "sessionDir": str(task_dir / "session"),
             "phase": None if phase_record is None else {
                 "phaseId": (phase_record.get("contract") or {}).get("phaseId"),
@@ -2816,6 +2602,7 @@ def cmd_continue(args) -> dict:
     config = load_config(root)
     worktree, _ = validate_worktree(common, root, frozen["worktree"])
     prompt = read_prompt(args)
+    installed_pi = pi_version()
     contract_raw = None
     if args.contract_file:
         contract_raw = load_contract(args.contract_file)
@@ -2856,7 +2643,7 @@ def cmd_continue(args) -> dict:
                 raise ValueError(f"round {value} has no state evidence; stale artifacts, inspect {candidate}")
             if round_state.get("state") in ACTIVE_STATES or round_state.get("state") not in TERMINAL_STATES:
                 raise ValueError(f"round {value} is not terminal-known (state={round_state.get('state')!r}); "
-                                 "do not auto-continue or replay an unknown run")
+                                 "never replay an unknown run")
             if not meta.is_file() or "exit" not in read_meta(meta):
                 raise ValueError(f"round {value} has no exit evidence; stale artifacts, inspect {candidate}")
             if not (candidate / "round.jsonl").is_file():
@@ -2890,7 +2677,7 @@ def cmd_continue(args) -> dict:
                     phase_record = install_phase_contract(task_dir, contract_raw, root, worktree)
                 elif phase_record.get("contractSha256") != new_hash:
                     # Explicit design revision for the same phase: allowed, but the
-                    # original budget anchor and the single auto-continue quota stay.
+                    # original budget anchor stays.
                     phase_record = install_phase_contract(task_dir, contract_raw, root, worktree,
                                                           prior=phase_record)
         timeout_seconds = float(frozen["timeoutSeconds"])
@@ -2906,7 +2693,7 @@ def cmd_continue(args) -> dict:
             timeout_seconds = min(timeout_seconds, max(1.0, remaining))
         prior = {"round": latest_number, "state": latest_state.get("state"),
                  "exitCode": latest_state.get("exitCode"), "endHead": latest_head}
-        round_dir = ensure_round_inputs(task_dir, number, prompt, frozen, prior)
+        round_dir = ensure_round_inputs(task_dir, number, prompt, frozen, prior, installed_pi)
         spawn_worker(task_dir, number, lock_value, timeout_seconds)
     except Exception as exc:
         if lock_value is not None:
@@ -3199,7 +2986,7 @@ def _redact_receipt_metadata(checks: dict) -> dict:
 
 def _scan_checks(checks_dir: Path) -> dict:
     result = {"dir": str(checks_dir), "exists": checks_dir.is_dir(), "entries": 0,
-              "partial": False, "running": None, "legacyCandidate": None, "ignored": [],
+              "partial": False, "running": None, "unreceiptedLog": None, "ignored": [],
               "ignoredCount": 0,
               "receipts": {"total": 0, "scanned": 0, "truncated": False, "partial": False,
                            "failedAttempts": 0, "latest": None, "latestFailed": None,
@@ -3307,11 +3094,11 @@ def _scan_checks(checks_dir: Path) -> dict:
     for log in sorted(logs, key=_mtime, reverse=True):
         if log.stem in valid_receipt_stems or log.stem in active_marker_stems:
             continue
-        result["legacyCandidate"] = {
+        result["unreceiptedLog"] = {
             "log": log.name, "uncertain": True,
             "reason": "no validated receipt and no live running marker; quiet output is not failure",
             "recordedAt": _mtime(log), "logEvidence": _tail_evidence(log),
-            "note": "legacy attempt candidate only: not proof of an active, hung or failed check"}
+            "note": "unreceipted-log candidate only: not proof of an active, hung or failed check"}
         break
 
     # Local no-follow resource-guard snapshot. Unknown is never "under budget";
@@ -3377,7 +3164,7 @@ def _invalid_phase_info(task_dir: Path, problem: str, candidate: dict,
 
     The invalid record is never projected as absent: the board keeps a phase
     binding with unknown readiness so an old phase event cannot fall back to the
-    legacy accept path while the declared contract cannot be trusted.
+    brief-only accept path while the declared contract cannot be trusted.
     """
     raw = read_json(phase_path(task_dir), None)
     raw = raw if isinstance(raw, dict) else {}
@@ -3401,7 +3188,7 @@ def _invalid_phase_info(task_dir: Path, problem: str, candidate: dict,
         "contractRef": str(phase_path(task_dir)),
         "baselineCommit": raw.get("baselineCommit"),
         "state": "invalid", "candidate": candidate.get("head"),
-        "budget": phase_budget(task_dir, None), "autoContinue": None,
+        "budget": phase_budget(task_dir, None),
         "lastDecision": None,
         "evidence": {"schemaVersion": 1, "round": round_number, "phaseId": phase_id,
                      "contractSha256": digest, "candidate": candidate,
@@ -3496,8 +3283,8 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
     if checks["running"] is not None:
         notes.append("the running marker and wrapper deadline come from pi_check; an inner command "
                      "deadline is never inferred from shell syntax")
-    if checks["legacyCandidate"] is not None:
-        notes.append("the latest unreceipted check log is an explicitly uncertain legacy candidate; "
+    if checks["unreceiptedLog"] is not None:
+        notes.append("the latest unreceipted check log is an explicitly uncertain unreceipted-log candidate; "
                      "it is not proof of an active, hung or failed check")
     guard = checks.get("resourceGuard") or {}
     if guard.get("breached"):
@@ -3521,12 +3308,6 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
         contract = phase_record.get("contract") or {}
         phase_state = read_phase_state(task_dir)
         budget = phase_budget(task_dir, phase_record)
-        auto_ledger, auto_problem = read_phase_auto(task_dir)
-        auto_entry = None
-        if auto_ledger is not None:
-            auto_entry = (auto_ledger.get("phases") or {}).get(contract.get("phaseId"))
-        elif auto_problem:
-            auto_entry = {"status": "unknown", "error": auto_problem}
         readiness = None
         snapshot = None
         try:
@@ -3551,7 +3332,6 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
             "state": phase_state.get("state") or "executing",
             "candidate": candidate_block.get("head"),
             "budget": budget,
-            "autoContinue": auto_entry,
             "lastDecision": phase_state.get("lastDecision"),
             "evidence": snapshot,
             "readiness": readiness,
@@ -3613,10 +3393,7 @@ def build_result(repo_arg: str, task_arg: str, round_arg=None) -> dict:
     selected_raw = (read_json(selected_dir / "round.state.json", {}) or {}).get("state")
     summary_data = load_round_summary(task_dir, frozen, selected_dir, selected_number)
     summary = bounded(summary_data) if isinstance(summary_data, dict) and "source" in summary_data else None
-    summary_text = (selected_dir / "round.summary.txt").read_text(encoding="utf-8") \
-        if (selected_dir / "round.summary.txt").is_file() else None
-    notes = ["exit 0 means the Pi process completed execution; it is never acceptance PASS",
-             "acceptance requires the project's own checks and independent main review"]
+    notes = ["exit 0 means the Pi process completed execution; it is never acceptance PASS"]
     if selected_state["state"] == "unknown":
         if selected_raw in ACTIVE_STATES and task_held:
             notes.append("the supervisor is gone but an owned Pi child still holds the task lock; "
@@ -3633,25 +3410,34 @@ def build_result(repo_arg: str, task_arg: str, round_arg=None) -> dict:
         notes.append("model usage was not fully reported; missing values are unknown, not zero")
     if supervisor_alive:
         notes.append("the supervisor is alive and holds the task lock")
+    checks = []
+    if summary is not None:
+        for receipt in ((summary.get("checks") or {}).get("receipts") or []):
+            code = receipt.get("exit_code")
+            status = "unknown" if code is None else ("failed" if code != 0 else "covered")
+            checks.append(acceptance_line(receipt.get("id") or "?", status, code,
+                                          receipt.get("test_counts")))
+        if (summary.get("checks") or {}).get("total") == 0:
+            checks = ["no check receipts recorded (missing evidence)"]
+    evidence = evidence_paths(task_dir, selected_number)
     return {
-        "schemaVersion": 1, "task": task, "repo": frozen.get("repo") or str(root),
-        "worktree": frozen.get("worktree"),
-        "readOnly": bool(frozen.get("readOnly")), "model": frozen.get("model"),
-        "thinking": frozen.get("thinking"),
-        "session": {"sessionId": frozen.get("sessionId"), "sessionDir": frozen.get("sessionDir")},
-        "round": selected_number, "latestRound": latest_number, "state": selected_state["state"],
-        "exitCode": selected_state["exitCode"], "timedOut": selected_state["timedOut"],
-        "cancelled": selected_state["cancelled"], "activeWorker": task_held,
-        "supervisorAlive": supervisor_alive,
+        "schemaVersion": 1, "task": task, "round": selected_number, "latestRound": latest_number,
+        "state": selected_state["state"], "exitCode": selected_state["exitCode"],
+        "timedOut": selected_state["timedOut"], "cancelled": selected_state["cancelled"],
         "execution": "completed_execution" if selected_state["state"] == "completed"
         and selected_state["exitCode"] == 0 else selected_state["state"],
-        "acceptance": "not_verified",
-        "rounds": compacts,
-        "summary": summary, "summaryText": summary_text,
+        "acceptance": "not_verified", "candidateHead": selected_state.get("endHead"),
+        "model": frozen.get("model"), "modelCheck": (summary or {}).get("model_check"),
+        "reportedModels": (summary or {}).get("models"),
+        "activeWorker": task_held, "supervisorAlive": supervisor_alive,
+        "usage": (summary or {}).get("usage"),
         "usageComplete": bool(summary and summary.get("usage_complete")),
-        "evidence": evidence_paths(task_dir, selected_number),
+        "costUsd": (summary or {}).get("reported_cost_usd"),
+        "checks": checks,
+        "final": ((summary or {}).get("final_excerpt") or "")[:COMPACT_FINAL_CHARS],
+        "evidence": {"roundDir": evidence.get("roundDir"),
+                     "summaryJson": evidence.get("summaryJson")},
         "notes": notes,
-        "runtimeVersion": frozen.get("runtimeVersion"),
     }
 
 
@@ -3681,164 +3467,12 @@ def acceptance_line(check_id, status, exit_code=None, counts=None) -> str:
 COMPACT_FINAL_CHARS = 1200
 
 
-def compact_result(full: dict) -> dict:
-    """Default ``result`` view derived from the full shape (``--full`` keeps it)."""
-    summary = full.get("summary") if isinstance(full.get("summary"), dict) else None
-    checks = []
-    if summary is not None:
-        for receipt in ((summary.get("checks") or {}).get("receipts") or []):
-            code = receipt.get("exit_code")
-            status = "unknown" if code is None else ("failed" if code != 0 else "covered")
-            checks.append(acceptance_line(receipt.get("id") or "?", status, code,
-                                          receipt.get("test_counts")))
-        if (summary.get("checks") or {}).get("total") == 0:
-            checks = ["no check receipts recorded (missing evidence)"]
-    selected = next((item for item in full.get("rounds") or []
-                     if item.get("round") == full.get("round")), {})
-    notes = [note for note in full.get("notes") or []
-             if isinstance(note, str) and not note.startswith("acceptance requires")]
-    view = {
-        "schemaVersion": 1, "view": "compact", "task": full.get("task"),
-        "round": full.get("round"), "latestRound": full.get("latestRound"),
-        "state": full.get("state"), "exitCode": full.get("exitCode"),
-        "timedOut": full.get("timedOut"), "cancelled": full.get("cancelled"),
-        "execution": full.get("execution"), "acceptance": full.get("acceptance"),
-        "candidateHead": selected.get("endHead"), "model": full.get("model"),
-        "usage": (summary or {}).get("usage"), "usageComplete": full.get("usageComplete"),
-        "costUsd": (summary or {}).get("reported_cost_usd"),
-        "checks": checks,
-        "final": ((summary or {}).get("final_excerpt") or "")[:COMPACT_FINAL_CHARS],
-        "evidence": {"roundDir": (full.get("evidence") or {}).get("roundDir"),
-                     "summaryJson": (full.get("evidence") or {}).get("summaryJson")},
-        "notes": notes, "more": "result --full returns the complete shape",
-    }
-    return view
-
-
 def cmd_result(args) -> dict:
-    full = build_result(args.repo, args.task, args.round)
-    return full if args.full else compact_result(full)
+    return build_result(args.repo, args.task, args.round)
 
 
 def cmd_status(args) -> dict:
     return build_status(args.repo, args.task, args.round)
-
-
-def cmd_upgrade(args) -> dict:
-    """Safely replace a non-running task's frozen helper snapshot.
-
-    Uses the existing lock protocol for mutual exclusion with start/continue:
-    the project admission lock serializes lifecycle work, and the task and
-    supervisor locks are held for the whole validate/replace/persist sequence.
-    The next ``continue`` then runs the new helpers; no half-published state.
-    """
-    root = canonical_root(Path(args.repo))
-    common = git_common_dir(root)
-    task = require_task_arg(args.task)
-    task_dir = task_dir_for(common, task)
-    if not task_dir.is_dir():
-        raise ValueError(f"unknown task {task!r}; no evidence at {task_dir}")
-    admission = lock_fd(state_root(common) / ".admission.lock", blocking=True, timeout=30)
-    task_lock = None
-    supervisor_lock = None
-    try:
-        try:
-            task_lock = lock_fd(task_dir / ".task.lock")
-        except LockHeld:
-            raise ValueError("task is active; the frozen helper snapshot is never hot-edited "
-                             "while a worker owns the task") from None
-        try:
-            supervisor_lock = lock_fd(task_dir / ".supervisor.lock")
-        except LockHeld:
-            raise ValueError("supervisor lease is still held; the frozen helper snapshot is "
-                             "never hot-edited while a supervisor owns the task") from None
-        # Re-validate everything under the held locks; a precheck outside the
-        # locks is not sufficient.
-        frozen = read_json(task_dir / "task.json", None)
-        if not isinstance(frozen, dict) or frozen.get("task") != task:
-            raise ValueError(f"task {task!r} has no readable task.json; inspect {task_dir}")
-        frozen_repo = frozen.get("repo")
-        if not isinstance(frozen_repo, str) or Path(frozen_repo).expanduser().resolve() != root:
-            raise ValueError(f"task {task!r} belongs to checkout {frozen_repo!r}, not {root}")
-        legacy = []
-        try:
-            from pi_handoff import legacy_stop_bindings
-            legacy = legacy_stop_bindings(root, task)
-        except Exception:  # noqa: BLE001 - an unreadable binding store must not block upgrades
-            legacy = []
-        if legacy:
-            first = legacy[0]
-            raise ValueError(
-                f"task {task!r} is still bound to the legacy Stop-hook handoff route "
-                f"(event {first.get('eventKey')}, state {first.get('state')!r}); this runtime no "
-                "longer delivers through it and will not adopt the task. Finish it with its "
-                f"frozen helpers: python3 {task_dir / 'tools' / 'pi_task.py'} result --repo {root} "
-                f"--task {task}, review the exact candidate yourself, then retire the "
-                f"binding record {first.get('path')} (user action) and run upgrade again.")
-        rounds = list_rounds(task_dir)
-        if not rounds:
-            raise ValueError(f"task {task!r} has no rounds yet")
-        # A missing/unreadable round state is not proof of terminal execution.
-        latest_number, latest_dir = rounds[-1]
-        round_state = read_json(latest_dir / "round.state.json", None)
-        if not isinstance(round_state, dict):
-            raise ValueError(f"latest round {latest_number} has no readable round.state.json; "
-                             "unknown state is not proof of terminal execution; refusing to "
-                             "replace helpers")
-        if round_state.get("round") not in (None, latest_number):
-            raise ValueError(f"latest round state identity mismatch (round="
-                             f"{round_state.get('round')!r}); refusing to replace helpers")
-        if round_state.get("state") not in TERMINAL_STATES:
-            raise ValueError(f"latest round {latest_number} is not terminal-known "
-                             f"(state={round_state.get('state')!r}); refusing to replace helpers")
-        meta_path = latest_dir / "round.meta"
-        if not meta_path.is_file() or "exit" not in read_meta(meta_path):
-            raise ValueError(f"latest round {latest_number} has no exit evidence; refusing to "
-                             "replace helpers")
-        source = Path(__file__).resolve().parent
-        staging = task_dir / "tools.new"
-        shutil.rmtree(staging, ignore_errors=True)
-        hashes = snapshot_helpers(source, staging)
-        tools = task_dir / "tools"
-        backup = task_dir / f"tools.old-{int(time.time())}"
-        metadata_path = task_dir / "task.json"
-        old_metadata = metadata_path.read_bytes()
-        moved_old = False
-        try:
-            if tools.exists():
-                os.replace(tools, backup)
-                moved_old = True
-            os.replace(staging, tools)
-            frozen.update(helperHashes=hashes, runtimeVersion=runtime_version(), upgradedAt=time.time())
-            history = frozen.get("upgradeHistory") \
-                if isinstance(frozen.get("upgradeHistory"), list) else []
-            frozen["upgradeHistory"] = (history[-4:] + [{"at": frozen["upgradedAt"],
-                                                          "runtimeVersion": frozen["runtimeVersion"]}])
-            atomic(metadata_path, frozen)
-        except (OSError, ValueError) as exc:
-            shutil.rmtree(staging, ignore_errors=True)
-            try:
-                if moved_old:
-                    if tools.exists():
-                        shutil.rmtree(tools, ignore_errors=True)
-                    if backup.exists() and not tools.exists():
-                        os.replace(backup, tools)
-                elif tools.exists():
-                    shutil.rmtree(tools, ignore_errors=True)
-                metadata_path.write_bytes(old_metadata)
-            except OSError:
-                pass
-            raise ValueError(f"helper snapshot upgrade failed and was rolled back: {exc}") from None
-        return {"ok": True, "task": task, "runtimeVersion": frozen["runtimeVersion"],
-                "helperHashes": hashes, "toolsDir": str(tools),
-                "backupDir": str(backup) if moved_old else None,
-                "note": "known task snapshot upgraded under the lifecycle locks; the next round "
-                        "uses the new helpers. Active tasks are refused and never hot-edited."}
-    finally:
-        for fd in (supervisor_lock, task_lock):
-            if fd is not None:
-                os.close(fd)
-        os.close(admission)
 
 
 def cmd_cancel(args) -> dict:
@@ -3935,16 +3569,14 @@ def cmd_project(args) -> dict:
                                       "existing task snapshots never change and unavailable models are "
                                       "rejected without substitution",
                        "reviewPolicy": {
-                           "newTaskDefaultLimit": NEW_TASK_DEFAULT_LIMIT,
-                           "legacyTaskLimit": LEGACY_FAILED_DELIVERY_LIMIT,
-                           "note": "a new task pins two complete deliveries; after the first "
+                           "limit": REVIEW_LIMIT,
+                           "note": "every task allows two complete deliveries; after the first "
                                    "reviewed quality failure the same Codex main session "
                                    "reassesses the complete outcome and the remaining plan "
                                    "before the second Pi delivery, and a second failure "
-                                   "transfers implementation to that main session. Historical "
-                                   "pins stay frozen; contract revisions, phase renames, "
-                                   "pauses, resumes and later config changes never raise the "
-                                   "limit or reset counted failures"},
+                                   "transfers implementation to that main session; contract "
+                                   "revisions, phase renames, pauses and resumes never reset "
+                                   "counted failures"},
                        "readOnlyIsNotASecuritySandbox": True, "codexCliInvocations": 0},
             "activeTasks": busy[:20], "activeTaskCount": len(busy),
             "note": "configuration references are instructions only; this runtime executes no configured commands"}
@@ -3973,13 +3605,8 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--prompt-file")
     start.add_argument("--prompt")
     start.add_argument("--read-only", action="store_true")
-    start.add_argument("--review-limit", type=int, choices=NEW_TASK_REVIEW_LIMITS,
-                       help="fixed at 2 for new tasks: two complete deliveries with a "
-                            "whole-task Codex main-session replan after the first reviewed "
-                            "quality failure and takeover after the second. Historical pins "
-                            "and unpinned legacy tasks keep their frozen limit.")
-    start.add_argument("--contract-file", help="frozen phase contract JSON (optional; legacy tasks "
-                                                  "start without one)")
+    start.add_argument("--contract-file", help="frozen phase contract JSON (optional; without it "
+                                                  "the task runs from its brief alone)")
     start.set_defaults(func=cmd_start)
 
     cont = sub.add_parser("continue", help="continue a terminal-known task in its pinned session")
@@ -3993,8 +3620,6 @@ def build_parser() -> argparse.ArgumentParser:
     result = sub.add_parser("result", help="bounded latest state and evidence pointers")
     add_repo_task(result)
     result.add_argument("--round", type=int)
-    result.add_argument("--full", action="store_true",
-                        help="previous full shape (per-round evidence, summaryText); default is compact")
     result.set_defaults(func=cmd_result)
 
     status = sub.add_parser("status", help="fast read-only round/check snapshot (no summary generation)")
@@ -4034,11 +3659,6 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_task(phase)
     phase.add_argument("--round", type=int)
     phase.set_defaults(func=cmd_phase_status)
-
-    upgrade = sub.add_parser("upgrade", help="safely replace a task's frozen helper snapshot when "
-                                              "no worker is active")
-    add_repo_task(upgrade)
-    upgrade.set_defaults(func=cmd_upgrade)
 
     worker = sub.add_parser("_worker", help=argparse.SUPPRESS)
     worker.add_argument("--task-dir", required=True)

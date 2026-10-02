@@ -1,268 +1,123 @@
 # Codex-Pi runtime implementation
 
-Version 0.6.0 (`runtime/VERSION`). Changes against 0.5.3: 1200-byte delivery card, compact single-line CLI output (`result --full` for the old shape), board-only progress milestones, worker contract once per session with `log_tail` and forbidden-checkout protection, removal of the Stop-hook delivery path, `check`, `wait`, `packet` and `dispatch`, and size-only Codex-facing accounting (`codex-io.jsonl`, `pi_board.py metrics`).
+Version 0.6.0 (`runtime/VERSION`). It requires Pi >= 1.0.0 and does not migrate 0.5.x tasks; finish those with their own frozen helpers.
 
-Cross-project persistent Pi worker lifecycle for the Codex main session. Final
-architecture: **Codex main → shell → shared Python lifecycle scripts → Pi CLI**.
-There is no MCP server, no Node dependency and no package manifest in this
-plugin. Python owns admission, persistence, evidence, model policy and process
-control; the main session calls the CLI through its shell.
+Cross-project persistent Pi worker lifecycle for the Codex main session: **Codex main -> shell -> Python lifecycle scripts -> Pi CLI with one worker extension**. There is no MCP server and no package manifest. Python owns admission, persistence, evidence, model policy and process control. A single dependency-free TypeScript file (`runtime/pi_worker.ts`) runs inside Pi and guards and supports the worker. Current commands and rules are in [runtime guidance](../skills/collaborate/references/runtime.md), [handoff guidance](../skills/collaborate/references/handoff.md) and [the Skill](../skills/collaborate/SKILL.md).
 
-The Pi execution path starts only Pi. The opted-in board transport invokes only `codex --disable daemon_auto_start queue` to notify the existing desktop task; it never starts another Codex model. CLI plugin management is also permitted for installation. Current commands and limits are in [runtime guidance](../skills/collaborate/references/runtime.md) and [handoff guidance](../skills/collaborate/references/handoff.md).
+The Pi execution path starts only Pi. The opted-in board transport invokes only `codex --disable daemon_auto_start queue` to notify the existing desktop task; it never starts another Codex model.
 
 ## Entrypoints
 
 ```sh
 python3 runtime/pi_task.py project  --repo <path-inside-project>
-python3 runtime/pi_task.py start    --repo <path> --task <id> --worktree <linked-checkout> --prompt-file <brief>
+python3 runtime/pi_task.py start    --repo <path> --task <id> --worktree <linked-checkout> --prompt-file <brief> [--contract-file <phase.json>] [--read-only]
 python3 runtime/pi_task.py continue --repo <path> --task <id> --prompt-file <follow-up>
-python3 runtime/pi_task.py result   --repo <path> --task <id> [--round N] [--full]
-python3 runtime/pi_task.py cancel   --repo <path> --task <id>
-python3 runtime/pi_task.py --help
+python3 runtime/pi_task.py status | result | readiness | phase-status | progress | cancel ...
+python3 runtime/pi_board.py register | show | decide | pause | resume | recover | rearm | refresh | metrics ...
 ```
 
-Every command prints one single-line compact JSON object to stdout (`result` is a compact view unless `--full`) and exits non-zero with an
-actionable stderr message on error. `PI_BIN` overrides the Pi executable (test
-double or explicit path only). Helpers used by the Pi worker are
-`runtime/pi_summary.py` and `runtime/pi_check.py`.
+Every command prints one single-line compact JSON object and exits non-zero with an actionable stderr message on error. `PI_BIN` overrides the Pi executable (test double or explicit path only).
 
 | File | Role |
 | --- | --- |
-| `runtime/pi_task.py` | Admission, config, model policy, brief, detached worker, timeout, cancel, result, CLI |
+| `runtime/pi_task.py` | Admission, config, model policy, brief and worker config, detached worker, timeout, cancel, status/result, readiness, CLI |
+| `runtime/pi_worker.ts` | In-process worker extension: guard, native tools `check`/`progress`/`readiness`, system prompt contract, settle continuation |
 | `runtime/pi_summary.py` | Bounded round summary, check-receipt aggregation, usage, reported-model check |
-| `runtime/pi_check.py` | One-check receipt: true exit/signal/timeout, log sha256, HEAD/dirty, counts |
-| `runtime/pi_handoff.py` | Hook entry: Interrupt route pause and cli-queue recovery evidence; reads legacy Stop-hook bindings only so `upgrade` can refuse them |
-| `runtime/pi_board.py` | Shared evidence board, event decisions, queue claims, deterministic CLI transport and `metrics` |
-| `runtime/pi_takeover.py` | Read-only failure-policy fold from exact review decisions; a new task pins two complete deliveries (historical pins 1/2 and legacy 3 stay frozen) and the second failure transfers implementation to the existing Codex task |
+| `runtime/pi_check.py` | One-check receipt: true exit/signal/timeout, log sha256, HEAD/dirty, counts, `log_tail` on failure |
+| `runtime/pi_phase.py` | Phase contract schema, validation and hash |
+| `runtime/pi_handoff.py` | Hook entry: Interrupt route pause and cli-queue recovery evidence |
+| `runtime/pi_board.py` | Shared evidence board, delivery card, event decisions, queue claims, CLI transport, `metrics` |
+| `runtime/pi_takeover.py` | Failure-policy fold from exact review decisions: two complete deliveries, then takeover |
 | `runtime/pi_copy.py` / `pi_size.py` | Bounded evidence copying and byte scans without following symlinks |
-| `hooks/hooks.json` | Plugin-discovered Interrupt, SessionStart and UserPromptSubmit commands (no Stop hook); requires host trust |
-| `runtime/VERSION` | Runtime version copied into every task state |
+| `hooks/hooks.json` | Interrupt, SessionStart and UserPromptSubmit hook commands; requires host trust |
 
-`pi_summary.py` and `pi_check.py` are derived from the already-tested
-`project-delegated-execution` local helpers. No community server code is used.
+## The worker round
+
+`start` and `continue` refuse unless `pi --version` is >= 1.0.0; the version is frozen as `piVersion` in `task.json` and the actual one is written to each `round.meta`. Before launch the runtime writes `rounds/N/worker.json`, the round's `brief.md` (user prompt plus a short fixed header) and `contract.md` (full worker contract). Launch:
+
+```
+pi -p --mode json --session-id ... --session-dir ... --model ... --thinking ... --tools <list>
+   --no-extensions --no-approve -e <tools>/pi_worker.ts --no-skills --no-prompt-templates @brief.md
+CODEX_PI_WORKER_CONFIG=<round>/worker.json
+```
+
+- **Load proof.** The extension atomically writes `worker.ready` (`piVersion`, `pid`, `at`). A round that ends without it, or in which a `tool_execution_start` appears before it, fails as `WORKER_EXTENSION_NOT_LOADED` and is never ready. An unreadable config leaves no marker and blocks every call.
+- **Guard** (`tool_call`). Path tokens of `read`/`write`/`edit`/`grep`/`find`/`ls` and every path-like token of a `bash` command or `check` argument are resolved through symlinks (relative to the worktree). A path inside the main checkout or another registered worktree is blocked unless it is inside an allowed root (round worktree, task tools, round checks): `forbidden-path`. `write`/`edit` outside the allowed roots is blocked: `outside-worktree`. Unknown tools and undecidable inputs are blocked: `undecidable`. Blocks are appended to `worker-blocks.jsonl`. `bash` without a `timeout` gets the default (600 s); a larger value is clamped to the ceiling (the phase command cap, else 3600 s). Pi's bash tool kills the whole process group when its timeout fires (`dist/core/tools/bash.js` timer calling `killProcessTree`; `dist/utils/shell.js` `process.kill(-pid, "SIGKILL")`).
+- **Tools.** `check` runs the frozen `pi_check.py` with `--output-dir <checks>`, so receipts are byte-compatible; the command string is split like a POSIX shell without running a shell. It returns `isError` for a nonzero exit, a timeout or a cancel and includes `log_tail`. `progress` and `readiness` call the frozen `pi_task.py`.
+- **Prompt.** `before_agent_start` adds the contract as the `codex_pi_worker` system prompt section on every run.
+- **Settle.** `agent_before_settle` runs `readiness`; when `settle.eligible` it claims the per-phase quota file (`settle/<hash>.claim`, exclusive create) and returns `continue: true` with one entry listing the missing items. Eligible means: every gap is missing evidence (no failed, skipped or unknown item), scope and resources fine, at least 60 s of phase budget left, no board pause, quota unused. Any error means no continuation.
 
 ## Host continuation
 
-`pi_board.py` projects bounded execution/check evidence into a shared local board. The existing Pi supervisor refreshes it roughly every 15 seconds and on terminal exit. It enqueues only actionable events (a delivery card of at most 1200 UTF-8 bytes; ordinary progress milestones stay on the board) to the exact registered desktop task UUID. Idle delivery starts a turn; busy delivery waits for the current turn to end. A local observation does not call a model. A real owner turn still loads its normal context.
+`pi_board.py` projects bounded execution/check evidence into a shared local board. The Pi supervisor refreshes it roughly every 15 seconds and on terminal exit. It enqueues only actionable events (a delivery card of at most 1200 UTF-8 bytes; ordinary progress milestones stay on the board) to the exact registered desktop task UUID. Idle delivery starts a turn; busy delivery waits for the current turn to end. A local observation does not call a model.
 
-Event content and main decisions are distinct from queue claims. Claims use a short file lock, released before the bounded CLI invocation. A confirmed send is not repeatedly sent while review is pending. An ambiguous post-spawn failure is uncertain, requiring explicit recovery; the queue has no caller idempotency key. Pause and uncertain delivery are visible through compact recovery evidence. Short hooks provide interruption/recovery and suppress overlapping legacy Stop notifications for a board route; no synchronous hook waiting or heartbeat is required.
+Event content and main decisions are distinct from queue claims. Claims use a short file lock, released before the bounded CLI invocation. A confirmed send is not repeated while review is pending. An ambiguous post-spawn failure is uncertain and needs explicit recovery; the queue has no caller idempotency key. Short hooks provide interruption pause and recovery evidence. The runtime records only sizes of what it prints to the Codex side (`codex-io.jsonl`); `metrics` aggregates them. The supervisor cannot detect its own death. Tested desktop evidence: [CLI queue validation](../docs/validation/cli-queue-20260926.md).
 
-The application must be running/available for a visible desktop continuation. The supervisor cannot detect its own death. Command deadlines and optional no-follow directory guards detect only their declared limits. Tested desktop evidence is in [CLI queue validation](../docs/validation/cli-queue-20260926.md) and the [tiny real Pi fixture](../docs/validation/quick-pi-acceptance-20260926.md). Retained historical lifecycle tests below are not the final event-transport release result.
+## Model policy
 
-## Model policy (hard restriction)
-
-This mechanism may run Pi with **only `deepseek/deepseek-flash`**:
-
-- `load_config` rejects any other value, including `openai-codex/gpt-6-luna`,
-  unqualified IDs such as `deepseek-flash`, case/whitespace-altered copies, and
-  an explicitly empty or non-string value. The allowed model is never
-  substituted silently; omitting the key defaults to the allowed model.
-- `start` re-asserts the config value, and `continue` additionally requires the
-  frozen task model to be the allowed model. A task frozen under another model
-  cannot be continued even when the current profile is valid; the rejection
-  happens before any lock or round work and leaves all existing evidence
-  unmodified.
-- The detached worker independently revalidates the frozen model immediately
-  after reading `task.json` — before touching round files, acquiring locks or
-  launching anything — so the internal `_worker` entry and an edited or stale
-  `task.json` cannot bypass the check.
-- The spawn argv pins the constant `deepseek/deepseek-flash`; it never uses
-  `task["model"]`, an automatic choice or a provider fallback.
-- Thinking is preserved from config (the profiles use `max`).
-- Pi's **reported** provider/model still comes from raw events and is compared
-  with the required model. A mismatch stays visible as `model_check:
-  "mismatch"` and the result stays `acceptance: "not_verified"`; argv alone is
-  not treated as proof that the provider ran the requested model.
-- Pi execution never invokes Codex or another model. Offline tests use process doubles; real CLI queue validation is separate;
-  disallowed IDs appear only as offline fixture metadata.
+`load_config` accepts only models in `ALLOWED_MODELS` (`deepseek/deepseek-flash`, `newapi/glm-5.3`); the choice is frozen per task at `start`. `continue` and the detached worker revalidate the frozen model before touching evidence or launching anything; the spawn argv uses the frozen model and there is no fallback. Pi's reported provider/model comes from raw events and is compared with the frozen one: a mismatch stays visible as `modelCheck: "mismatch"` and the result stays `acceptance: "not_verified"`.
 
 ## Repository resolution
 
-`--repo` may point anywhere inside a checkout. The runtime resolves the git
-toplevel of the supplied path and keeps **that checkout** as the project
-identity (`canonical_root`). It deliberately does not redirect to the Git
-primary worktree and never loads another checkout's config automatically.
-
-This matters for the authorized installation: the project checkout
-`/home/example/works/sample-project-linked` is itself a linked worktree
-whose Git primary is `/home/example/works/sample-project`; the config
-exists only in the linked project checkout, and the primary is not the target.
-
-- `project`/`start` use the config of the supplied checkout only. If it is
-  missing, the error names the path and, when a sibling checkout holds
-  `.agents/codex-pi.json`, points at it without loading it.
-- `validate_worktree` rejects **both** the configured project checkout passed as
-  `--repo` and the repository's **Git primary checkout** as implementation
-  worktrees. A different linked checkout is accepted.
-- `continue` requires the frozen `repo` identity to match the supplied
-  checkout; a different checkout is rejected with guidance to pass `--repo`
-  inside the frozen checkout. This closes `--repo` inversion attempts even when
-  the other checkout has no config. `result` and `cancel` continue to
-  read common-dir evidence from any checkout of the project.
-- The freeze records the checkout that started the task, so a task can never
-  silently switch projects or configs on continuation.
+`--repo` may point anywhere inside a checkout; the runtime keeps **that checkout** as the project identity (`canonical_root`) and never loads another checkout's config. `validate_worktree` rejects both the configured project checkout and the repository's Git primary checkout as implementation worktrees. `continue` requires the frozen `repo` identity to match. `result` and `cancel` read common-dir evidence from any checkout of the project.
 
 ## State layout
-
-Everything lives under the repository's **git common dir**:
 
 ```
 <git-common-dir>/codex-pi/
   .admission.lock                         per-project start/continue admission
   worktrees/<sha256(realpath)>.claim.json permanent one-writer claim per worktree
+  board.json / board.queue.json ...       shared board and queue state
   tasks/<task>/
-    task.json                             frozen repo/worktree/model/thinking/session/runtime
-    .task.lock                            held by the supervisor AND inherited by Pi
-    .supervisor.lock                      held only by the live supervisor
-    tools/                                frozen helper snapshot + VERSION for this task
+    task.json                             frozen repo/worktree/model/thinking/session/runtime/piVersion
+    .task.lock / .supervisor.lock         supervisor (task lock also inherited by Pi) / supervisor only
+    tools/                                frozen helper snapshot (incl. pi_worker.ts) + VERSION
     session/                              pinned Pi session directory
-    cancel.json / cancel.observed
-    supervisor.log
+    settle/                               one-shot settle quota claim files
+    codex-io.jsonl                        size-only Codex-facing accounting
     rounds/<n>/
-      brief.md                            immutable (0444) and sha256-pinned
+      brief.md contract.md                immutable (0444); contract.md is the full worker contract
+      worker.json worker.ready            extension configuration and load proof
+      worker-blocks.jsonl                 guard blocks (tool, rule, path)
       round.jsonl / round.err             raw Pi stdout/stderr
-      round.meta / round.state.json       exact exit, timeout, cancel, HEAD, error
-      round.summary.json / round.summary.txt
+      round.meta / round.state.json       exit, timeout, cancel, HEAD, Pi version, error
+      round.summary.json / .txt           bounded summary
       round.checks/                       pi_check receipts
 ```
 
-A detached worker executes the **snapshot** `tasks/<task>/tools/pi_task.py`, so
-updating the plugin cannot change an active run. `task.json` records the runtime
-version and helper hashes. Worktree claims are conservative, task-lifetime
-reservations: they are never auto-released and never auto-deleted, so every new
-task needs a new linked checkout. This is stated by `project` and by the claim
-error.
+A detached worker executes the **snapshot** `tools/pi_task.py`, so updating the plugin cannot change an active run. Worktree claims are task-lifetime reservations, never auto-released, so every new task needs a new linked checkout.
 
 ## Command contract
 
-- `project` — resolved project checkout, config, capabilities/limits (including
-  `allowedModels` and the worktree rule), active tasks. No model request, no
-  worker. Missing config is an actionable error; the config must stay inside the
-  repo (symlink/traversal rejected) and constraint/check entries are references
-  only, never executed.
-- `start` — fresh task, immutable round 1, detached worker; returns identity and
-  evidence paths immediately. The config model must be the allowed model.
-  `--read-only` limits Pi to `read,grep,find,ls`; writable uses
-  `read,write,edit,bash` and is explicitly not a security sandbox. Every brief
-  contains the user directive never to run `codex`. `--review-limit 2` is the
-  fixed new-task default (two complete deliveries with a whole-task main-session
-  replan after the first reviewed quality failure) and is pinned in `task.json`;
-  registration copies it to the board and later contract/config changes cannot
-  raise it. Historical pins and unpinned legacy tasks stay frozen. The command
-  returns while the worker continues after the caller process exits.
-- `continue` — only a terminal-known task of the same frozen checkout, same
-  pinned session and worktree, next immutable round. Refuses while the task lock
-  is held (including by an orphaned Pi), when the previous state is unknown,
-  when the frozen model is not permitted, or when brief/exit/log evidence is
-  stale; no automatic retry or replay.
-- `result` — bounded state, all rounds (including every failed prior attempt),
-  bounded summary and evidence pointers; no raw logs or command traces by
-  default. `supervisorAlive` and `activeWorker` expose lock truth.
-- `cancel` — writes an explicit request for the live supervisor, which stops its
-  Pi process group including descendants that ignore SIGTERM. If the supervisor
-  is gone but an orphaned Pi still holds the task lock, it returns
-  `request: "orphaned"` without signaling any unverified PID.
+- `project` - resolved checkout, config, capabilities and limits (`allowedModels`, the worktree rule, active tasks). No model request, no worker.
+- `start` - fresh task, immutable round 1, detached worker. `--read-only` limits Pi to `read,grep,find,ls` plus the native tools; writable adds `write,edit,bash`; neither is a security sandbox.
+- `continue` - only a terminal-known task of the same frozen checkout, same pinned session and worktree, next immutable round. Refuses while the task lock is held (including by an orphaned Pi), when the previous state is unknown, under a pause or reached takeover, or when brief/exit/log evidence is stale; no automatic retry or replay.
+- `status` / `result` - bounded read-only snapshot / compact terminal view; `supervisorAlive` and `activeWorker` expose lock truth.
+- `cancel` - writes an explicit request for the live supervisor, which stops Pi's process group. If the supervisor is gone but an orphaned Pi still holds the task lock it returns `request: "orphaned"` without signaling an unverified PID.
 
-Exit code 0 always means **completed execution only**. Every result carries
-`acceptance: "not_verified"`.
+Exit code 0 means **completed execution only**; every result carries `acceptance: "not_verified"`.
 
 ## Lock and liveness model
 
-- The detached supervisor holds `.task.lock` and `.supervisor.lock`.
-- Pi inherits `.task.lock` (`pass_fds`), so a SIGKILLed supervisor cannot free
-  capacity or the worktree while its Pi child is still running. `maxWorkers` and
-  `continue` therefore keep rejecting.
-- `.supervisor.lock` is never inherited, so a vanished supervisor is detectable.
-  An active recorded state without a live supervisor lease is `unknown`, never
-  `completed` and never a reason to start a continuation — even when an orphaned
-  Pi still holds the task lock.
-- A parent-side `starting` record while the task lock is held is still treated
-  as active (pre-lease spawn window), not as a vanished supervisor.
-- `cancel` uses the lease to distinguish a live worker from an orphan; it never
-  signals a PID it cannot prove it owns.
+The supervisor holds `.task.lock` and `.supervisor.lock`; Pi inherits `.task.lock`, so a killed supervisor cannot free capacity while Pi runs. `.supervisor.lock` is never inherited: an active recorded state without a live lease is `unknown`, never `completed`. A parent-side `starting` record while the task lock is held counts as active. `cancel` never signals a PID it cannot prove it owns.
 
-## Review repairs in this revision
+## Limitations
 
-1. **Duplicate `start` cannot mutate prior evidence.** `cmd_start` tracks
-   whether this invocation created the task directory; cleanup and failure
-   marking only apply to a directory this invocation created. Duplicate starts
-   return an error and leave every existing state/brief/raw/meta byte unchanged
-   for active, failed and completed tasks.
-2. **No configured/primary checkout bypass and no config cross-loading.**
-   `canonical_root` stays on the supplied checkout; the Git primary is only used
-   to reject it as a worktree; the configured checkout is rejected too; missing
-   configs produce a sibling-checkout hint instead of loading another project.
-   `continue` preserves the frozen repo identity and rejects a different
-   `--repo` checkout with guidance.
-3. **Orphaned Pi keeps capacity protection.** Pi inherits the task lock and the
-   supervisor lease detects supervisor death. With `maxWorkers=1`, killing only
-   the supervisor leaves the Pi child alive, a second start is rejected, the
-   original result is `unknown`, and `continue` is blocked until the operator
-   inspects and cleans the exact orphan process.
-4. **Model hard restriction enforced end to end.** Config, start, continuation
-   and the internal worker all require exactly `deepseek/deepseek-flash`; the
-   spawn argv pins it; reported-model mismatches stay visible and unverified.
-   The earlier defect fixes and the MCP/Node removal remain in effect: the
-   deliverable is Python stdlib lifecycle only.
+- The runtime validates an existing linked checkout; the main session creates it.
+- The guard is a path-token check at the tool boundary, not a sandbox: it cannot see paths built at run time by the shell, and `bash` keeps the user's local capability. A process that detaches from its group escapes Pi's timeout kill.
+- The model restriction rejects other IDs and surfaces reported mismatches but cannot attest the upstream provider.
+- An orphaned Pi or supervisor is never killed automatically; the operator inspects the recorded PIDs.
+- Config checks and constraints are text passed to Pi; the runtime never executes them. Acceptance stays with the project's checks and Codex review.
+- Unreported provider usage stays `null`/unknown. Requires Python 3.10+, Git, POSIX process groups (macOS/Linux) and Pi >= 1.0.0 (Node runs the extension).
 
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests -p 'test_*.py' -v
+python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-Historical lifecycle baseline on 2026-09-26: **52 tests, OK, exit 0** (37.321 s),
-full output preserved at
-`/tmp/pi-collab-research-20260926/final-runtime-tests.log`. No live model call,
-no network, no Codex binary or GPT probe; the Pi process is always the offline
-double in `tests/doubles/`. Coverage includes:
+Tests use the offline Pi double in `tests/doubles/`, which plays the extension's load proof; the extension itself is driven through Node's native type stripping with a fake ExtensionAPI (`tests/doubles/extension_harness.mjs`). A missing `node` fails the suite. No live model call, no network, no Codex binary.
 
-- config safety (missing/invalid/symlink/traversal/limits) plus the missing
-  config sibling-checkout hint;
-- model policy: disallowed, unqualified, whitespace-altered and empty models are
-  rejected by `project` and `start` without running any Pi double; a stale
-  frozen model is rejected by `continue` and by direct `_worker` invocation
-  without changing evidence; a simulated reported-model mismatch remains
-  `model_check: mismatch` / `not_verified`; the no-Codex trap is preserved;
-- repository semantics: checkout-only config resolution, a second linked worker
-  checkout accepted with the project checkout config, configured and Git primary
-  checkouts rejected as worktrees, `--repo` inversion rejected via the missing
-  config hint, frozen repo identity preserved on continue, and `result` readable
-  from another checkout via common-dir evidence;
-- read-only `project` checks against the real user paths
-  (`sample-project-linked` and its Git primary `sample-project`)
-  with no model launch;
-- lifecycle start/complete, pinned session across continuation, immutable
-  evidence, failed attempts kept visible, missing usage stays unknown, reasoning
-  not double-counted;
-- duplicate-start preservation for active, failed and completed tasks;
-- recovery: nonzero exit, timeout (124), cancel of a SIGTERM-ignoring
-  descendant, lingering descendant after normal completion, unknown after a
-  SIGKILLed supervisor, orphaned-Pi capacity/unknown/continue-block behavior;
-- concurrency: same task, same worktree and `maxWorkers` races across real
-  processes; project isolation for the same task id; foreign worktree;
-- process detachment without MCP: the `start` command returns, its caller
-  process exits, and the worker keeps running to completion.
+## Reviews and takeover
 
-## Limitations
-
-- The runtime validates an existing linked checkout; the main session creates it
-  (`git worktree add`). Claims are permanent for the task lifetime, so a new task
-  needs a new checkout.
-- `read_only` is a Pi tool allowlist, not a sandbox; writable `bash` has the
-  user's full local capability.
-- The model restriction is a hard configuration/runtime guard: the runtime
-  rejects other model IDs, pins argv and surfaces reported mismatches, but it
-  cannot cryptographically attest the upstream provider's identity.
-- An orphaned Pi or supervisor is never killed automatically. `result` reports
-  `unknown` plus recorded PIDs, and the operator must inspect and clean the exact
-  processes; the runtime does not signal unverified PIDs.
-- Config checks/constraints are text passed to Pi; the runtime never executes
-  them. Real acceptance remains with the project's checks and Codex review.
-- Unreported provider usage stays `null`/unknown; no cost or capability claims.
-- `codex_usage.py` is intentionally not bundled: it audits Codex sessions and no
-  current lifecycle command needs it.
-- Requires Python 3.10+, Git, and `fcntl`/POSIX process groups (macOS/Linux).
-  Tests use process doubles only; real Pi/provider behavior is not proven here.
-
-A new task pins two complete Pi deliveries at creation. The reusable whole-task analysis and takeover responsibility are defined in `skills/collaborate/SKILL.md`; the first reviewed quality failure keeps implementation in Pi only after the same Codex main session completes that analysis for the complete outcome and remaining plan and records one coherent repair in the existing design and the next immutable brief; the second failure transfers implementation to that main session. Historical pins (one or two) are not migrated; tasks without a pin keep the former limit of three. Counting is task-scoped since the last accepted outcome: one exact main decision per distinct round on a `review_required`/`phase_blocked` event (`changes_requested`/`reject`, `failure-kind quality`), while duplicate events for one round, checks, progress, the single missing-receipt auto-continuation and explicitly external blockers do not count. Acceptance before the limit resets the count for an authorized next phase; a reached takeover remains latched for that Pi task, and a future outcome needs a separate dispatch. At the limit the board persists `codex_takeover_required` with the pinned limit, counted failures, implementation owner and reason, and continuation, automatic continuation and internal-worker admission refuse Pi. There is deliberately no plan schema, heading parser or plan hash gate: the runtime counts exact decisions and controls ownership; it cannot prove analysis quality. The runtime never implements or starts Codex: the existing main task repeats the whole-task analysis and performs authorized work after verifying writer release. Project acceptance remains the completion authority.
+Every task allows two complete Pi deliveries; the first reviewed quality failure requires the same Codex main session to complete the whole-task analysis (see the Skill) before the second delivery, and the second failure transfers implementation to that session. Counting is task-scoped since the last accepted outcome: one exact main decision per distinct round on a `review_required`/`phase_blocked` event (`changes_requested`/`reject`, `failure-kind quality`); duplicate events, checks, progress, the in-round settle continuation and explicitly external blockers do not count. A reached takeover is latched for that task; the board persists `codex_takeover_required` and `continue` and the worker refuse Pi. The runtime counts exact decisions and controls ownership; it cannot prove analysis quality and never starts Codex.

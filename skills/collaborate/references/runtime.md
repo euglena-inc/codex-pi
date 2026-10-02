@@ -1,6 +1,6 @@
 # Runtime commands
 
-Usage only. Rules, model policy and review boundaries are in [the Skill](../SKILL.md); event handling is in [handoff](handoff.md). Replace example paths and the owner UUID before running; never interpolate user text into shell commands. All commands print one line of compact JSON.
+Usage only. Rules, model policy and review boundaries are in [the Skill](../SKILL.md); event handling is in [handoff](handoff.md). Replace example paths and the owner UUID before running; never interpolate user text into shell commands. All commands print one line of compact JSON. Pi >= 1.0.0 is required (`start` and `continue` refuse an older or unreadable Pi); 0.5.x tasks are not migrated.
 
 ```sh
 python3 /abs/plugin/runtime/pi_task.py project --repo /abs/repo
@@ -14,50 +14,42 @@ Start, then register immediately (registration also catches an already finished 
 
 ```sh
 python3 .../pi_task.py status --repo REPO --task TASK [--round N]   # fast read-only snapshot
-python3 .../pi_task.py result --repo REPO --task TASK [--round N] [--full]
+python3 .../pi_task.py result --repo REPO --task TASK [--round N]
 python3 .../pi_board.py show --repo REPO --task TASK               # board card, pending events, queue
+python3 .../pi_board.py metrics --repo REPO [--task TASK]          # usage, decisions, Codex-facing bytes
 ```
 
-`result` is compact by default: state, execution, candidate head, usage totals, check lines (`ID exit=N run=.. pass=.. fail=.. skip=..`, or `ID missing`/`ID unknown`), Pi's final text (at most 1200 characters) and notes. `--full` returns the previous complete shape (per-round evidence paths, `summary`, `summaryText`). Collect `result` once per terminal round (`pi_board.py metrics --repo REPO [--task TASK]`: per-task usage, decisions, Codex-facing bytes); raw logs, receipts and the native session stay under the Git common directory `codex-pi/tasks/`. `show` gives the absolute evidence paths a delivery card leaves out.
+`result` prints state, execution, candidate head, usage totals, check lines (`ID exit=N run=.. pass=.. fail=.. skip=..`, or `ID missing`/`ID unknown`), Pi's final text (at most 1200 characters) and notes. Collect it once per terminal round; raw logs, receipts and the native session stay under the Git common directory `codex-pi/tasks/`. `show` gives the absolute evidence paths a delivery card leaves out.
 
-## Worker contract and boundaries
-
-Round 1, and any round whose phase contract hash differs from the last round that carried it, gets the full worker contract in its brief; other rounds get a short header (at most 15 lines, with the round-1 brief path and the frozen `pi_check` template). `rounds/N/contract.md` holds the full contract every round. The command guard terminates an owned bash command that references the repository's main checkout or another registered worktree (paths resolved through symlinks; the round worktree, task `tools` and round `checks` are never forbidden; rule `forbidden-path`, recorded in `command-guard.json`). A `write`/`edit` outside the allowed directories makes the round not ready (`SCOPE_ESCAPE`); a `read` outside is only counted.
-
-## Continue, cancel, upgrade
+## Continue and cancel
 
 ```sh
 python3 .../pi_task.py continue --repo REPO --task TASK --prompt-file /abs/repair.md [--contract-file /abs/phase.json]
 python3 .../pi_task.py cancel --repo REPO --task TASK
-python3 .../pi_task.py upgrade --repo REPO --task TASK
 ```
 
-`continue` preserves the pinned session and worktree in a new immutable round; a paused task refuses it until explicit resume. `cancel` signals only the owned worker group; verify it ended before repair. `upgrade` is described in [handoff](handoff.md).
+`continue` preserves the pinned session and worktree in a new immutable round; a paused task refuses it until explicit resume. `cancel` signals only the owned worker group; verify it ended before repair.
+
+## The worker round
+
+Pi runs `pi -p --mode json --no-extensions --no-approve -e <tools>/pi_worker.ts ...`. The runtime writes `rounds/N/worker.json` (task, round, worktree, forbidden and allowed roots, bash default and ceiling, check cap, checks and tools dirs, Python, phase flag, settle quota path, contract text) and passes its path in `CODEX_PI_WORKER_CONFIG`. The extension writes `worker.ready`; a round that ends, or runs a tool, without it fails as `WORKER_EXTENSION_NOT_LOADED`.
+
+- **Guard:** every tool call is checked. A path in the main checkout or another registered worktree is blocked (`forbidden-path`, symlinks resolved); `write`/`edit` outside the round worktree, tools and checks dirs is blocked (`outside-worktree`); anything undecidable is blocked. Blocks go to `worker-blocks.jsonl`. `bash` gets a default timeout and is clamped to the ceiling (the phase command cap, else one hour).
+- **Tools:** `check` runs the frozen `pi_check.py` (receipts bind command, revision, exit and log hash; a failure returns `log_tail`, at most 20 lines and 2000 bytes); `progress` and `readiness` call the frozen `pi_task.py`.
+- **Prompt:** `brief.md` is the prompt plus a short fixed header. The contract is the system prompt section `codex_pi_worker` every run and `contract.md` every round.
+- **Settle:** in a phase task, when only evidence is missing, the extension continues once per phase (the quota file under `settle/`).
 
 ## Phase contracts
 
 A complete phase is frozen with `--contract-file` (schema and operations: [phase autonomy validation](../../../docs/validation/phase-autonomy-o1-20260926.md)): goal, result, baseline, scope, design ref and hash, acceptance items with real commands, budgets, repair and escalation boundary. The project PLAN stays authoritative.
 
 ```sh
-python3 .../pi_task.py progress --repo WT --task TASK --round N --activity implementing --step '...' --completed-criteria ITEM --next '...' --evidence-ref PATH
-python3 .../pi_task.py readiness --repo REPO --task TASK --round N
+python3 .../pi_task.py readiness --repo REPO --task TASK [--round N]
 python3 .../pi_task.py phase-status --repo REPO --task TASK
 python3 .../pi_board.py decide --repo REPO --task TASK --event-id EVENT --decision accept --reviewed-head FULL_SHA --phase PHASE --contract-hash HASH
 ```
 
-Progress is Pi's self-report: never a receipt, never acceptance. Readiness compares the contract with real `pi_check` receipts bound to the candidate; a missing, failed, skipped or unknown item is never ready. Ordinary progress stays on the board; only an anomaly (a sustained unrepaired check failure) may enqueue, at most twice per phase. `accept` binds phase, contract, candidate and the live round state, and refuses on any mismatch.
-
-## Checks and resource protection
-
-The brief gives each task's frozen `toolsDir` and the round's `checksDir`; run from the Pi worktree:
-
-```sh
-python3 /abs/task/tools/pi_check.py --output-dir /abs/round/round.checks --id affected-tests --timeout-seconds 600 -- make test
-python3 /abs/task/tools/pi_check.py --output-dir ... --id evidence --timeout-seconds 180 --watch-path /abs/evidence --max-bytes 104857600 -- python3 real_check.py
-python3 /abs/task/tools/pi_copy.py /abs/source /abs/new-destination --max-bytes 104857600
-```
-
-A failing, timed-out or cancelled check also prints `log_tail` (last 20 lines, at most 2000 bytes) on stdout; the receipt is unchanged. Receipts bind command, revision, exit and log hash; failed, skipped, interrupted, unknown or zero-test attempts are never a pass. A phase command timeout must not exceed the contract's `commandTimeoutSeconds`. Declared `resourceLimits` and `--watch-path` guards stop only the owned process group on a known breach; an incomplete measurement stays unknown. History: [validation notes](../../../docs/validation/command-protection-20261001.md).
+Progress is Pi's self-report, never acceptance. Readiness compares the contract with real receipts bound to the candidate; a missing, failed, skipped or unknown item is never ready. Ordinary progress stays on the board; only a sustained unrepaired check failure may enqueue, at most twice per phase. `accept` binds phase, contract, candidate and the live round state, and refuses on any mismatch. A phase command timeout must not exceed `commandTimeoutSeconds`; declared `resourceLimits` stop only the owned process group on a known breach, and an incomplete measurement stays unknown.
 
 ## Decisions
 

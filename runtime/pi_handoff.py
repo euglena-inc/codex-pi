@@ -9,19 +9,12 @@ Stop-hook delivery any more. The hooks that remain are deliberately small:
 * ``SessionStart`` / ``UserPromptSubmit`` print bounded, read-only recovery
   evidence for cli-queue routes (pause, uncertain delivery, monitor health).
 
-The old ``arm``/``ack``/``status``/``release`` commands and the Stop-hook
-continuation were removed. Binding records written by them under
-``${CODEX_PI_HANDOFF_ROOT:-${CODEX_HOME:-~/.codex}/codex-pi/handoffs}/bindings``
-are only read by ``legacy_stop_bindings`` so ``pi_task.py upgrade`` can refuse
-to adopt this runtime for a task still bound to the legacy route.
-
 This module never invokes the Codex CLI and never starts a model.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -31,9 +24,6 @@ if str(RUNTIME_DIR) not in sys.path:
 
 MAX_EVENT_BYTES = 1_000_000
 MAX_MESSAGE_BYTES = 900
-# Legacy binding states that still wait on a Stop-hook delivery or recovery.
-# ``delivered``, ``acked`` and ``stale`` need nothing from this runtime.
-LEGACY_PENDING_STATES = ("armed", "suspended", "expired", "needs_recovery")
 
 
 def bounded(text, limit: int = MAX_MESSAGE_BYTES) -> str:
@@ -41,48 +31,6 @@ def bounded(text, limit: int = MAX_MESSAGE_BYTES) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
-
-
-def handoff_root() -> Path:
-    override = os.environ.get("CODEX_PI_HANDOFF_ROOT")
-    if override:
-        root = Path(override).expanduser()
-        if not root.is_absolute():
-            root = Path.cwd() / root
-        return root
-    home = Path(os.environ.get("CODEX_HOME") or "~/.codex").expanduser()
-    return home / "codex-pi" / "handoffs"
-
-
-def legacy_stop_bindings(repo, task: str) -> list:
-    """Pending legacy Stop-hook bindings for one repo/task (read-only, bounded).
-
-    Unreadable files are skipped: they cannot be attributed to a task.
-    """
-    try:
-        repo_real = Path(repo).expanduser().resolve()
-    except OSError:
-        return []
-    directory = handoff_root() / "bindings"
-    if not directory.is_dir():
-        return []
-    found = []
-    for path in sorted(directory.glob("*.json"))[:2000]:
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(data, dict) or data.get("task") != task \
-                or data.get("state") not in LEGACY_PENDING_STATES:
-            continue
-        try:
-            if Path(str(data.get("repo"))).expanduser().resolve() != repo_real:
-                continue
-        except (OSError, ValueError):
-            continue
-        found.append({"eventKey": data.get("eventKey"), "state": data.get("state"),
-                      "round": data.get("round"), "path": str(path)})
-    return found
 
 
 def _queue_recovery_lines(session: str) -> list:

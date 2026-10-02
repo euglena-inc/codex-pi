@@ -143,7 +143,6 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(response["worktree"], str(worker_wt.resolve()))
         result = repo.wait_terminal("cfg", env=base_env())
         self.assertEqual(result["state"], "completed")
-        self.assertEqual(result["repo"], str(project_wt.resolve()))
         frozen = json.loads((repo.task_dir("cfg") / "task.json").read_text())
         self.assertEqual(frozen["repo"], str(project_wt.resolve()))
 

@@ -57,7 +57,7 @@ from pi_task import (ACTIVE_STATES, TERMINAL_STATES, TASK_RE, LockHeld, atomic, 
 
 from pi_task import record_codex_io  # noqa: E402
 from pi_takeover import (FAILURE_KINDS, _records as decision_records,  # noqa: E402
-                         normalize_review_limit, review_policy)
+                         review_policy)
 
 SCHEMA_VERSION = 1
 BOARD_DIR = "codex-pi"
@@ -82,7 +82,6 @@ MAX_NOTE = 300
 MAX_MONITORS = 200
 MAX_QUEUE_TASKS = 200
 MAX_QUEUE_FAILURES = 10
-REFRESH_INTERVAL_SECONDS = 15.0
 MONITOR_LEASE_SECONDS = 90.0
 GIT_TIMEOUT_SECONDS = 10.0
 DISPATCH_TIMEOUT_SECONDS = 20.0
@@ -631,7 +630,7 @@ def _default_codex() -> dict:
 
 
 def _new_card(task_id, thread, title, goal, brief_ref, plan_ref, repo, common, worktree,
-              transport, codex_bin, now, review_pin=None) -> dict:
+              transport, codex_bin, now) -> dict:
     card = {
         "taskId": task_id, "ownerThread": thread, "codexTaskId": thread,
         "title": _text(title or task_id, 200), "goal": _text(goal or "", 600),
@@ -644,8 +643,6 @@ def _new_card(task_id, thread, title, goal, brief_ref, plan_ref, repo, common, w
         "evidence": {}, "check": None, "events": [], "handled": {}, "overflow": None,
         "nextSeq": 1, "attention": None, "codex": _default_codex(),
     }
-    if isinstance(review_pin, dict):
-        card["reviewPolicyPin"] = dict(review_pin)
     return card
 
 
@@ -766,7 +763,6 @@ def _phase_projection(card: dict, status: dict, now: float):
     if not isinstance(phase, dict) or not phase.get("phaseId"):
         return None, bool(card.get("phase"))
     readiness = phase.get("readiness") or {}
-    auto = phase.get("autoContinue") or {}
     candidate = _phase_candidate_head(status)
     scope_value = readiness.get("scope")
     if isinstance(scope_value, dict):
@@ -787,11 +783,6 @@ def _phase_projection(card: dict, status: dict, now: float):
         state = "rejected"
     elif readiness.get("status") == "ready" and status.get("state") == "completed":
         state = "review_ready"
-    elif (auto.get("status") == "started"
-          and isinstance(auto.get("round"), int)
-          and isinstance(status.get("round"), int)
-          and auto["round"] > status["round"]):
-        state = "continuing"
     elif status.get("state") in ACTIVE_STATES:
         state = "executing"
     else:
@@ -816,7 +807,6 @@ def _phase_projection(card: dict, status: dict, now: float):
                       "scope": scope_value,
                       "generatedAt": readiness.get("generatedAt")},
         "budget": phase.get("budget") or {},
-        "autoContinue": auto or None,
         "updatedAt": now,
     }
     stable_keys = ("phaseId", "contractHash", "contractRef", "baselineCommit", "candidate",
@@ -830,11 +820,6 @@ def _phase_projection(card: dict, status: dict, now: float):
                 != (new_readiness.get("status"), new_readiness.get("coverage"),
                     new_readiness.get("scope"), (new_readiness.get("execution") or {}),
                     (new_readiness.get("resource") or {}).get("status")):
-            changed = True
-        old_auto = existing.get("autoContinue") or {}
-        new_auto = new_phase.get("autoContinue") or {}
-        if (old_auto.get("status"), old_auto.get("reason"), old_auto.get("round")) \
-                != (new_auto.get("status"), new_auto.get("reason"), new_auto.get("round")):
             changed = True
     return new_phase, changed
 
@@ -961,20 +946,13 @@ def _supersede_phase_kinds(card: dict, now: float, kinds, keep_event_id=None,
     return count
 
 
-def _phase_blocked_reason(readiness: dict, auto: dict, status: dict) -> str:
+def _phase_blocked_reason(readiness: dict, status: dict) -> str:
     resource = readiness.get("resource") or {}
     resource_status = resource.get("status")
     if resource_status == "breached":
         return "resource_breached"
     if resource_status == "escalated":
         return "resource_unknown"
-    auto_status = (auto or {}).get("status")
-    if auto_status == "exhausted":
-        return "auto_continue_used"
-    if auto_status in ("unknown", "claimed"):
-        return "auto_continue_unknown"
-    if auto_status == "blocked":
-        return (auto or {}).get("reason") or "auto_continue_unknown"
     execution = readiness.get("execution") or {}
     execution_status = execution.get("status")
     if execution_status == "failed":
@@ -1019,7 +997,7 @@ MAX_CARD_ITEMS = 8
 def _delivery_info(status: dict) -> dict:
     """Per-acceptance-item facts the delivery card prints (id/status/exit/counts).
 
-    Phase tasks use the normalized snapshot items; legacy tasks use the latest
+    Phase tasks use the normalized snapshot items; brief-only tasks use the latest
     receipt per check id. Unknown stays unknown; nothing is invented.
     """
     items = []
@@ -1056,7 +1034,6 @@ def _project_phase_events(card: dict, status: dict, now: float) -> list:
     readiness = phase.get("readiness") or {}
     phase_evidence = phase.get("evidence") if isinstance(phase.get("evidence"), dict) else {}
     resource_evidence = phase_evidence.get("resource")
-    auto = phase.get("autoContinue") or {}
     phase_id = phase.get("phaseId")
     contract_hash = phase.get("contractHash") or phase.get("contractSha256")
     candidate = _phase_candidate_head(status)
@@ -1102,16 +1079,10 @@ def _project_phase_events(card: dict, status: dict, now: float) -> list:
                  "phaseId": phase_id, "contractHash": contract_hash})
             if event is not None:
                 card["phase"] = dict(card.get("phase") or {}, reviewEventId=event["id"])
-        elif (auto.get("status") == "started"
-          and isinstance(auto.get("round"), int)
-          and isinstance(status.get("round"), int)
-          and auto["round"] > status["round"]):
-            # Local same-phase continuation owns the terminal round; no GPT wake-up.
-            pass
         else:
-            reason = _phase_blocked_reason(readiness, auto, status)
+            reason = _phase_blocked_reason(readiness, status)
             fingerprint = (f"phase:{phase_id}:contract:{contract_hash}:candidate:{candidate}:"
-                           f"blocked:{reason}:{auto.get('status') or 'none'}")
+                           f"blocked:{reason}")
             # A review event from a previous, now-invalid state must not remain
             # current: the same snapshot gate owns both sides. Superseding a
             # pending review advances the durable ready episode so a later
@@ -1128,8 +1099,7 @@ def _project_phase_events(card: dict, status: dict, now: float) -> list:
                 "Missing, failed, skipped or unknown evidence is never ready.",
                 {"candidateHead": candidate, "reason": reason,
                  "coverage": readiness.get("coverage"), "gaps": readiness.get("gaps"),
-                 "resource": resource_evidence or None,
-                 "autoContinue": auto or None})
+                 "resource": resource_evidence or None})
     ownership = status.get("ownership") or {}
     if state == "unknown" and recorded in ACTIVE_STATES:
         add("ownership_unknown", f"phase:{phase_id}:{recorded}",
@@ -1436,11 +1406,11 @@ def project_events(card: dict, status: dict, now: float) -> list:
     phase = status.get("phase")
     if isinstance(phase, dict) and phase.get("phaseId"):
         return _project_phase_events(card, status, now)
-    return _project_legacy_events(card, status, now)
+    return _project_brief_only_events(card, status, now)
 
 
-def _project_legacy_events(card: dict, status: dict, now: float) -> list:
-    """Legacy (no phase contract) actionable facts, unchanged from 0.4."""
+def _project_brief_only_events(card: dict, status: dict, now: float) -> list:
+    """Actionable facts for a task without a phase contract (brief-only)."""
     added = []
     state = status.get("state")
     recorded = status.get("recordedState")
@@ -2156,35 +2126,6 @@ def _decide_hint(repo, task_id, event: dict) -> str:
 # operations
 # ---------------------------------------------------------------------------
 
-def _task_review_pin(frozen: dict) -> dict | None:
-    """The dispatch-time quality-failure pin frozen in task.json, if valid."""
-    raw = frozen.get("reviewPolicy") if isinstance(frozen, dict) else None
-    if not isinstance(raw, dict):
-        return None
-    limit = normalize_review_limit(raw.get("qualityFailureLimit"))
-    if limit is None:
-        return None
-    pinned_at = raw.get("pinnedAt")
-    if not isinstance(pinned_at, (int, float)) or isinstance(pinned_at, bool):
-        pinned_at = frozen.get("createdAt")
-    return {"schemaVersion": 1, "qualityFailureLimit": limit, "pinnedAt": pinned_at,
-            "pinnedBy": _text(raw.get("pinnedBy") or "start", 60)}
-
-
-def _adopt_task_review_pin(card: dict, pin: dict | None) -> None:
-    """Adopt the creation-time pin once, before any delivery failure exists.
-
-    A card that already carries a pin is never overwritten, so re-registration,
-    contract edits or later config changes cannot raise or reset the limit.
-    Legacy cards without a pin stay on the legacy default.
-    """
-    if not isinstance(pin, dict) or isinstance(card.get("reviewPolicyPin"), dict):
-        return
-    policy = review_policy(card)
-    if policy["failedDeliveries"] == 0 and not policy["takeoverRequired"]:
-        card["reviewPolicyPin"] = dict(pin)
-
-
 def register_task(repo, task, thread=None, transport=TRANSPORT_OFFLINE, codex_bin=None,
                   title=None, goal=None, brief_ref=None, plan_ref=None, codex_task_id=None,
                   now=None) -> dict:
@@ -2199,7 +2140,6 @@ def register_task(repo, task, thread=None, transport=TRANSPORT_OFFLINE, codex_bi
     if not isinstance(frozen, dict) or frozen.get("task") != task_id:
         raise ValueError(f"task {task_id!r} has no readable task.json; inspect {task_dir}")
     require_allowed_model(frozen.get("model"), "board registration")
-    review_pin = _task_review_pin(frozen)
     transport = _validate_transport(transport)
     owner_thread = _validate_thread(thread, required=(transport == TRANSPORT_CLI_QUEUE))
     resolved_bin = None
@@ -2224,7 +2164,7 @@ def register_task(repo, task, thread=None, transport=TRANSPORT_OFFLINE, codex_bi
         if not isinstance(card, dict):
             card = _new_card(task_id, owner_thread, title or task_id, goal or "", brief_ref,
                              plan_ref, root, common, frozen.get("worktree"), transport,
-                             resolved_bin, now, review_pin=review_pin)
+                             resolved_bin, now)
             cards[task_id] = card
         else:
             card["ownerThread"] = owner_thread or card.get("ownerThread")
@@ -2244,7 +2184,6 @@ def register_task(repo, task, thread=None, transport=TRANSPORT_OFFLINE, codex_bi
             card["repo"] = str(root)
             card["commonDir"] = str(common)
             card["worktree"] = frozen.get("worktree")
-            _adopt_task_review_pin(card, review_pin)
             card["updatedAt"] = now
         board["revision"] = int(board.get("revision") or 0) + 1
         board["updatedAt"] = now

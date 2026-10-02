@@ -10,7 +10,7 @@ This Skill is the single authority for roles, model policy, the whole-task analy
 ## Roles and model policy
 
 - The existing Codex main task designs, dispatches, reviews and, at the limit, implements; Pi implements. No extra Codex agent, nested model or automatic model review. Codex CLI is only the `queue` transport and plugin management, never `exec`, `resume` or `fork`.
-- Model: `.agents/codex-pi.json` selects one of `ALLOWED_MODELS` (`pi_task.py project` lists them; default `deepseek/deepseek-flash`, thinking `max`). `start` freezes it per task; later config edits affect only new tasks. No fallback: an unavailable model fails the round and keeps the evidence.
+- Model: `.agents/codex-pi.json` selects one of `ALLOWED_MODELS` (`pi_task.py project` lists them; default `deepseek/deepseek-flash`, thinking `max`). `start` freezes it per task; later config edits affect only new tasks. No fallback: an unavailable model fails the round and keeps the evidence. Pi must be >= 1.0.0.
 - The worker runs with Pi extensions, skills and prompt templates disabled. The user's goal and project contracts govern scope and acceptance; config constraints and checks are references, not success claims. Resolve routine choices without extra approval gates.
 
 ## Whole-task analysis (the single reusable design act)
@@ -45,18 +45,18 @@ The supervisor refreshes the board locally; unchanged state and ordinary progres
 
 ## Review and retain evidence
 
-A card is execution evidence, not a goal or acceptance. Read its task, round and event id, call `result` once (compact; `--full` for the complete shape), then inspect only the relevant diff, receipts and original evidence. Require the exact full candidate commit and the project's real checks; exit 0, summaries and model claims are insufficient.
+A card is execution evidence, not a goal or acceptance. Read its task, round and event id, call `result` once, then inspect only the relevant diff, receipts and original evidence. Require the exact full candidate commit and the project's real checks; exit 0, summaries and model claims are insufficient.
 
 On a material defect, trace reachable entries and state boundaries, name the shared cause, and classify related paths as reproduced, reachable but unverified, or excluded with a reason. Give the same Pi session one consolidated brief (reproduction, repair scope, affected checks, unknowns, downstream effect). Never infer a defect from a missing test. An active round keeps its immutable brief. Record the decision for the exact event with `decide`; keep failed attempts, logs and usage. Delivery, handling and acceptance are separate states.
 
 ## Two complete deliveries, then takeover
 
-A delivery is a completed report reviewed by the main task, not a tool call, red test, progress echo or round number. A new task pins **two complete Pi deliveries** (`start` accepts only `--review-limit 2`); older tasks keep their frozen pin, or three when unpinned. Revisions, renames, pause/resume, retries and config edits cannot raise it.
+A delivery is a completed report reviewed by the main task, not a tool call, red test, progress echo or round number. Every task allows **two complete Pi deliveries**. Revisions, renames, pause/resume, retries and config edits cannot raise it.
 
-- Count one exact main decision per distinct round on a `review_required`/`phase_blocked` event decided `changes_requested` or `reject` with `--failure-kind quality` (the default). Duplicates, Pi's red tests, routine repairs, progress and the single missing-receipt auto-continuation never count. Only a genuine missing external prerequisite uses `--failure-kind external --note` naming the evidence and unlock condition; implementation or evidence defects are never external.
+- Count one exact main decision per distinct round on a `review_required`/`phase_blocked` event decided `changes_requested` or `reject` with `--failure-kind quality` (the default). Duplicates, Pi's red tests, routine repairs, progress and the single in-round settle continuation never count. Only a genuine missing external prerequisite uses `--failure-kind external --note` naming the evidence and unlock condition; implementation or evidence defects are never external.
 - `reviewPolicy` (`limit`, `failedDeliveries`, `implementationOwner`, `reason`, `instruction`) derives from the exact decisions. After the first quality failure, finish the whole-task analysis and refine the route before the second delivery. At the limit the board emits `codex_takeover_required` and Pi implementation is refused; pause/resume and later acceptance cannot clear it. Acceptance before the limit starts a fresh count for the next phase; renaming never resets.
 - Takeover: verify Pi, its descendants and the supervisor released the checkout (unknown ownership blocks writing); keep the candidate, dirty work, evidence and budgets. Redo the analysis, update the design, then the main task implements, integrates and verifies directly. Never hand the outcome back to Pi, start another model, weaken acceptance or reset spend. The takeover event is resolved as a handoff receipt, never as new code passing old Pi checks.
 
 ## Updates and savings
 
-Edit canonical plugin source, never managed caches, hook trust or a running task's frozen helpers; adopt updates as in [events](references/handoff.md). Report savings only for comparable completed work.
+Edit canonical plugin source, never managed caches, hook trust or a running task's frozen helpers. A new runtime does not migrate 0.5.x tasks: finish them with their own frozen helpers. Report savings only for comparable completed work.

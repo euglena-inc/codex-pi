@@ -195,7 +195,7 @@ class CompactCliTest(unittest.TestCase):
     def test_every_cli_prints_single_line_json(self):
         base = ("--repo", str(self.repo.root), "--task", "compact")
         for args in (("project", "--repo", str(self.repo.root)),
-                     ("status", *base), ("result", *base), ("result", *base, "--full"),
+                     ("status", *base), ("result", *base),
                      ("phase-status", *base)):
             with self.subTest(args=args[0]):
                 self.single_line(run_cli(*args, env=self.env))
@@ -211,29 +211,21 @@ class CompactCliTest(unittest.TestCase):
             self.assertNotIn("\n", proc.stdout[:-1])
             json.loads(proc.stdout)
 
-    def test_result_is_compact_by_default_and_full_keeps_the_old_shape(self):
+    def test_result_is_compact_and_the_old_full_shape_is_gone(self):
         compact = self.single_line(run_cli("result", "--repo", str(self.repo.root),
                                            "--task", "compact", env=self.env))
-        full = self.single_line(run_cli("result", "--repo", str(self.repo.root),
-                                        "--task", "compact", "--full", env=self.env))
-        self.assertEqual(compact["view"], "compact")
         for key in ("state", "execution", "acceptance", "round", "usage", "checks", "final",
-                    "notes", "candidateHead"):
+                    "notes", "candidateHead", "evidence"):
             self.assertIn(key, compact)
-        for dropped in ("summaryText", "rounds", "summary"):
+        for dropped in ("summaryText", "rounds", "summary", "view", "session", "more"):
             self.assertNotIn(dropped, compact)
         self.assertLessEqual(len(compact["final"]), 1200)
         self.assertEqual(compact["state"], "completed")
         self.assertEqual(compact["acceptance"], "not_verified")
         self.assertEqual(sum(1 for note in compact["notes"] if "never acceptance" in note), 1)
-        self.assertLess(len(json.dumps(compact)), len(json.dumps(full)))
-        # --full is the previous shape.
-        for key in ("summaryText", "rounds", "summary", "evidence", "session", "latestRound",
-                    "usageComplete", "execution", "notes", "runtimeVersion"):
-            self.assertIn(key, full)
-        self.assertNotIn("view", full)
-        self.assertEqual(full["rounds"][0]["evidence"]["roundDir"], full["evidence"]["roundDir"])
-        self.assertIn("final_excerpt", full["summary"])
+        refused = run_cli("result", "--repo", str(self.repo.root), "--task", "compact", "--full",
+                          env=self.env, expect=2)
+        self.assertIn("unrecognized arguments: --full", refused.stderr)
 
     def test_status_drops_fixed_notes(self):
         status = cli_json("status", "--repo", str(self.repo.root), "--task", "compact",

@@ -23,9 +23,9 @@ python3 .../pi_board.py rearm --repo REPO --task TASK --event-id EVENT
 
 A pause stops dispatch, not Pi; ordinary prompts and progress questions never resume it. A queued card does not override a later pause. A delivery that timed out or crashed may already have arrived: keep the uncertain claim, inspect, and use explicit recovery only if needed. `rearm` may duplicate it (the queue has no idempotency key); never rearm a live inflight send, steal locks or claim exactly-once. Hooks only check pause and recovery. A dead supervisor cannot report itself.
 
-## Adopt an update
+## Updates
 
-Install through the formal plugin mechanism; never edit managed caches, hook trust or app queue databases (hook review is the user's action in the app). At a verified terminal boundary with no worker or supervisor ownership run `pi_task.py upgrade --repo REPO --task TASK` (it refuses a task still on the removed Stop-hook route and says how to finish it), then `register` again, and verify helper hashes and the unchanged session and worktree before `continue`. Registering a terminal task may enqueue a review event at once.
+Install through the formal plugin mechanism; never edit managed caches, hook trust or app queue databases (hook review is the user's action in the app). A running task keeps its frozen helpers; a task from 0.5.x is finished with those helpers, not migrated. Registering a terminal task may enqueue a review event at once.
 
 ## Real desktop validation
 

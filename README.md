@@ -6,7 +6,7 @@
 
 1. Codex 给 Pi 一个完整任务段，明确目标、范围、验收和资源上限。
 2. Pi 在独立工作树内实施；现有 supervisor 每约 15 秒刷新本地看板。
-3. 普通进度和未变化状态不调用主模型，也不入队。待审、阻塞、失败或异常（如持续未修复的检查失败）才通过 `codex queue` 向原桌面任务发送一张不超过 1200 字节的交付卡：任务、轮次、事件 ID、完整候选提交、逐验收项结果、审查额度、Pi 最终报告节选和一条命令提示。CLI 只输出单行紧凑 JSON，`result` 默认紧凑，`--full` 给出完整结构。
+3. 普通进度和未变化状态不调用主模型，也不入队。待审、阻塞、失败或异常（如持续未修复的检查失败）才通过 `codex queue` 向原桌面任务发送一张不超过 1200 字节的交付卡：任务、轮次、事件 ID、完整候选提交、逐验收项结果、审查额度、Pi 最终报告节选和一条命令提示。CLI 只输出单行紧凑 JSON，`result` 只给紧凑视图。
 4. Codex 派工前先做一次可复用的整任务分析，写进现有设计和 brief；Pi 每次完整交付后复用它审查。
 5. 新任务固定两次完整 Pi 交付，第二次质量失败后由同一主会话直接接手。计数、外部缺料和接手规则只在 Skill 中陈述。
 
@@ -41,15 +41,15 @@
 
 ## 0.6.0 变化摘要与升级注意
 
-- 交付卡不超过 1200 字节；CLI 输出单行紧凑 JSON；`result` 默认紧凑，`--full` 给出旧结构；普通进度里程碑只留在看板。
-- 第 1 轮（及合同 hash 变化的轮次）给 Pi 完整合同，其余轮次给短头；失败的检查在 stdout 带 `log_tail`；命令守卫终止引用主检出或其他 worktree 的命令；写越界使交付判定为不就绪（`SCOPE_ESCAPE`）。
-- 删除旧 Stop-hook 投递（`pi_handoff.py` 的 arm/ack/status/release）、`pi_task.py check`、`pi_task.py wait`、`pi_board.py packet` 与 `dispatch` 入口；hooks 只保留 Interrupt 暂停与 cli-queue 恢复。
-- 新增 `pi_board.py metrics --repo R [--task T]`：每任务一行紧凑 JSON（轮数、Pi 用量与费用合计、评审决定、是否接手、面向 Codex 的字节数）；字节数来自任务目录下只记大小的 `codex-io.jsonl`。未取得的用量或费用保持未知，不以部分和冒充完整。
-- **升级注意**：本机若有任务仍绑定旧 Stop 路由（绑定记录处于 armed、suspended 等待处理状态），`pi_task.py upgrade` 会拒绝。先用该任务冻结的 `tools/pi_task.py result` 收尾并自行审查，再由用户退役该绑定文件，然后升级。桌面队列投递在安装前需单独做真实验证（见 [交接恢复](skills/collaborate/references/handoff.md) 的 Real desktop validation）。
+- 交付卡不超过 1200 字节；CLI 输出单行紧凑 JSON，`result` 只有紧凑一种形状；普通进度里程碑只留在看板。
+- Pi 须为 1.0.0 及以上（`start` 与 `continue` 会拒绝更旧或读不出版本的 Pi）。每轮通过 `-e` 加载冻结的 `pi_worker.ts` 扩展：它在工具调用前拦截主检出与其他 worktree 的路径、越界写入，给 bash 填默认超时并限上限，提供原生工具 `check`、`progress`、`readiness`，把合同作为系统提示注入，并在只缺证据时于同一会话内续跑一次。扩展没有加载的轮次一律失败（`WORKER_EXTENSION_NOT_LOADED`）。brief 只含任务文本和固定短头；失败的检查返回 `log_tail`。
+- 删除旧 Stop-hook 投递、`pi_task.py check`、`wait`、`upgrade`、`result --full`，`pi_board.py packet`、`dispatch`，以及 Python 侧的命令守卫、越界判定、supervisor 新进程自动续跑和旧版本固定上限（现统一为两次完整交付）；hooks 只保留 Interrupt 暂停与 cli-queue 恢复。
+- 新增 `pi_board.py metrics --repo R [--task T]`：每任务一行紧凑 JSON（轮数、Pi 用量与费用合计、评审决定、是否接手、面向 Codex 的字节数）；未取得的用量或费用保持未知，不以部分和冒充完整。
+- **升级注意**：0.6.0 与 0.5.x 任务不兼容，不提供迁移。仍在运行或待收尾的旧任务，用其冻结的 `tools/` 下 helper 收尾并自行审查；旧 Stop 绑定记录由用户自行清理。桌面队列投递和真实 Pi 扩展在安装前需单独做真实验证（见 [交接恢复](skills/collaborate/references/handoff.md) 的 Real desktop validation）。
 
 ## 安装与维护
 
-插件由独立 Git 仓库管理，通过仓库自带的 marketplace 分发。依赖 Python 3.10+、Git、已有 Pi CLI；自动通知另需支持 `queue` 的 Codex CLI 和桌面应用。认证沿用现有本地配置，插件不复制密钥。运行时适用于 macOS/Linux，使用标准库、文件锁和进程组。
+插件由独立 Git 仓库管理，通过仓库自带的 marketplace 分发。依赖 Python 3.10+、Git、Pi CLI 1.0.0 及以上；自动通知另需支持 `queue` 的 Codex CLI 和桌面应用。认证沿用现有本地配置，插件不复制密钥。运行时适用于 macOS/Linux，Python 部分只用标准库、文件锁和进程组。
 
 其他 Codex 环境可以直接安装公开仓库自带的 marketplace：
 

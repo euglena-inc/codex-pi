@@ -46,7 +46,7 @@ Complete <whole result>. Baseline <commit>; work only in <worktree>.
 Read <constraints> and <spec path/sections>; acceptance is <contract path and IDs>.
 Settled: <key decision and difficulty -> solution -> verification>. Scope: <allowed; protected>.
 Own implementation, targeted checks, ordinary repairs and scoped commits; do not stop at code written or a partial PASS.
-Run formal checks with this task's frozen pi_check and this round's checksDir.
+Run formal checks with the `check` tool.
 Inputs: <allowed sources; gaps>; do not bypass <forbidden sources>.
 On <design contradiction / authority change / repeated ineffective repair> return the evidence and one decision question.
 If a must-ask item is open, take the conservative reading and report a spec gap.

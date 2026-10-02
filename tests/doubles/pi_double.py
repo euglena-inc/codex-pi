@@ -11,6 +11,11 @@ network, or Codex access. Scenario is selected with PI_DOUBLE_MODE:
   session-trace          record argv once, then behave like ok
   descendant-ignore-term spawn an ignore-TERM grandchild, then exit 0
   descendant-hang        spawn an ignore-TERM grandchild, then hang
+  tool-before-ready      emit a tool event without ever writing worker.ready, then hang
+
+`--version` prints PI_DOUBLE_VERSION (default 1.0.0). When launched with `-e <ext>`
+and CODEX_PI_WORKER_CONFIG, the double plays the extension's load proof and writes
+`worker.ready` (skipped when PI_DOUBLE_NO_READY is set or in tool-before-ready mode).
 
 The recorded session id / session dir / tools / model are appended as JSON
 lines to $PI_DOUBLE_TRACE when that variable is set.
@@ -74,6 +79,9 @@ def record_trace() -> None:
         "model": arg_value("--model"), "thinking": arg_value("--thinking"),
         "tools": arg_value("--tools"),
         "noExtensions": "--no-extensions" in sys.argv,
+        "noApprove": "--no-approve" in sys.argv,
+        "extension": arg_value("-e"),
+        "workerConfig": os.environ.get("CODEX_PI_WORKER_CONFIG"),
         "noSkills": "--no-skills" in sys.argv,
         "noPromptTemplates": "--no-prompt-templates" in sys.argv,
         "noContextFiles": "--no-context-files" in sys.argv,
@@ -92,9 +100,29 @@ def spawn_grandchild() -> None:
                      stderr=subprocess.DEVNULL)
 
 
+def write_ready() -> None:
+    config = os.environ.get("CODEX_PI_WORKER_CONFIG")
+    if not config or "-e" not in sys.argv or os.environ.get("PI_DOUBLE_NO_READY"):
+        return
+    round_dir = Path(json.loads(Path(config).read_text(encoding="utf-8"))["roundDir"])
+    target = round_dir / "worker.ready"
+    temp = target.with_suffix(".tmp")
+    temp.write_text(json.dumps({"piVersion": "1.0.0", "pid": os.getpid(), "at": time.time()}))
+    os.replace(temp, target)
+
+
 def main() -> int:
+    if "--version" in sys.argv[1:]:
+        print(os.environ.get("PI_DOUBLE_VERSION", "1.0.0"))
+        return 0
     mode = os.environ.get("PI_DOUBLE_MODE", "ok")
     record_trace()
+    if mode == "tool-before-ready":
+        emit({"type": "tool_execution_start", "toolName": "read",
+              "args": {"path": "README.md"}, "toolCallId": "early"})
+        time.sleep(600)
+        return 0
+    write_ready()
     if mode == "fail":
         provider, model = reported_model()
         emit({"type": "turn_start"})

@@ -48,10 +48,19 @@ class LifecycleTest(unittest.TestCase):
         self.assertTrue(brief.is_file())
         self.assertEqual(stat_mode(brief), 0o444)
         brief_text = brief.read_text(encoding="utf-8")
-        self.assertIn("do not execute the Codex CLI", brief_text)
+        self.assertIn("Implement the change.", brief_text)
         self.assertIn("acceptance PASS", brief_text)
-        self.assertIn("AGENTS.md", brief_text)
-        self.assertIn(str(task_dir / "tools" / "pi_check.py"), brief_text)
+        self.assertIn("worker contract", brief_text)
+        contract_text = (task_dir / "rounds" / "1" / "contract.md").read_text(encoding="utf-8")
+        self.assertIn("Do not execute the Codex CLI", contract_text)
+        self.assertIn("AGENTS.md", contract_text)
+        self.assertIn("check(id, command", contract_text)
+        self.assertTrue((task_dir / "tools" / "pi_worker.ts").is_file())
+        worker = json.loads((task_dir / "rounds" / "1" / "worker.json").read_text())
+        self.assertEqual(Path(worker["toolsDir"]).resolve(), (task_dir / "tools").resolve())
+        task_pi = json.loads((task_dir / "task.json").read_text())["piVersion"]
+        self.assertEqual(task_pi, "1.0.0")
+        self.assertIn("pi_version=1.0.0", (task_dir / "rounds" / "1" / "round.meta").read_text())
         digest = hashlib.sha256(brief.read_bytes()).hexdigest()
         state = json.loads((task_dir / "rounds" / "1" / "round.state.json").read_text())
         self.assertEqual(state["briefSha256"], digest)
@@ -63,29 +72,27 @@ class LifecycleTest(unittest.TestCase):
 
         result = repo.wait_terminal("alpha", env=env)
         self.assertEqual(result["state"], "completed")
+        self.assertTrue((task_dir / "rounds" / "1" / "worker.ready").is_file())
         finished = json.loads((task_dir / "rounds" / "1" / "round.state.json").read_text())
         self.assertEqual(Path(finished["workerScript"]).resolve().parent, (task_dir / "tools").resolve())
         self.assertEqual(result["exitCode"], 0)
         self.assertEqual(result["execution"], "completed_execution")
         self.assertEqual(result["acceptance"], "not_verified")
         self.assertFalse(result["activeWorker"])
-        self.assertEqual(result["summary"]["usage"]["input"], 10)
-        self.assertEqual(result["summary"]["usage"]["output"], 5)
-        self.assertEqual(result["summary"]["model_check"], "matched")
+        self.assertEqual(result["usage"]["input"], 10)
+        self.assertEqual(result["usage"]["output"], 5)
+        self.assertEqual(result["modelCheck"], "matched")
         self.assertTrue(result["usageComplete"])
-        self.assertEqual(result["summary"]["acceptance"], "not_verified")
-        checks = result["summary"]["checks"]
-        self.assertEqual(checks["total"], 0)
-        self.assertIn("missing evidence", checks["absence"])
-        self.assertNotIn("tool_execution_start", json.dumps(result["summary"]))
-        self.assertNotIn("commands", result["summary"])
+        self.assertEqual(result["checks"], ["no check receipts recorded (missing evidence)"])
+        self.assertNotIn("tool_execution_start", json.dumps(result))
+        self.assertNotIn("commands", result)
 
         recorded = [json.loads(line) for line in trace.read_text().splitlines()]
         self.assertEqual(len(recorded), 1)
         self.assertEqual(recorded[0]["sessionId"], "alpha")
         self.assertEqual(recorded[0]["model"], "deepseek/deepseek-flash")
         self.assertEqual(recorded[0]["thinking"], "max")
-        self.assertEqual(recorded[0]["tools"], "read,write,edit,bash")
+        self.assertEqual(recorded[0]["tools"], "read,write,edit,bash,check,progress,readiness")
         self.assertTrue(recorded[0]["noExtensions"] and recorded[0]["noSkills"]
                         and recorded[0]["noPromptTemplates"])
         self.assertFalse(recorded[0]["noContextFiles"], "AGENTS.md discovery must stay enabled")
@@ -98,10 +105,10 @@ class LifecycleTest(unittest.TestCase):
         repo.start("ro", worktree, read_only=True, env=env)
         result = repo.wait_terminal("ro", env=env)
         self.assertEqual(result["state"], "completed")
-        self.assertTrue(result["readOnly"])
+        self.assertTrue(json.loads((repo.task_dir("ro") / "task.json").read_text())["readOnly"])
         recorded = json.loads(trace.read_text().splitlines()[0])
-        self.assertEqual(recorded["tools"], "read,grep,find,ls")
-        self.assertIn("read-only", (repo.task_dir("ro") / "rounds" / "1" / "brief.md").read_text())
+        self.assertEqual(recorded["tools"], "read,grep,find,ls,check,progress,readiness")
+        self.assertIn("read-only", (repo.task_dir("ro") / "rounds" / "1" / "contract.md").read_text())
 
     def test_project_selected_newapi_model_is_pinned_and_passed_to_pi(self):
         model = "newapi/glm-5.3"
@@ -115,12 +122,12 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(started["model"], model)
         result = repo.wait_terminal("newapi-model", env=env)
         self.assertEqual(result["state"], "completed")
-        self.assertEqual(result["summary"]["model_check"], "matched")
+        self.assertEqual(result["modelCheck"], "matched")
 
         task = json.loads((repo.task_dir("newapi-model") / "task.json").read_text())
         self.assertEqual(task["model"], model)
-        brief = (repo.task_dir("newapi-model") / "rounds" / "1" / "brief.md").read_text()
-        self.assertIn(f"pinned to `{model}`", brief)
+        contract = (repo.task_dir("newapi-model") / "rounds" / "1" / "contract.md").read_text()
+        self.assertIn(f"pinned to `{model}`", contract)
         recorded = json.loads(trace.read_text().splitlines()[0])
         self.assertEqual(recorded["model"], model)
 
@@ -146,9 +153,9 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(response["round"], 2)
         second = repo.wait_terminal("beta", env=ok_env)
         self.assertEqual(second["state"], "completed")
-        self.assertEqual(len(second["rounds"]), 2)
-        self.assertEqual(second["rounds"][0]["state"], "failed")
-        self.assertEqual(second["rounds"][0]["exitCode"], 3)
+        self.assertEqual(second["latestRound"], 2)
+        self.assertEqual(repo.result("beta", round=1, env=ok_env)["state"], "failed")
+        self.assertEqual(repo.result("beta", round=1, env=ok_env)["exitCode"], 3)
         self.assertEqual(second["round"], 2)
         explicit = repo.result("beta", round=1, env=ok_env)
         self.assertEqual(explicit["round"], 1)
@@ -319,8 +326,8 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(result["state"], "completed")
         self.assertFalse(result["usageComplete"])
         for key in ("input", "cacheRead", "cacheWrite", "output", "totalTokens"):
-            self.assertIsNone(result["summary"]["usage"][key])
-        self.assertEqual(result["summary"]["model_check"], "matched")
+            self.assertIsNone(result["usage"][key])
+        self.assertEqual(result["modelCheck"], "matched")
         self.assertEqual(result["acceptance"], "not_verified")
 
     def test_stale_round_evidence_blocks_continue(self):
@@ -542,10 +549,8 @@ class LifecycleTest(unittest.TestCase):
         self.assertIn(str(repo.root.resolve()), blocked.stderr)
         self.assertEqual(snapshot_files(task_dir), before)
         # result may still read common-dir evidence from any checkout of the project.
-        result = cli_json("result", "--repo", str(worktree), "--task", "frozen", "--full",
-                          env=env)
+        result = cli_json("result", "--repo", str(worktree), "--task", "frozen", env=env)
         self.assertEqual(result["state"], "completed")
-        self.assertEqual(result["repo"], str(repo.root.resolve()))
 
     def test_stale_frozen_model_cannot_continue_and_evidence_is_preserved(self):
         repo, worktree = self.make()
@@ -596,8 +601,8 @@ class LifecycleTest(unittest.TestCase):
         repo.start("mismatch", worktree, env=env)
         result = repo.wait_terminal("mismatch", env=env)
         self.assertEqual(result["state"], "completed")
-        self.assertEqual(result["summary"]["model_check"], "mismatch")
-        self.assertIn("openai-codex/gpt-6-luna", result["summary"]["models"])
+        self.assertEqual(result["modelCheck"], "mismatch")
+        self.assertIn("openai-codex/gpt-6-luna", result["reportedModels"])
         self.assertEqual(result["acceptance"], "not_verified")
 
 

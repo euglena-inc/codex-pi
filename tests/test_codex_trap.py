@@ -42,11 +42,11 @@ class CodexTrapTest(unittest.TestCase):
         repo.continue_task("trapped-task", env=env)
         result = repo.wait_terminal("trapped-task", env=env, timeout=30)
         self.assertEqual(result["state"], "completed")
-        self.assertEqual(len(result["rounds"]), 2)
+        self.assertEqual(result["latestRound"], 2)
         self.assertFalse(self.marker.exists(),
                          "a codex executable on PATH was invoked by the runtime")
-        brief = (repo.task_dir("trapped-task") / "rounds" / "1" / "brief.md").read_text()
-        self.assertIn("do not execute the Codex CLI", brief)
+        contract = (repo.task_dir("trapped-task") / "rounds" / "1" / "contract.md").read_text()
+        self.assertIn("Do not execute the Codex CLI", contract)
         self.assertEqual(result["acceptance"], "not_verified")
 
     def test_worker_environment_keeps_trap_without_running_it(self):

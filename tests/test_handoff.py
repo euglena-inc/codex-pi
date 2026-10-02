@@ -2,7 +2,7 @@
 
 The remaining hooks only pause cli-queue routes on Interrupt and print bounded
 recovery evidence on SessionStart/UserPromptSubmit. Removed CLI entries return
-argument errors, and ``upgrade`` refuses a task still bound to the legacy route.
+argument errors.
 No Codex binary and no model are used.
 """
 from __future__ import annotations
@@ -91,7 +91,7 @@ class HooksAfterStopRemovalTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(json.loads(proc.stdout), {})
 
-    def test_legacy_bindings_are_never_injected_on_prompt_or_session_start(self):
+    def test_old_binding_files_are_never_injected_on_prompt_or_session_start(self):
         repo, _ = self.make()
         env = h_env(self.tmp)
         for state in ("delivered", "armed", "suspended", "needs_recovery", "acked"):
@@ -163,26 +163,6 @@ class HooksAfterStopRemovalTest(unittest.TestCase):
         repo.start(name, worktree, env=env)
         repo.wait_terminal(name, env=env)
         return repo, env
-
-    def test_upgrade_refuses_a_task_still_bound_to_the_legacy_stop_route(self):
-        repo, env = self.finished_task("legacy")
-        binding = self.write_binding(repo, "legacy", "armed")
-        before = (repo.task_dir("legacy") / "task.json").read_bytes()
-        proc = run_cli("upgrade", "--repo", str(repo.root), "--task", "legacy", env=env, expect=2)
-        self.assertIn("legacy Stop-hook", proc.stderr)
-        self.assertIn("frozen helpers", proc.stderr)
-        self.assertIn(str(repo.task_dir("legacy") / "tools" / "pi_task.py"), proc.stderr)
-        self.assertIn(str(binding), proc.stderr)
-        self.assertEqual((repo.task_dir("legacy") / "task.json").read_bytes(), before)
-        self.assertFalse(list(repo.task_dir("legacy").glob("tools.old-*")))
-
-    def test_delivered_binding_or_other_task_does_not_block_upgrade(self):
-        repo, env = self.finished_task("clean")
-        self.write_binding(repo, "clean", "delivered", key="a" * 64)
-        self.write_binding(repo, "someone-else", "armed", key="b" * 64)
-        data = json.loads(run_cli("upgrade", "--repo", str(repo.root), "--task", "clean",
-                                  env=env).stdout)
-        self.assertTrue(data["ok"])
 
     def test_snapshot_contains_self_contained_helpers(self):
         repo, worktree = self.make()

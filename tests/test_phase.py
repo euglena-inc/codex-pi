@@ -224,12 +224,6 @@ class PhaseTest(unittest.TestCase):
     def phase_state(self, repo: Repo, task: str) -> dict:
         return json.loads((repo.task_dir(task) / "phase.state.json").read_text(encoding="utf-8"))
 
-    def phase_auto(self, repo: Repo, task: str) -> dict:
-        path = repo.task_dir(task) / "phase-auto.json"
-        if not path.exists():
-            return {}
-        return json.loads(path.read_text(encoding="utf-8")).get("phases", {})
-
     def pending(self, repo: Repo, task: str, kind: str | None = None) -> list:
         events = json.loads((repo.state_dir / "board.json").read_text(encoding="utf-8"))[
             "cards"][task]["events"]
@@ -258,12 +252,17 @@ class PhaseTest(unittest.TestCase):
         task_json = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
         self.assertIn("pi_phase.py", task_json["helperHashes"])
         brief = (task_dir / "rounds" / "1" / "brief.md").read_text(encoding="utf-8")
-        self.assertIn("phase_id=P-CONTRACT", brief)
-        self.assertIn(f"contract_sha256={frozen['contractSha256']}", brief)
-        self.assertIn("id=A1", brief)
-        self.assertIn("--completed-criteria", brief)
-        self.assertIn("readiness", brief)
-        self.assertIn("design_sha256=" + sha, brief)
+        self.assertNotIn("phase_id=", brief, "the brief is the prompt plus a short header")
+        contract_md = (task_dir / "rounds" / "1" / "contract.md").read_text(encoding="utf-8")
+        worker = json.loads((task_dir / "rounds" / "1" / "worker.json").read_text(encoding="utf-8"))
+        self.assertEqual(worker["contract"], contract_md)
+        self.assertTrue(worker["phase"])
+        for text in (contract_md,):
+            self.assertIn("phase_id=P-CONTRACT", text)
+            self.assertIn(f"contract_sha256={frozen['contractSha256']}", text)
+            self.assertIn("id=A1", text)
+            self.assertIn("check(id, command", text)
+            self.assertIn("design_sha256=" + sha, text)
         self.wait_terminal(repo, "contract-task")
 
     def test_invalid_contracts_are_rejected_before_any_task_evidence(self):
@@ -290,7 +289,7 @@ class PhaseTest(unittest.TestCase):
             self.assertFalse(repo.task_dir(task).exists(),
                              f"{name}: no task evidence may exist after rejection")
 
-    def test_legacy_task_stays_compatible(self):
+    def test_brief_only_task_has_no_contract(self):
         repo, worktree = self.make()
         env = self.h_env(PI_DOUBLE_MODE="ok")
         self.start(repo, worktree, "legacy", None, env)
@@ -298,7 +297,7 @@ class PhaseTest(unittest.TestCase):
         readiness = cli_json("readiness", "--repo", str(repo.root), "--task", "legacy", env=env)
         self.assertEqual(readiness["status"], "no_contract")
         status = cli_json("phase-status", "--repo", str(repo.root), "--task", "legacy", env=env)
-        self.assertTrue(status["legacy"])
+        self.assertTrue(status["briefOnly"])
         self.assertFalse(status["phaseInstalled"])
         self.register(repo, "legacy", env)
         self.refresh(repo, "legacy", env)
@@ -427,7 +426,7 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(reviews[0]["phaseId"], "P-READY")
         self.assertEqual(reviews[0]["candidate"]["head"], candidate)
 
-    def test_brief_uses_contract_command_timeout_and_keeps_round_timeout(self):
+    def test_worker_config_uses_contract_command_timeout_and_keeps_round_timeout(self):
         repo, worktree = self.make(name="brief-phase")
         env = self.h_env(PI_DOUBLE_MODE="hang")
         try:
@@ -436,27 +435,28 @@ class PhaseTest(unittest.TestCase):
                 "brief.json", self.contract(repo, "P-BRIEF", design_sha=sha))
             self.start(repo, worktree, "brief-phase", path, env)
             repo.wait_round_state("brief-phase", "running")
-            brief = (repo.task_dir("brief-phase") / "rounds" / "1" / "brief.md").read_text(
-                encoding="utf-8")
-            self.assertIn("command_timeout_seconds=900", brief)
-            self.assertIn("--timeout-seconds 900", brief)
-            self.assertNotIn("--timeout-seconds 14400", brief)
-            self.assertIn("whole-round", brief)
-            self.assertIn("declared command", brief)
+            round_dir = repo.task_dir("brief-phase") / "rounds" / "1"
+            worker = json.loads((round_dir / "worker.json").read_text(encoding="utf-8"))
+            self.assertEqual(worker["checkTimeoutSeconds"], 900)
+            self.assertEqual(worker["bashCeilingSeconds"], 900)
+            self.assertEqual(worker["bashDefaultTimeoutSeconds"], 600)
+            self.assertIn("command_timeout_seconds=900",
+                          (round_dir / "contract.md").read_text(encoding="utf-8"))
         finally:
             repo.cancel("brief-phase", env=env)
             repo.wait_terminal("brief-phase", env=env, timeout=25)
-        legacy, legacy_wt = self.make(name="brief-legacy")
+        plain, plain_wt = self.make(name="brief-plain")
         try:
-            self.start(legacy, legacy_wt, "brief-legacy", None, env)
-            legacy.wait_round_state("brief-legacy", "running")
-            legacy_brief = (legacy.task_dir("brief-legacy") / "rounds" / "1"
-                            / "brief.md").read_text(encoding="utf-8")
-            self.assertIn("--timeout-seconds 14400", legacy_brief)
-            self.assertNotIn("command_timeout_seconds", legacy_brief)
+            self.start(plain, plain_wt, "brief-plain", None, env)
+            plain.wait_round_state("brief-plain", "running")
+            worker = json.loads((plain.task_dir("brief-plain") / "rounds" / "1" / "worker.json")
+                                .read_text(encoding="utf-8"))
+            self.assertEqual(worker["checkTimeoutSeconds"], 14400)
+            self.assertFalse(worker["phase"])
+            self.assertIsNone(worker["settleQuotaPath"])
         finally:
-            legacy.cancel("brief-legacy", env=env)
-            legacy.wait_terminal("brief-legacy", env=env, timeout=25)
+            plain.cancel("brief-plain", env=env)
+            plain.wait_terminal("brief-plain", env=env, timeout=25)
 
     def test_receipt_command_identity_gates_readiness_board_and_accept(self):
         fixture = self.ready_accept_fixture("cmd-gate", "P-CMDGATE")
@@ -565,7 +565,7 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(readiness()["status"], "ready")
         self.assertEqual(readiness()["items"][0]["status"], "covered")
 
-    def test_failed_required_check_escalates_without_auto_continue(self):
+    def test_failed_required_check_escalates(self):
         repo, worktree = self.make()
         env = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="3")
         sha = self.write_design(repo)
@@ -576,7 +576,6 @@ class PhaseTest(unittest.TestCase):
         self.synth_receipt(checks, "A1", 3, self.head(worktree))
         repo.wait_terminal("failed-check-task")
         self.assertEqual(self.rounds(repo, "failed-check-task"), [1])
-        self.assertEqual(self.phase_auto(repo, "failed-check-task"), {})
         self.register(repo, "failed-check-task", env)
         self.refresh(repo, "failed-check-task", env)
         blocked = self.pending(repo, "failed-check-task", "phase_blocked")
@@ -584,7 +583,7 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(blocked[0]["evidence"]["reason"], "required_check_failed")
 
     # ------------------------------------------------------------------
-    # O1-4 / O1-5 classification and one auto-continuation
+    # O1-4 / O1-5 classification
     # ------------------------------------------------------------------
     def test_running_check_timeout_stays_local_and_never_queues(self):
         repo, worktree = self.make()
@@ -609,111 +608,7 @@ class PhaseTest(unittest.TestCase):
             repo.cancel("local-timeout", env=env)
             repo.wait_terminal("local-timeout", env=env, timeout=25)
 
-    def test_one_auto_continuation_reuses_session_worktree_and_budget(self):
-        repo, worktree = self.make()
-        trace = self.tmp / "trace.jsonl"
-        env = self.h_env(PI_DOUBLE_MODE="session-trace", PI_DOUBLE_TRACE=str(trace))
-        sha = self.write_design(repo)
-        path = self.write_contract("p.json", self.contract(repo, "P-AUTO", design_sha=sha,
-                                                           budget=3600))
-        self.start(repo, worktree, "auto-task", path, env)
-        self.wait_rounds(repo, "auto-task", 2)
-        # Both rounds are terminal and the single quota is spent.
-        self.wait_for(lambda: all(
-            json.loads((repo.task_dir("auto-task") / "rounds" / str(n) / "round.state.json")
-                       .read_text(encoding="utf-8"))["state"] == "completed" for n in (1, 2)),
-            timeout=30, what="both auto rounds completed")
-        recorded = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines() if line]
-        self.assertEqual(len(recorded), 2, "exactly one automatic continuation round ran")
-        self.assertEqual(recorded[0]["sessionId"], recorded[1]["sessionId"])
-        self.assertEqual(recorded[0]["sessionDir"], recorded[1]["sessionDir"])
-        self.assertEqual(recorded[0]["cwd"], recorded[1]["cwd"])
-        self.assertEqual(Path(recorded[1]["cwd"]).resolve(), worktree.resolve())
-        brief = (repo.task_dir("auto-task") / "rounds" / "2" / "brief.md").read_text(encoding="utf-8")
-        self.assertIn("delivery gap repair", brief)
-        self.assertIn("A1", brief)
-        state = self.phase_state(repo, "auto-task")
-        self.assertAlmostEqual(state["budgetSeconds"], 3600, delta=1)
-        self.assertAlmostEqual(state["deadlineAt"] - state["startedAt"], 3600, delta=1)
-        self.wait_for(lambda: self.phase_auto(repo, "auto-task").get("P-AUTO", {}).get(
-            "status") == "exhausted", timeout=20, what="auto ledger exhausted")
-        state = self.phase_state(repo, "auto-task")
-        self.assertTrue(state["autoContinue"]["used"])
-        self.assertEqual(state["autoContinue"]["status"], "exhausted")
-        self.register(repo, "auto-task", env)
-        self.refresh(repo, "auto-task", env)
-        blocked = self.pending(repo, "auto-task", "phase_blocked")
-        self.assertEqual(len(blocked), 1)
-        self.assertEqual(blocked[0]["evidence"]["reason"], "auto_continue_used")
-        self.assertEqual(self.pending(repo, "auto-task", "review_required"), [])
-        revision = json.loads((repo.state_dir / "board.json").read_text(encoding="utf-8"))["revision"]
-        self.refresh(repo, "auto-task", env)
-        self.assertEqual(json.loads((repo.state_dir / "board.json").read_text(encoding="utf-8"))["revision"],
-                         revision, "a repeated refresh must not add duplicate events")
-        # The spent quota is durable: no second automatic round can appear.
-        self.assertEqual(self.rounds(repo, "auto-task"), [1, 2])
-
-    def test_pause_blocks_the_automatic_continuation(self):
-        repo, worktree = self.make()
-        env = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="4")
-        sha = self.write_design(repo)
-        path = self.write_contract("p.json", self.contract(repo, "P-PAUSED", design_sha=sha))
-        self.start(repo, worktree, "paused-task", path, env)
-        repo.wait_round_state("paused-task", "running")
-        self.register(repo, "paused-task", env)
-        board_json("pause", "--repo", str(repo.root), "--task", "paused-task",
-                   "--note", "user paused", env=env)
-        repo.wait_terminal("paused-task")
-        self.assertEqual(self.rounds(repo, "paused-task"), [1], "a paused phase never auto-continues")
-        self.assertEqual(self.phase_auto(repo, "paused-task"), {})
-        self.refresh(repo, "paused-task", env)
-        blocked = self.pending(repo, "paused-task", "phase_blocked")
-        self.assertEqual(len(blocked), 1)
-        self.assertEqual(blocked[0]["evidence"]["reason"], "paused")
-        # Resuming explicitly does not resurrect the spent automatic decision.
-        board_json("resume", "--repo", str(repo.root), "--task", "paused-task", env=env)
-        self.refresh(repo, "paused-task", env)
-        self.assertEqual(self.rounds(repo, "paused-task"), [1])
-
-    def test_unknown_auto_continue_start_escalates_without_retry(self):
-        repo, worktree = self.make()
-        env = self.h_env(PI_DOUBLE_MODE="ok")
-        sha = self.write_design(repo)
-        path = self.write_contract("p.json", self.contract(repo, "P-UNKNOWN", design_sha=sha))
-        self.start(repo, worktree, "unknown-start", path, env)
-        self.wait_rounds(repo, "unknown-start", 2)
-        self.wait_for(lambda: self.phase_auto(repo, "unknown-start").get("P-UNKNOWN", {}).get(
-            "status") == "exhausted", timeout=20, what="auto ledger exhausted")
-        # Simulate a crash after the claim but before the continuation started.
-        ledger = json.loads((repo.task_dir("unknown-start") / "phase-auto.json").read_text(encoding="utf-8"))
-        ledger["phases"]["P-UNKNOWN"]["status"] = "claimed"
-        (repo.task_dir("unknown-start") / "phase-auto.json").write_text(
-            json.dumps(ledger), encoding="utf-8")
-        self.register(repo, "unknown-start", env)
-        self.refresh(repo, "unknown-start", env)
-        blocked = self.pending(repo, "unknown-start", "phase_blocked")
-        self.assertEqual(len(blocked), 1)
-        self.assertEqual(blocked[0]["evidence"]["reason"], "auto_continue_unknown")
-        self.assertEqual(self.rounds(repo, "unknown-start"), [1, 2],
-                         "an unknown start result is never retried")
-
-    def test_budget_exhaustion_blocks_auto_continue(self):
-        repo, worktree = self.make()
-        env = self.h_env(PI_DOUBLE_MODE="ok")
-        sha = self.write_design(repo)
-        path = self.write_contract("p.json", self.contract(repo, "P-BUDGET", design_sha=sha,
-                                                           budget=1))
-        self.start(repo, worktree, "budget-task", path, env)
-        repo.wait_terminal("budget-task")
-        self.assertEqual(self.rounds(repo, "budget-task"), [1])
-        self.assertEqual(self.phase_auto(repo, "budget-task"), {})
-        self.register(repo, "budget-task", env)
-        self.refresh(repo, "budget-task", env)
-        blocked = self.pending(repo, "budget-task", "phase_blocked")
-        self.assertEqual(len(blocked), 1)
-        self.assertEqual(blocked[0]["evidence"]["reason"], "budget_exhausted")
-
-    def test_nonzero_exit_never_auto_continues(self):
+    def test_nonzero_exit_is_never_ready(self):
         repo, worktree = self.make()
         env = self.h_env(PI_DOUBLE_MODE="fail")
         sha = self.write_design(repo)
@@ -721,7 +616,6 @@ class PhaseTest(unittest.TestCase):
         self.start(repo, worktree, "fail-task", path, env)
         repo.wait_terminal("fail-task")
         self.assertEqual(self.rounds(repo, "fail-task"), [1])
-        self.assertEqual(self.phase_auto(repo, "fail-task"), {})
         readiness = cli_json("readiness", "--repo", str(repo.root), "--task", "fail-task",
                              "--round", "1", env=env)
         self.assertEqual(readiness["status"], "not_ready")
@@ -733,7 +627,7 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(len(blocked), 1)
         self.assertEqual(blocked[0]["evidence"]["reason"], "round_execution_failed")
 
-    def test_out_of_scope_change_escalates_instead_of_auto_continuing(self):
+    def test_out_of_scope_change_escalates(self):
         repo, worktree = self.make()
         env = self.h_env(PI_DOUBLE_MODE="delay-ok", PI_DOUBLE_DELAY="4")
         sha = self.write_design(repo)
@@ -753,30 +647,6 @@ class PhaseTest(unittest.TestCase):
         blocked = self.pending(repo, "scope-task", "phase_blocked")
         self.assertEqual(len(blocked), 1)
         self.assertEqual(blocked[0]["evidence"]["reason"], "scope_violation")
-
-    def test_auto_continue_claim_is_single_per_phase(self):
-        repo, worktree = self.make()
-        env = self.h_env(PI_DOUBLE_MODE="hang")
-        sha = self.write_design(repo)
-        path = self.write_contract("p.json", self.contract(repo, "P-QUOTA", design_sha=sha))
-        self.start(repo, worktree, "quota-task", path, env)
-        repo.wait_round_state("quota-task", "running")
-        try:
-            task_dir = repo.task_dir("quota-task")
-            task = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
-            first, problem = pi_task._claim_auto_continue(task_dir, "P-QUOTA", "a" * 64, 1,
-                                                          "missing_checks", task)
-            self.assertIsNotNone(first, problem)
-            second, existing = pi_task._claim_auto_continue(task_dir, "P-QUOTA", "a" * 64, 1,
-                                                            "missing_checks", task)
-            self.assertIsNone(second)
-            self.assertTrue(existing["used"])
-            ledger = pi_task.read_phase_auto(task_dir)[0]
-            self.assertEqual(list(ledger["phases"]), ["P-QUOTA"])
-            self.assertEqual(ledger["phases"]["P-QUOTA"]["round"], 2)
-        finally:
-            repo.cancel("quota-task", env=env)
-            repo.wait_terminal("quota-task", env=env, timeout=25)
 
     def test_scope_check_covers_all_changed_files_beyond_a_prefix(self):
         repo, worktree = self.make()
@@ -1108,78 +978,6 @@ class PhaseTest(unittest.TestCase):
                 "--prompt", "more", env=env, expect=0)
         repo.wait_terminal("route-continue", round=2)
 
-    def test_late_pause_between_claim_and_start_fails_closed(self):
-        repo, worktree = self.make()
-        env = self.h_env(PI_DOUBLE_MODE="hang")
-        sha = self.write_design(repo)
-        path = self.write_contract("p.json", self.contract(repo, "P-LATE", design_sha=sha))
-        self.start(repo, worktree, "late-pause", path, env)
-        repo.wait_round_state("late-pause", "running")
-        # Registering creates the board whose lock the start decision now holds;
-        # the mocked pause check reports "not paused" for the decision and
-        # "late pause" for the locked re-check.
-        self.register(repo, "late-pause", env)
-        task_dir = repo.task_dir("late-pause")
-        round_dir = task_dir / "rounds" / "1"
-        task = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
-        head = self.head(worktree)
-        round_state = json.loads((round_dir / "round.state.json").read_text(encoding="utf-8"))
-        round_state.update({"state": "completed", "exitCode": 0, "endHead": head,
-                            "endedAt": time.time(), "timedOut": False, "cancelled": False})
-        (round_dir / "round.state.json").write_text(json.dumps(round_state), encoding="utf-8")
-        try:
-            with mock.patch.object(pi_task, "board_pause_active",
-                                   side_effect=[(False, None), (True, "late pause")]) as pause:
-                result = pi_task.post_round_phase(task, task_dir, 1, round_dir,
-                                                  {"exitCode": 0, "endHead": head,
-                                                   "endedAt": time.time()}, "completed")
-            self.assertIsNone(result, "a late pause must not start the continuation")
-            self.assertEqual(pause.call_count, 2)
-            self.assertFalse((task_dir / "rounds" / "2").exists())
-            ledger = self.phase_auto(repo, "late-pause")
-            self.assertEqual(ledger["P-LATE"]["status"], "blocked")
-            self.assertEqual(ledger["P-LATE"]["reason"], "paused")
-            state = self.phase_state(repo, "late-pause")
-            self.assertEqual(state["lastDecision"]["reason"], "paused")
-        finally:
-            repo.cancel("late-pause", env=env)
-            repo.wait_terminal("late-pause", env=env, timeout=25)
-
-    def test_unavailable_pause_lock_fails_closed(self):
-        repo, worktree = self.make()
-        env = self.h_env(PI_DOUBLE_MODE="hang")
-        sha = self.write_design(repo)
-        path = self.write_contract("p.json", self.contract(repo, "P-LOCK", design_sha=sha))
-        self.start(repo, worktree, "pause-lock", path, env)
-        repo.wait_round_state("pause-lock", "running")
-        self.register(repo, "pause-lock", env)
-        task_dir = repo.task_dir("pause-lock")
-        round_dir = task_dir / "rounds" / "1"
-        task = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
-        head = self.head(worktree)
-        round_state = json.loads((round_dir / "round.state.json").read_text(encoding="utf-8"))
-        round_state.update({"state": "completed", "exitCode": 0, "endHead": head,
-                            "endedAt": time.time(), "timedOut": False, "cancelled": False})
-        (round_dir / "round.state.json").write_text(json.dumps(round_state), encoding="utf-8")
-        import fcntl
-        lock_path = repo.state_dir / "board.lock"
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            result = pi_task.post_round_phase(task, task_dir, 1, round_dir,
-                                              {"exitCode": 0, "endHead": head,
-                                               "endedAt": time.time()}, "completed")
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
-        self.assertIsNone(result, "an unverifiable pause state must not start a continuation")
-        self.assertFalse((task_dir / "rounds" / "2").exists())
-        ledger = self.phase_auto(repo, "pause-lock")
-        self.assertEqual(ledger["P-LOCK"]["status"], "blocked")
-        self.assertEqual(ledger["P-LOCK"]["reason"], "pause_state_unknown")
-        repo.cancel("pause-lock", env=env)
-        repo.wait_terminal("pause-lock", env=env, timeout=25)
-
     # ------------------------------------------------------------------
     # O1-6 acceptance gate and stale evidence
     # ------------------------------------------------------------------
@@ -1486,7 +1284,7 @@ class PhaseTest(unittest.TestCase):
         state = self.phase_state(repo, "cross-task")
         self.assertEqual(state["phaseId"], "P-CROSS2")
 
-    def test_same_phase_revision_keeps_budget_anchor_and_quota(self):
+    def test_same_phase_revision_keeps_the_budget_anchor(self):
         repo, worktree, env = self.ready_phase(task="revision-task", phase_id="P-REV")
         original = self.phase_state(repo, "revision-task")
         event = self.pending(repo, "revision-task", "review_required")[0]

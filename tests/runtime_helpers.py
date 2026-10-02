@@ -185,11 +185,8 @@ class Repo:
     def cancel(self, task: str, env: dict | None = None):
         return cli_json("cancel", "--repo", str(self.root), "--task", task, env=env)
 
-    def result(self, task: str, round: int | None = None, env: dict | None = None,
-               full: bool = True) -> dict:
+    def result(self, task: str, round: int | None = None, env: dict | None = None) -> dict:
         args = ["result", "--repo", str(self.root), "--task", task]
-        if full:
-            args.append("--full")
         if round is not None:
             args += ["--round", str(round)]
         return cli_json(*args, env=env)
