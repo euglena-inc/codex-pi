@@ -59,6 +59,33 @@ class ExecutionTest(unittest.TestCase):
             path.write_text(text)
             self.assertEqual(terminal_evidence(path)["status"], "unknown")
 
+    def test_large_agent_end_does_not_evict_the_final_message_from_the_bounded_window(self):
+        path=self.root/'stream.jsonl'
+        final={"type":"message_end","message":{"role":"assistant","stopReason":"stop",
+            "errorMessage":None,"content":[{"type":"text","text":"final report"}]}}
+        events=[final,{"type":"turn_end"},{"type":"agent_end","messages":[
+            final["message"],{"role":"user","content":[{"type":"text","text":"x"*1_250_000}]}]}]
+        path.write_text("\n".join(json.dumps(event) for event in events)+"\n")
+        evidence=terminal_evidence(path)
+        self.assertEqual(evidence["status"],"completed")
+        self.assertEqual(evidence["finalText"],"final report")
+
+    def test_truncated_large_terminal_line_cannot_reuse_an_earlier_stop(self):
+        path=self.root/'stream.jsonl'
+        final=json.dumps({"type":"message_end","message":{"role":"assistant","stopReason":"stop",
+            "content":[{"type":"text","text":"earlier"}]}})
+        path.write_text(final+"\n"+'{"type":"agent_end","messages":[{"role":"assistant","content":"'
+                       +"x"*1_250_000)
+        self.assertEqual(terminal_evidence(path)["status"],"unknown")
+
+    def test_large_later_tool_activity_cannot_reuse_a_completed_assistant(self):
+        path=self.root/'stream.jsonl'
+        final=json.dumps({"type":"message_end","message":{"role":"assistant","stopReason":"stop",
+            "content":[{"type":"text","text":"earlier"}]}})
+        tool=json.dumps({"type":"tool_execution_end","toolName":"large","output":"x"*1_250_000})
+        path.write_text(final+"\n"+tool+"\n")
+        self.assertEqual(terminal_evidence(path)["status"],"unknown")
+
     def test_later_activity_and_stream_fault_cannot_reuse_an_earlier_answer(self):
         path=self.root/'stream.jsonl'
         prefix=json.dumps({'type':'message_end','message':{'role':'assistant','stopReason':'stop',
