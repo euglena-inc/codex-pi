@@ -99,3 +99,11 @@ Version 0.6.0. README, plugin manifest and IMPLEMENTATION.md are updated to matc
 - Step 3 (accepted at `158f79c`, +264/−2813 lines):
   - Pending legacy states are `armed`, `suspended`, `expired` and `needs_recovery`. A legacy binding file is retired by the user, because the runtime no longer has `release`.
   - No legacy binding state injects recovery text. `hooks.json` keeps `Interrupt`, `SessionStart` and `UserPromptSubmit`.
+- Step 4 and release (accepted at `df08aa8`):
+  - `show` across several tasks splits its stdout bytes evenly, with the remainder going to the first task. The total is exact; the per-task split is an estimate.
+  - `metrics` takeover reflects the review-policy latch.
+  - The manifest version is `0.6.0` without a `+codex.<timestamp>` cache suffix. The release owner adds a suffix at install time if one is wanted.
+  - Baseline from one consuming repository (6 tasks, read-only `metrics`):
+    - Pi cost US$0.10–0.46 per task, every usage record complete;
+    - 2 takeovers;
+    - Codex bytes not tracked before 0.6.0.
