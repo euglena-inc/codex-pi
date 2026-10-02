@@ -13,6 +13,10 @@ from runtime_helpers import (RUNTIME, Repo, base_env, cleanup_repos, default_con
 
 sys.path.insert(0, str(RUNTIME))
 import pi_board  # noqa: E402
+import pi_store  # noqa: E402
+import pi_queue  # noqa: E402
+import pi_events  # noqa: E402
+import pi_core  # noqa: E402
 import pi_task  # noqa: E402
 
 CHECK = RUNTIME / "pi_check.py"
@@ -96,7 +100,7 @@ class ForbiddenCheckoutRootsTest(unittest.TestCase):
         wt = repo.worktree("a")
         other = repo.worktree("b")
         task_dir = repo.task_dir("T")
-        forbidden, allowed = pi_task.forbidden_checkouts(wt, task_dir, 1)
+        forbidden, allowed = pi_core.forbidden_checkouts(wt, task_dir, 1)
         self.assertIn(os.path.realpath(str(repo.root)), forbidden)
         self.assertIn(os.path.realpath(str(other)), forbidden)
         self.assertNotIn(os.path.realpath(str(wt)), forbidden)
@@ -107,20 +111,20 @@ class ForbiddenCheckoutRootsTest(unittest.TestCase):
 
 class DecideHintTest(unittest.TestCase):
     def test_hint_references_the_card_and_stays_within_200_bytes(self):
-        card = pi_board._new_card("t1", "11111111-2222-3333-4444-555555555555", "T", "G", "b.md",
-                                  None, "/r", "/c", "/w", pi_board.TRANSPORT_CLI_QUEUE,
+        card = pi_events._new_card("t1", "11111111-2222-3333-4444-555555555555", "T", "G", "b.md",
+                                  None, "/r", "/c", "/w", pi_store.TRANSPORT_CLI_QUEUE,
                                   "/bin/true", 1)
         head = "0123456789abcdef0123456789abcdef01234567"
-        event = pi_board.add_event(card, "review_required", 2, "fp", "s",
+        event = pi_events.add_event(card, "review_required", 2, "fp", "s",
                                    {"round": 2, "head": head}, {}, "q", 1)
         event["phaseId"] = "P1"
         event["contractHash"] = "c" * 64
-        hint = pi_board._decide_hint(card["repo"], card["taskId"], event)
+        hint = pi_events._decide_hint(card["repo"], card["taskId"], event)
         self.assertLessEqual(len(hint.encode("utf-8")), 200)
         self.assertNotIn(head, hint)
         self.assertNotIn("c" * 64, hint)
         self.assertNotIn(event["id"], hint)
-        text, _ = pi_board.build_packet(card, [event])
+        text, _ = pi_queue.build_packet(card, [event])
         self.assertIn(head, text)
         self.assertIn("contract=" + "c" * 64, text)
         self.assertIn(event["id"], text)

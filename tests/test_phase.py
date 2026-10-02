@@ -24,7 +24,12 @@ from runtime_helpers import (RUNTIME, Repo, base_env, cleanup_repos, cli_json, d
 
 sys.path.insert(0, str(RUNTIME))
 import pi_board  # noqa: E402
+import pi_store  # noqa: E402
+import pi_queue  # noqa: E402
+import pi_phase  # noqa: E402
+import pi_events  # noqa: E402
 import pi_task  # noqa: E402
+import pi_size  # noqa: E402
 
 BOARD = RUNTIME / "pi_board.py"
 TASK = RUNTIME / "pi_task.py"
@@ -245,7 +250,7 @@ class PhaseTest(unittest.TestCase):
         frozen = json.loads((task_dir / "phase.json").read_text(encoding="utf-8"))
         recorded = frozen["contract"]
         self.assertEqual(recorded["phaseId"], "P-CONTRACT")
-        self.assertEqual(frozen["contractSha256"], pi_task.contract_hash(recorded))
+        self.assertEqual(frozen["contractSha256"], pi_phase.contract_hash(recorded))
         self.assertEqual(data["phase"]["contractSha256"], frozen["contractSha256"])
         self.assertTrue(frozen["baselineCommit"])
         self.assertTrue((task_dir / "tools" / "pi_phase.py").is_file())
@@ -692,7 +697,7 @@ class PhaseTest(unittest.TestCase):
         repo.wait_round_state("scope-cap", "running")
         docs = worktree / "docs"
         docs.mkdir(parents=True, exist_ok=True)
-        for index in range(pi_task.MAX_SCOPE_DIFF_FILES + 10):
+        for index in range(pi_phase.MAX_SCOPE_DIFF_FILES + 10):
             (docs / f"c{index:05d}.txt").write_text("x\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(worktree), "add", "-A"], check=True,
                        capture_output=True)
@@ -901,8 +906,8 @@ class PhaseTest(unittest.TestCase):
             return {"status": "queued", "exitCode": 0, "timedOut": False,
                     "outputSha256": "0" * 64, "outputExcerpt": "", "argv0": argv[0]}
 
-        with mock.patch.object(pi_board, "_resolve_codex_bin", return_value="/bin/true"):
-            dispatched = pi_board.dispatch_task(board_path, "head-fail", cli_runner=runner)
+        with mock.patch.object(pi_queue, "_resolve_codex_bin", return_value="/bin/true"):
+            dispatched = pi_queue.dispatch_task(board_path, "head-fail", cli_runner=runner)
         self.assertFalse(dispatched["dispatched"])
         self.assertEqual(calls, [], "an unknown active candidate must never emit a queue message")
         self.assertEqual(card["events"], [])
@@ -968,12 +973,12 @@ class PhaseTest(unittest.TestCase):
         self.start(repo, worktree, "route-continue", None, env)
         self.wait_terminal(repo, "route-continue")
         self.register(repo, "route-continue", env, transport="cli-queue", thread=THREAD_A)
-        pi_board.pause_route(THREAD_A, now=time.time())
+        pi_store.pause_route(THREAD_A, now=time.time())
         proc = run_cli("continue", "--repo", str(repo.root), "--task", "route-continue",
                        "--prompt", "more", env=env, expect=2)
         self.assertIn("paused", proc.stderr)
         self.assertEqual(len(self.rounds(repo, "route-continue")), 1)
-        pi_board.resume_route(THREAD_A)
+        pi_store.resume_route(THREAD_A)
         run_cli("continue", "--repo", str(repo.root), "--task", "route-continue",
                 "--prompt", "more", env=env, expect=0)
         repo.wait_terminal("route-continue", round=2)
@@ -1217,8 +1222,8 @@ class PhaseTest(unittest.TestCase):
         # 2) Installing a live contract revision invalidates the old event even
         #    when the candidate is unchanged.
         revised = dict(frozen["contract"], result="revised complete result")
-        phase_record, _problem = pi_task.read_phase_record(repo.task_dir("stale-task"))
-        pi_task.install_phase_contract(repo.task_dir("stale-task"), revised, repo.root,
+        phase_record, _problem = pi_phase.read_phase_record(repo.task_dir("stale-task"))
+        pi_phase.install_phase_contract(repo.task_dir("stale-task"), revised, repo.root,
                                        worktree, prior=phase_record)
         proc = run_board(*decide, "--decision", "accept", "--reviewed-head", head,
                          "--phase", "P-STALE", "--contract-hash", contract_sha,
@@ -1238,13 +1243,13 @@ class PhaseTest(unittest.TestCase):
     def test_stale_event_is_not_dispatched_and_is_marked_superseded(self):
         repo, _worktree = self.make()
         board = {"schemaVersion": 1, "revision": 1, "createdAt": 1, "updatedAt": 1, "cards": {}}
-        card = pi_board._new_card("stale-dispatch", THREAD_A, "t", "g", None, None,
+        card = pi_events._new_card("stale-dispatch", THREAD_A, "t", "g", None, None,
                                   str(repo.root), str(repo.state_dir), str(repo.root),
-                                  pi_board.TRANSPORT_CLI_QUEUE, None, 1)
+                                  pi_store.TRANSPORT_CLI_QUEUE, None, 1)
         card["pi"] = {"round": 2, "state": "completed", "stage": "review", "updatedAt": 1}
         card["phase"] = {"phaseId": "P", "contractHash": "a" * 64, "candidate": "b" * 40,
                          "status": "blocked", "readiness": {"status": "not_ready"}}
-        event = pi_board.add_event(card, "phase_blocked", 2, "p:old", "old", {"head": "c" * 40},
+        event = pi_events.add_event(card, "phase_blocked", 2, "p:old", "old", {"head": "c" * 40},
                                    {}, "q", 1)
         event["phaseId"] = "P"
         event["contractHash"] = "a" * 64
@@ -1252,7 +1257,7 @@ class PhaseTest(unittest.TestCase):
         path = repo.state_dir / "board.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(board), encoding="utf-8")
-        result = pi_board.dispatch_task(path, "stale-dispatch", cli_runner=lambda argv, timeout: {
+        result = pi_queue.dispatch_task(path, "stale-dispatch", cli_runner=lambda argv, timeout: {
             "status": "queued", "exitCode": 0, "timedOut": False, "outputSha256": "0" * 64,
             "outputExcerpt": "", "argv0": argv[0]})
         self.assertFalse(result["dispatched"])
@@ -1410,7 +1415,7 @@ class PhaseTest(unittest.TestCase):
     def test_declared_phase_resource_breach_stops_pi_and_blocks(self):
         repo, worktree = self.make(name="res-breach")
         sha = self.write_design(repo)
-        baseline = pi_task.measure(worktree)
+        baseline = pi_size.measure(worktree)
         self.assertTrue(baseline["complete"])
         cap = int(baseline["bytes"]) + 8
         env = self.h_env(PI_DOUBLE_MODE="hang",
@@ -1584,7 +1589,7 @@ class PhaseTest(unittest.TestCase):
             resource_limits=[{"path": ".", "maxBytes": 10 ** 9}])
         repo, env = fixture["repo"], fixture["env"]
         task, candidate = "res-evidence", fixture["candidate"]
-        state_path = repo.task_dir(task) / "rounds" / "1" / pi_task.RESOURCE_STATE_FILE
+        state_path = repo.task_dir(task) / "rounds" / "1" / pi_phase.RESOURCE_STATE_FILE
         original = state_path.read_bytes()
         first = fixture["review"]
 
@@ -1711,8 +1716,8 @@ class PhaseTest(unittest.TestCase):
             return {"bytes": 0, "complete": True, "unknown": False, "exists": True,
                     "reason": None}
 
-        with mock.patch.object(pi_task, "measure", side_effect=slow_ok) as fake:
-            monitor = pi_task.PhaseResourceMonitor(
+        with mock.patch.object(pi_phase, "measure", side_effect=slow_ok) as fake:
+            monitor = pi_phase.PhaseResourceMonitor(
                 tmp, worktree, limits, "P", "a" * 64, 1,
                 unknown_seconds=999, scan_budget_seconds=0.2)
             started = time.monotonic()
@@ -1730,8 +1735,8 @@ class PhaseTest(unittest.TestCase):
             return {"bytes": 10 ** 9, "complete": True, "unknown": False, "exists": True,
                     "reason": None}
 
-        with mock.patch.object(pi_task, "measure", side_effect=breach) as fake:
-            monitor2 = pi_task.PhaseResourceMonitor(
+        with mock.patch.object(pi_phase, "measure", side_effect=breach) as fake:
+            monitor2 = pi_phase.PhaseResourceMonitor(
                 tmp, worktree, limits, "P", "a" * 64, 1,
                 unknown_seconds=999, scan_budget_seconds=10)
             started = time.monotonic()
@@ -1747,8 +1752,8 @@ class PhaseTest(unittest.TestCase):
             return {"bytes": 0, "complete": False, "unknown": True, "exists": True,
                     "reason": "unreadable"}
 
-        with mock.patch.object(pi_task, "measure", side_effect=unreadable):
-            monitor3 = pi_task.PhaseResourceMonitor(
+        with mock.patch.object(pi_phase, "measure", side_effect=unreadable):
+            monitor3 = pi_phase.PhaseResourceMonitor(
                 tmp, worktree, limits[:2], "P", "a" * 64, 1,
                 unknown_seconds=0.05, scan_budget_seconds=5)
             self.assertIsNone(monitor3.scan())
@@ -1763,10 +1768,10 @@ class PhaseTest(unittest.TestCase):
         worktree = round_dir / "wt"
         worktree.mkdir()
         limits = [{"path": "not-created-yet", "maxBytes": 100}]
-        monitor = pi_task.PhaseResourceMonitor(round_dir, worktree, limits, "P-MISS",
+        monitor = pi_phase.PhaseResourceMonitor(round_dir, worktree, limits, "P-MISS",
                                                "a" * 64, 1, scan_budget_seconds=5)
         monitor.final_scan()
-        verdict = pi_task.evaluate_resource_evidence(
+        verdict = pi_phase.evaluate_resource_evidence(
             round_dir, {"phaseId": "P-MISS", "resourceLimits": limits}, 1, "a" * 64)
         self.assertEqual(verdict["status"], "ok")
         self.assertEqual(verdict["limits"][0]["observedBytes"], 0)

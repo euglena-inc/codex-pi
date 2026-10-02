@@ -14,6 +14,9 @@ from test_board import board_only, captured_runner, write_board
 
 sys.path.insert(0, str(RUNTIME))
 import pi_board  # noqa: E402
+import pi_store  # noqa: E402
+import pi_queue  # noqa: E402
+import pi_events  # noqa: E402
 
 BOARD = RUNTIME / "pi_board.py"
 THREAD = "11111111-2222-3333-4444-555555555555"
@@ -97,8 +100,8 @@ class CodexIoTest(unittest.TestCase):
 
     def test_queued_card_records_packet_bytes(self):
         board = board_only(self.repo, task_id="t1", thread=THREAD,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE)
-        pi_board.add_event(board["cards"]["t1"], "review_required", 3, "fp", "s",
+                           transport=pi_store.TRANSPORT_CLI_QUEUE)
+        pi_events.add_event(board["cards"]["t1"], "review_required", 3, "fp", "s",
                            {"round": 3, "head": "a" * 40}, {}, "q", 1)
         path = write_board(self.repo, board)
         calls = []
@@ -106,8 +109,8 @@ class CodexIoTest(unittest.TestCase):
         os.environ["CODEX_PI_HANDOFF_ROOT"] = str(self.tmp / "handoffs")
         self.addCleanup(os.environ.pop, "CODEX_PI_HANDOFF_ROOT", None)
         import unittest.mock as mock
-        with mock.patch.object(pi_board, "_resolve_codex_bin", return_value="/bin/true"):
-            result = pi_board.dispatch_task(path, "t1", cli_runner=captured_runner(calls))
+        with mock.patch.object(pi_queue, "_resolve_codex_bin", return_value="/bin/true"):
+            result = pi_queue.dispatch_task(path, "t1", cli_runner=captured_runner(calls))
         self.assertTrue(result["dispatched"])
         message = calls[0]["argv"][-1]
         line = io_lines(self.task_dir)[before:][-1]
@@ -177,7 +180,7 @@ class MetricsTest(unittest.TestCase):
     def test_decisions_by_kind_failure_kind_and_takeover(self):
         self.make_task("rev", {1: self.summary(1, 0.1)})
         board = board_only(self.repo, task_id="rev", thread=THREAD,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE)
+                           transport=pi_store.TRANSPORT_CLI_QUEUE)
         card = board["cards"]["rev"]
         card["reviewPolicyPin"] = {"qualityFailureLimit": 2}
         specs = [("review_required", 1, "changes_requested", "quality"),
@@ -185,7 +188,7 @@ class MetricsTest(unittest.TestCase):
                  ("phase_blocked", 3, "rejected", "quality"),
                  ("review_required", 4, "accepted", None)]
         for index, (kind, number, decision, failure) in enumerate(specs):
-            event = pi_board.add_event(card, kind, number, f"fp{index}", "s",
+            event = pi_events.add_event(card, kind, number, f"fp{index}", "s",
                                        {"round": number, "head": "a" * 40}, {}, "q", index)
             event.update(handled=True, handledAt=10 + index, decision=decision)
             if failure:

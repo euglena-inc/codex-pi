@@ -18,18 +18,34 @@ python3 runtime/pi_board.py register | show | decide | pause | resume | recover 
 
 Every command prints one single-line compact JSON object and exits non-zero with an actionable stderr message on error. `PI_BIN` overrides the Pi executable (test double or explicit path only).
 
+Task side (lower modules never import the ones above them; `pi_task.py` is the CLI entry):
+
 | File | Role |
 | --- | --- |
-| `runtime/pi_task.py` | Admission, config, model policy, brief and worker config, detached worker, timeout, cancel, status/result, readiness, CLI |
+| `runtime/pi_core.py` | Filesystem, lock, process, config and layout helpers; shared constants |
+| `runtime/pi_evidence.py` | Bounded read-only scanning of check receipts and markers; candidate identity; check lines |
+| `runtime/pi_phase.py` | Phase contract schema and validation, phase files and budget, resource limits, readiness snapshot, settle view |
+| `runtime/pi_brief.py` | Brief, full worker contract text, `worker.json`, round inputs |
+| `runtime/pi_supervisor.py` | Detached supervisor: launch Pi for one round, watch, finish the round, phase round log |
+| `runtime/pi_task.py` | Admission, worktree claims, frozen helper snapshot, status/result building, CLI |
 | `runtime/pi_worker.ts` | In-process worker extension: guard, native tools `check`/`progress`/`readiness`, system prompt contract, settle continuation |
 | `runtime/pi_summary.py` | Bounded round summary, check-receipt aggregation, usage, reported-model check |
 | `runtime/pi_check.py` | One-check receipt: true exit/signal/timeout, log sha256, HEAD/dirty, counts, `log_tail` on failure |
-| `runtime/pi_phase.py` | Phase contract schema, validation and hash |
-| `runtime/pi_handoff.py` | Hook entry: Interrupt route pause and cli-queue recovery evidence |
-| `runtime/pi_board.py` | Shared evidence board, delivery card, event decisions, queue claims, CLI transport, `metrics` |
-| `runtime/pi_takeover.py` | Failure-policy fold from exact review decisions: two complete deliveries, then takeover |
 | `runtime/pi_copy.py` / `pi_size.py` | Bounded evidence copying and byte scans without following symlinks |
+
+Board side:
+
+| File | Role |
+| --- | --- |
+| `runtime/pi_store.py` | Board files, locks, monitor records, owner routes and route pause |
+| `runtime/pi_events.py` | Card and event model, status projection, bounded progress echoes, decide hint |
+| `runtime/pi_queue.py` | Queue claims, the delivery card, one dispatch through `codex queue` |
+| `runtime/pi_board.py` | Registration, refresh, decisions, compact views, `metrics`, CLI |
+| `runtime/pi_takeover.py` | Failure-policy fold from exact review decisions: two complete deliveries, then takeover |
+| `runtime/pi_handoff.py` | Hook entry: Interrupt route pause and cli-queue recovery evidence |
 | `hooks/hooks.json` | Interrupt, SessionStart and UserPromptSubmit hook commands; requires host trust |
+
+Every module the entries import is listed in `HELPER_FILES` and copied into a task's frozen `tools/`, so a running task never imports from the plugin directory. No module is larger than about 1.8k lines.
 
 ## The worker round
 
@@ -116,7 +132,7 @@ The supervisor holds `.task.lock` and `.supervisor.lock`; Pi inherits `.task.loc
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-Tests use the offline Pi double in `tests/doubles/`, which plays the extension's load proof; the extension itself is driven through Node's native type stripping with a fake ExtensionAPI (`tests/doubles/extension_harness.mjs`). A missing `node` fails the suite. No live model call, no network, no Codex binary.
+Tests use the offline Pi double in `tests/doubles/`, which plays the extension's load proof; the extension itself is driven through Node's native type stripping with a fake ExtensionAPI (`tests/doubles/extension_harness.mjs`). A missing `node` fails the suite. No live model call, no network, no Codex binary. `scripts/check_pure_move.py` compares every top-level definition's AST with a committed baseline; the module split moved 280 definitions with none edited, and `tests/test_modules.py` runs the check, the size cap, the acyclic import rule and a frozen-tools run with the plugin directory removed.
 
 ## Reviews and takeover
 

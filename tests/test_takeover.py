@@ -28,6 +28,8 @@ from runtime_helpers import (RUNTIME, Repo, base_env, cleanup_repos, default_con
 
 sys.path.insert(0, str(RUNTIME))
 import pi_board
+import pi_events
+import pi_core
 import pi_task
 from pi_takeover import REVIEW_LIMIT, review_policy
 
@@ -52,7 +54,7 @@ class TakeoverPolicyTest(unittest.TestCase):
         self.addCleanup(cleanup_repos)
         self.repo = Repo(Path(self.temp.name), config=default_config())
         self.wt = self.repo.worktree("worker")
-        self.head = pi_task.git(self.wt, "rev-parse", "HEAD")
+        self.head = pi_core.git(self.wt, "rev-parse", "HEAD")
         self.file = self.repo.state_dir / "board.json"
         self.file.parent.mkdir(parents=True, exist_ok=True)
         self.board = None
@@ -62,7 +64,7 @@ class TakeoverPolicyTest(unittest.TestCase):
     # fixtures
     # ------------------------------------------------------------------
     def new_card(self, *, phase=None, contract="a" * 64):
-        card = pi_board._new_card("task", None, "task", "outcome", None, None,
+        card = pi_events._new_card("task", None, "task", "outcome", None, None,
                                   self.repo.root, self.repo.state_dir, str(self.wt),
                                   "offline", None, 1)
         if phase is not None:
@@ -89,7 +91,7 @@ class TakeoverPolicyTest(unittest.TestCase):
         else:
             self.card["phase"] = {"phaseId": phase, "contractHash": contract,
                                   "candidate": head, "status": "review_ready"}
-        event = pi_board.add_event(self.card, kind, number,
+        event = pi_events.add_event(self.card, kind, number,
                                    fingerprint or f"event-{number}-{kind}",
                                    "delivery", {"head": head}, {}, "review", number * 10)
         self.assertIsNotNone(event, "event publication must be new")

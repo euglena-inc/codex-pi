@@ -1,0 +1,215 @@
+"""Round inputs: the brief, the full worker contract text and ``worker.json`` for the
+in-process worker extension.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+import os
+import sys
+import time
+from pathlib import Path
+
+from pi_core import (
+    MAX_PROMPT_BYTES,
+    READ_ONLY_TOOLS,
+    SCHEMA_VERSION,
+    WRITABLE_TOOLS,
+    atomic,
+    forbidden_checkouts,
+)
+from pi_phase import phase_path, read_phase_record, settle_quota_path
+
+
+FORBIDDEN_RULE_TEXT = ("Do not reference the repository's main checkout or another worktree of this "
+                       "repository in any tool call: the worker guard blocks such a call (rule "
+                       "forbidden-path). Use only your round worktree.")
+MUST_ASK_LINE = ("If the brief leaves a must-ask item open (see task packet), choose the conservative "
+                 "reading and report it as a spec gap.")
+
+
+def compose_brief(task: dict, round_number: int, prompt: str, prior: dict | None) -> str:
+    """The user prompt plus a fixed short header; the contract lives in the system prompt."""
+    task_dir = Path(task["taskDir"])
+    round_dir = task_dir / "rounds" / str(round_number)
+    lines = ["---", "## Codex-Pi round header",
+             f"task={task['task']} round={round_number}",
+             "The worker contract (model policy, tools, boundaries, phase contract) is the system "
+             f"prompt section codex_pi_worker, also in {round_dir / 'contract.md'}; it applies to "
+             "every round of this session."]
+    if round_number > 1:
+        lines.append(f"Round-1 brief: {task_dir / 'rounds' / '1' / 'brief.md'}")
+    lines += ["Use the native tools `check` (recorded checks), `progress` and `readiness`.",
+              f'Only "{task_dir / "tools"}" and "{round_dir / "round.checks"}" may be written '
+              "outside the worktree.",
+              FORBIDDEN_RULE_TEXT]
+    if prior:
+        lines.append(f"Previous round {prior.get('round')}: outcome={prior.get('state')} "
+                     f"exit={prior.get('exitCode')} head={prior.get('endHead')}; execution "
+                     "evidence only, read its summary before continuing.")
+    lines.append("End with a concise report; never claim acceptance PASS.")
+    return prompt.rstrip() + "\n\n" + "\n".join(lines) + "\n"
+
+
+def check_timeout_seconds(task: dict, phase_record) -> float:
+    """Per-command cap for ``check``: the phase contract's cap, else the project round timeout."""
+    value = task["timeoutSeconds"]
+    if isinstance(phase_record, dict):
+        cap = (phase_record.get("contract") or {}).get("commandTimeoutSeconds")
+        if isinstance(cap, (int, float)) and not isinstance(cap, bool) \
+                and math.isfinite(float(cap)) and float(cap) > 0:
+            value = cap
+    return float(value)
+
+
+def compose_contract(task: dict) -> str:
+    """The worker contract injected into the system prompt and written to ``contract.md``."""
+    read_only = bool(task["readOnly"])
+    tools = READ_ONLY_TOOLS if read_only else WRITABLE_TOOLS
+    task_dir = Path(task["taskDir"])
+    lines = ["## Codex-Pi worker contract",
+             "Do not execute the Codex CLI (`codex`), launch any Codex agent, or call an OpenAI "
+             "model through Codex. The Codex main session reviews outcomes; this Pi session "
+             "implements and reports.",
+             f"Model policy: this task is pinned to `{task['model']}`. Do not call, delegate to, "
+             "or spawn any nested agent/model on another provider or model, and do not fall back "
+             "automatically. If the pinned model is unavailable, stop and report it.",
+             f"Mode: {'read-only' if read_only else 'writable'}; allowed tools: {tools}. This is a "
+             "worker guard, not a security sandbox.",
+             "Applicable AGENTS.md files discovered from the worktree remain authoritative. "
+             "Prompt templates, skills and project extensions are disabled."]
+    constraints = task.get("constraints") or []
+    if constraints:
+        lines += ["Project constraints (references; the runtime never executes them):"]
+        lines += [f"  - {entry}" for entry in constraints]
+    checks = task.get("checks") or []
+    if checks:
+        lines += ["Project checks (references only; never invent acceptance):"]
+        lines += [f"  - {entry}" for entry in checks]
+    phase_record, phase_problem = read_phase_record(task_dir)
+    if isinstance(phase_record, dict):
+        contract = phase_record.get("contract") or {}
+        lines += ["## Phase contract (machine-readable snapshot; the main session remains the "
+                  "design authority)",
+                  f"phase_id={contract.get('phaseId')}",
+                  f"contract_ref={phase_path(task_dir)}",
+                  f"contract_sha256={phase_record.get('contractSha256')}",
+                  f"baseline={contract.get('baseline')} (resolved {phase_record.get('baselineCommit')})",
+                  f"design_ref={contract.get('designRef')} design_sha256={contract.get('designSha256')}",
+                  f"phase_budget_seconds={contract.get('budgetSeconds')}",
+                  f"scope={', '.join(contract.get('scope') or [])}"]
+        if contract.get("commandTimeoutSeconds"):
+            lines.append(f"command_timeout_seconds={contract.get('commandTimeoutSeconds')}")
+        for limit in contract.get("resourceLimits") or []:
+            lines.append(f"resource_limit: path={limit.get('path')} max_bytes={limit.get('maxBytes')}")
+        lines.append("acceptance_items:")
+        for item in contract.get("acceptanceItems") or []:
+            lines.append(f"  - id={item.get('id')} check_id={item.get('checkId')}"
+                         + (f" min_run={item.get('minRun')}" if item.get('minRun') is not None else "")
+                         + (" forbid_skip=true" if item.get("forbidSkip") else ""))
+            lines.append(f"    command: {item.get('command')}")
+            lines.append(f"    pass_condition: {item.get('passCondition')}")
+            lines.append(f"    evidence: {item.get('evidence')}")
+        lines.append("autonomous_repair:")
+        lines += [f"  - {entry}" for entry in contract.get("autonomousRepair") or []]
+        lines.append("escalate_when:")
+        lines += [f"  - {entry}" for entry in contract.get("escalateWhen") or []]
+        lines.append("Rules: stay inside the declared scope and the phase budget; run every "
+                     "acceptance check through the `check` tool with the item's exact command so "
+                     "the receipt binds the candidate. When the round ends with only evidence "
+                     "missing you may be asked once to continue in this same session.")
+    elif phase_problem not in (None, "absent"):
+        lines.append(f"Phase contract state is {phase_problem}; treat phase-wide readiness as "
+                     "unknown and report it instead of inventing coverage.")
+    lines += [
+        "## Native tools",
+        "- check(id, command, timeoutSeconds?, watchPath?, maxBytes?): run a verification command "
+        "through the task's frozen pi_check helper; receipts capture the true exit, log hash, HEAD "
+        "and dirty state. A failing check returns the log tail. Use it instead of bash for every "
+        "recorded check; with a phase contract the command must be the declared one.",
+        "- progress(activity, step?, next?, blocker?, completedCriteria?, evidenceRefs?): "
+        "self-reported progress, never acceptance.",
+        "- readiness(): read-only delivery check of the contract against the receipts.",
+        "Every bash call has a finite timeout (a default is filled in and a ceiling clamps larger "
+        "values). Close fixtures with try/finally; a catch-and-print is not verification.",
+        f'Only "{task_dir / "tools"}" and this round\'s checks directory may be written outside '
+        "the worktree.",
+        FORBIDDEN_RULE_TEXT,
+        MUST_ASK_LINE,
+        "End with a concise report of changes and evidence. Never claim acceptance PASS; a zero "
+        "exit code only proves execution finished."]
+    return "\n".join(lines) + "\n"
+
+
+def write_brief(path: Path, text: str) -> str:
+    with path.open("x", encoding="utf-8") as stream:
+        stream.write(text)
+    os.chmod(path, 0o444)
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+BASH_DEFAULT_TIMEOUT_SECONDS = 600.0
+BASH_CEILING_SECONDS = 3600.0
+WORKER_READY_FILE = "worker.ready"
+WORKER_CONFIG_FILE = "worker.json"
+
+
+def write_worker_config(task_dir: Path, round_number: int, task: dict, contract_text: str) -> Path:
+    """Write ``rounds/N/worker.json`` for the in-process worker extension."""
+    round_dir = task_dir / "rounds" / str(round_number)
+    forbidden, allowed = forbidden_checkouts(Path(task["worktree"]), task_dir, round_number)
+    phase_record, _problem = read_phase_record(task_dir)
+    phase = isinstance(phase_record, dict)
+    ceiling = BASH_CEILING_SECONDS
+    if phase:
+        cap = (phase_record.get("contract") or {}).get("commandTimeoutSeconds")
+        if isinstance(cap, (int, float)) and not isinstance(cap, bool) \
+                and math.isfinite(float(cap)) and float(cap) > 0:
+            ceiling = float(cap)
+    config = {
+        "schemaVersion": 1, "task": task["task"], "round": round_number,
+        "repo": task["repo"], "worktree": task["worktree"],
+        "forbiddenRoots": forbidden, "allowedRoots": allowed,
+        "bashDefaultTimeoutSeconds": min(BASH_DEFAULT_TIMEOUT_SECONDS, ceiling),
+        "bashCeilingSeconds": ceiling,
+        "checkTimeoutSeconds": check_timeout_seconds(task, phase_record),
+        "checksDir": str(round_dir / "round.checks"), "toolsDir": str(task_dir / "tools"),
+        "python": sys.executable, "phase": phase,
+        "settleQuotaPath": str(settle_quota_path(
+            task_dir, (phase_record.get("contract") or {}).get("phaseId"))) if phase else None,
+        "roundDir": str(round_dir), "contract": contract_text,
+    }
+    path = round_dir / WORKER_CONFIG_FILE
+    atomic(path, config)
+    return path
+
+
+def ensure_round_inputs(task_dir: Path, round_number: int, prompt: str, task: dict,
+                        prior: dict | None, pi_version: str = "unknown") -> Path:
+    if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+        raise ValueError(f"prompt exceeds {MAX_PROMPT_BYTES} bytes")
+    if not prompt.strip():
+        raise ValueError("prompt must not be empty")
+    round_dir = task_dir / "rounds" / str(round_number)
+    round_dir.mkdir(parents=True)
+    (round_dir / "brief.md").parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if (round_dir / "brief.md").exists():
+            raise ValueError(f"round {round_number} already has a brief; never overwrite evidence")
+        contract_text = compose_contract(task)
+        digest = write_brief(round_dir / "brief.md", compose_brief(task, round_number, prompt, prior))
+        write_brief(round_dir / "contract.md", contract_text)
+        (round_dir / "round.checks").mkdir(exist_ok=True)
+        write_worker_config(task_dir, round_number, task, contract_text)
+    except FileExistsError:
+        raise ValueError(f"round {round_number} already has a brief; never overwrite evidence") from None
+    atomic(round_dir / "round.state.json",
+           {"schemaVersion": SCHEMA_VERSION, "round": round_number, "state": "starting",
+            "startedAt": time.time(), "exitCode": None, "timedOut": False, "cancelled": False,
+            "briefSha256": digest, "taskDir": str(task_dir)})
+    with (round_dir / "round.meta").open("a", encoding="utf-8") as meta:
+        meta.write(f"task={task['task']} round={round_number} model={task['model']} "
+                   f"thinking={task['thinking']}\nworktree={task['worktree']}\n"
+                   f"start={time.time()}\nbrief_sha256={digest}\npi_version={pi_version}\n")
+    return round_dir

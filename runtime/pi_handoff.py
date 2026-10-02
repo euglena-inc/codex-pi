@@ -61,7 +61,7 @@ def handle_recovery(event_name: str, session: str) -> dict:
 
 def handle_interrupt(session: str) -> dict:
     try:
-        from pi_board import pause_route
+        from pi_store import pause_route
         pause_route(session, "user interrupted this Codex session")
     except Exception:  # noqa: BLE001 - the hook must never crash on this
         pass

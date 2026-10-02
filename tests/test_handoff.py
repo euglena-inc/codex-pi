@@ -21,6 +21,7 @@ from runtime_helpers import (CLI, ROOT, RUNTIME, Repo, base_env, cleanup_repos, 
 
 sys.path.insert(0, str(RUNTIME))
 import pi_board  # noqa: E402
+import pi_store  # noqa: E402
 
 HANDOFF = RUNTIME / "pi_handoff.py"
 BOARD = RUNTIME / "pi_board.py"
@@ -107,14 +108,14 @@ class HooksAfterStopRemovalTest(unittest.TestCase):
     def test_interrupt_pauses_the_cli_queue_route_until_explicit_resume(self):
         env = h_env(self.tmp)
         with mock.patch.dict(os.environ, {"CODEX_PI_HANDOFF_ROOT": env["CODEX_PI_HANDOFF_ROOT"]}):
-            self.assertEqual(pi_board.route_paused(THREAD)[0], False)
+            self.assertEqual(pi_store.route_paused(THREAD)[0], False)
             self.assertEqual(run_hook("Interrupt", THREAD, env), {})
-            self.assertEqual(pi_board.route_paused(THREAD)[0], True)
+            self.assertEqual(pi_store.route_paused(THREAD)[0], True)
             # An ordinary prompt never resumes the pause.
             run_hook("UserPromptSubmit", THREAD, env)
-            self.assertEqual(pi_board.route_paused(THREAD)[0], True)
-            pi_board.resume_route(THREAD)
-            self.assertEqual(pi_board.route_paused(THREAD)[0], False)
+            self.assertEqual(pi_store.route_paused(THREAD)[0], True)
+            pi_store.resume_route(THREAD)
+            self.assertEqual(pi_store.route_paused(THREAD)[0], False)
 
     def test_hooks_never_invoke_codex_or_pi(self):
         codex, codex_marker = make_pi_trap(self.tmp / "bin", name="codex")

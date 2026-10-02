@@ -23,6 +23,12 @@ from runtime_helpers import RUNTIME, Repo, cleanup_repos
 
 sys.path.insert(0, str(RUNTIME))
 import pi_board  # noqa: E402
+import pi_core  # noqa: E402
+import pi_store  # noqa: E402
+import pi_queue  # noqa: E402
+import pi_phase  # noqa: E402
+import pi_evidence  # noqa: E402
+import pi_events  # noqa: E402
 import pi_task  # noqa: E402
 
 THREAD_A = "11111111-2222-3333-4444-555555555555"
@@ -41,9 +47,9 @@ REAL_CONTRACT = {
 }
 
 
-def make_card(task_id: str = "echo-task", *, transport=pi_board.TRANSPORT_CLI_QUEUE,
+def make_card(task_id: str = "echo-task", *, transport=pi_store.TRANSPORT_CLI_QUEUE,
               paused: bool = False) -> dict:
-    card = pi_board._new_card(task_id, THREAD_A, "Title", "Goal", "brief.md", None,
+    card = pi_events._new_card(task_id, THREAD_A, "Title", "Goal", "brief.md", None,
                               "/repo", "/common", "/worktree", transport, "/bin/true", 1)
     card["paused"] = paused
     return card
@@ -71,7 +77,7 @@ def base_status(checks_dir: Path, card: dict, *, phase_id: str = "P1", contract:
     status = {
         "task": card["taskId"], "round": round_number, "state": state,
         "recordedState": state, "startHead": candidate, "endHead": end_head,
-        "currentHead": None if state in pi_board.TERMINAL_STATES else candidate,
+        "currentHead": None if state in pi_core.TERMINAL_STATES else candidate,
         "ownership": {"activeWorker": True, "supervisorAlive": True},
         "timedOut": False, "cancelled": False,
         "evidence": {"brief": "/evidence/brief.md", "state": "/evidence/state.json",
@@ -86,7 +92,7 @@ def base_status(checks_dir: Path, card: dict, *, phase_id: str = "P1", contract:
                   "lastDecision": None, "readiness": None},
         "progress": None,
     }
-    status["candidate"] = pi_task.normalize_candidate(status)
+    status["candidate"] = pi_evidence.normalize_candidate(status)
     status["phase"]["candidate"] = status["candidate"].get("head")
     status["phase"]["evidence"] = {
         "schemaVersion": 1, "round": round_number, "phaseId": phase_id,
@@ -127,19 +133,19 @@ class ProgressEchoTest(unittest.TestCase):
     def real_status(self, repo: Repo, checks: Path, head: str, task_id: str):
         """Build a status whose phase snapshot comes from real receipts."""
         card = make_card(task_id=task_id)
-        scan = pi_task._scan_checks(checks)
+        scan = pi_evidence._scan_checks(checks)
         task_dir = self.tmp / f"task-{task_id}"
         task_dir.mkdir(parents=True, exist_ok=True)
         contract = dict(REAL_CONTRACT, phaseId=f"P-{task_id}")
         (task_dir / "phase.json").write_text(json.dumps({
             "schemaVersion": 1, "contract": contract,
-            "contractSha256": pi_task.contract_hash(contract),
+            "contractSha256": pi_phase.contract_hash(contract),
             "baselineCommit": head, "createdAt": 1}), encoding="utf-8")
         (task_dir / "task.json").write_text(json.dumps({"worktree": str(repo.root)}),
                                             encoding="utf-8")
         state = {"state": "running", "currentHead": head, "startedAt": 1}
-        candidate = pi_task.normalize_candidate(state)
-        snapshot = pi_task.build_phase_snapshot(task_dir, {"worktree": str(repo.root)}, 1,
+        candidate = pi_evidence.normalize_candidate(state)
+        snapshot = pi_phase.build_phase_snapshot(task_dir, {"worktree": str(repo.root)}, 1,
                                                 state=state, checks=scan, candidate=candidate)
         status = base_status(checks, card, candidate=head)
         status["checks"] = scan
@@ -155,9 +161,9 @@ class ProgressEchoTest(unittest.TestCase):
         Only a sustained anomaly may enqueue an echo; the first observation just
         records it. Returns the second call's result.
         """
-        pi_board.maybe_publish_progress(card, status, now=start, interval=interval,
+        pi_events.maybe_publish_progress(card, status, now=start, interval=interval,
                                         anomaly_seconds=180)
-        return pi_board.maybe_publish_progress(card, status, now=start + wait,
+        return pi_events.maybe_publish_progress(card, status, now=start + wait,
                                                interval=interval, anomaly_seconds=180)
 
     def milestone_keys(self, card, prefix):
@@ -191,7 +197,7 @@ class ProgressEchoTest(unittest.TestCase):
                               "evidenceRefs": ["runtime/pi_task.py"], "completedCriteria": [],
                               "updatedAt": 10}
         for now in (100, 101, 102):
-            result = pi_board.maybe_publish_progress(card, status, now=now, interval=600,
+            result = pi_events.maybe_publish_progress(card, status, now=now, interval=600,
                                                      anomaly_seconds=180)
             self.assertIsNone(result["created"])
             self.assertIsNone(result["merged"])
@@ -201,7 +207,7 @@ class ProgressEchoTest(unittest.TestCase):
     def test_ordinary_milestone_stays_on_the_board_and_never_enqueues(self):
         card = make_card()
         status = base_status(self.checks_dir, card, items=[covered_item()])
-        first = pi_board.maybe_publish_progress(card, status, now=100, interval=600,
+        first = pi_events.maybe_publish_progress(card, status, now=100, interval=600,
                                                 anomaly_seconds=180)
         self.assertIsNone(first["created"])
         self.assertIsNone(first["merged"])
@@ -218,7 +224,7 @@ class ProgressEchoTest(unittest.TestCase):
         checking["progress"] = {"round": 1, "activity": "checking", "step": "running tests",
                                 "evidenceRefs": ["round.checks/A1.log"], "completedCriteria": [],
                                 "updatedAt": 1200}
-        again = pi_board.maybe_publish_progress(card, checking, now=1200, interval=600,
+        again = pi_events.maybe_publish_progress(card, checking, now=1200, interval=600,
                                                 anomaly_seconds=180)
         self.assertIsNone(again["created"])
         self.assertEqual(self.pending(card), [])
@@ -240,7 +246,7 @@ class ProgressEchoTest(unittest.TestCase):
         self.assertIn("pause", event_one["question"])
         # Within the interval a new anomaly is merged into the pending packet,
         # not queued as a second notification.
-        merged = pi_board.maybe_publish_progress(card, status, now=1300, interval=600,
+        merged = pi_events.maybe_publish_progress(card, status, now=1300, interval=600,
                                                  anomaly_seconds=180)
         self.assertIsNone(merged["created"])
         self.assertIsNotNone(merged["merged"])
@@ -248,7 +254,7 @@ class ProgressEchoTest(unittest.TestCase):
         self.assertIn("A2", merged["merged"]["summary"])
         self.assertEqual(card["notify"]["phases"]["P1"]["count"], 1)
         # After the interval the next distinct anomaly is a second notification.
-        second = pi_board.maybe_publish_progress(card, status, now=1900, interval=600,
+        second = pi_events.maybe_publish_progress(card, status, now=1900, interval=600,
                                                  anomaly_seconds=180)
         event_two = second["created"]
         self.assertIsNotNone(event_two)
@@ -256,7 +262,7 @@ class ProgressEchoTest(unittest.TestCase):
         self.assertEqual(card["notify"]["phases"]["P1"]["count"], 2)
         self.assertEqual(len(self.pending(card)), 1, "older pending echo is superseded")
         # A third anomaly cannot exceed the two-notification quota.
-        third = pi_board.maybe_publish_progress(card, status, now=2600, interval=600,
+        third = pi_events.maybe_publish_progress(card, status, now=2600, interval=600,
                                                 anomaly_seconds=180)
         self.assertIsNone(third["created"])
         self.assertEqual(card["notify"]["phases"]["P1"]["count"], 2)
@@ -275,7 +281,7 @@ class ProgressEchoTest(unittest.TestCase):
         # A fresh read (restart) keeps the spend and continues with the second.
         card2 = self.read_card(path, card["taskId"])
         status2 = base_status(self.checks_dir, card2, items=items)
-        second = pi_board.maybe_publish_progress(card2, status2, now=2000, interval=600,
+        second = pi_events.maybe_publish_progress(card2, status2, now=2000, interval=600,
                                                  anomaly_seconds=180)
         self.assertIsNotNone(second["created"])
         self.assertEqual(card2["notify"]["phases"]["P1"]["count"], 2)
@@ -291,11 +297,11 @@ class ProgressEchoTest(unittest.TestCase):
         # A route (interrupt) pause is equally blocking.
         route_paused = make_card(task_id="echo-route")
         path = self.board_file(route_paused, "echo-route")
-        pi_board.pause_route(THREAD_A, now=1)
+        pi_store.pause_route(THREAD_A, now=1)
         route_status = base_status(self.checks_dir, route_paused, items=[failed_item()])
         blocked = self.echo(route_paused, route_status, 100)
         self.assertIsNone(blocked["created"])
-        pi_board.resume_route(THREAD_A)
+        pi_store.resume_route(THREAD_A)
         allowed = self.echo(route_paused, route_status, 100)
         self.assertIsNotNone(allowed["created"])
         del path
@@ -323,36 +329,36 @@ class ProgressEchoTest(unittest.TestCase):
         card = make_card()
         status = base_status(self.checks_dir, card, items=[failed_item()])
         # First observation records the failure without waking anyone.
-        first = pi_board.maybe_publish_progress(card, status, now=100, interval=600,
+        first = pi_events.maybe_publish_progress(card, status, now=100, interval=600,
                                                 anomaly_seconds=180)
         self.assertIsNone(first["created"])
         self.assertTrue(first["changed"])
-        early = pi_board.maybe_publish_progress(card, status, now=200, interval=600,
+        early = pi_events.maybe_publish_progress(card, status, now=200, interval=600,
                                                 anomaly_seconds=180)
         self.assertIsNone(early["created"])
-        echo = pi_board.maybe_publish_progress(card, status, now=300, interval=600,
+        echo = pi_events.maybe_publish_progress(card, status, now=300, interval=600,
                                                anomaly_seconds=180)
         self.assertIsNotNone(echo["created"])
         self.assertEqual(echo["created"]["factSource"], "observed_receipt")
         self.assertEqual(echo["created"]["evidence"]["reason"], "sustained_anomaly")
         self.assertEqual(card["notify"]["phases"]["P1"]["count"], 1)
-        repeat = pi_board.maybe_publish_progress(card, status, now=500, interval=600,
+        repeat = pi_events.maybe_publish_progress(card, status, now=500, interval=600,
                                                  anomaly_seconds=180)
         self.assertIsNone(repeat["created"], "the same sustained failure never repeats")
 
     def test_repair_progress_suppresses_the_sustained_echo(self):
         card = make_card()
         status = base_status(self.checks_dir, card, items=[failed_item()])
-        pi_board.maybe_publish_progress(card, status, now=100, interval=600, anomaly_seconds=180)
+        pi_events.maybe_publish_progress(card, status, now=100, interval=600, anomaly_seconds=180)
         repairing = base_status(self.checks_dir, card, items=[failed_item()])
         repairing["progress"] = {"round": 1, "activity": "repairing", "step": "fixing",
                                  "evidenceRefs": ["docs/repair.md"], "completedCriteria": [],
                                  "updatedAt": 150}
         # The repairing update is itself the key repair milestone; the sustained
         # anomaly fallback must not add a second echo for the same failure.
-        pi_board.maybe_publish_progress(card, repairing, now=300, interval=600,
+        pi_events.maybe_publish_progress(card, repairing, now=300, interval=600,
                                         anomaly_seconds=180)
-        repeat = pi_board.maybe_publish_progress(card, repairing, now=400, interval=600,
+        repeat = pi_events.maybe_publish_progress(card, repairing, now=400, interval=600,
                                                  anomaly_seconds=180)
         self.assertIsNone(repeat["created"])
         reasons = [event.get("evidence", {}).get("reason") for event in card.get("events", [])]
@@ -371,7 +377,7 @@ class ProgressEchoTest(unittest.TestCase):
         status["phase"]["readiness"] = {"status": "ready", "candidate": HEAD_A,
                                         "coverage": {"required": 1, "covered": 1},
                                         "writerFree": False, "generatedAt": 100}
-        added = pi_board.project_events(card, status, 101)
+        added = pi_events.project_events(card, status, 101)
         kinds = {event["kind"] for event in added}
         self.assertIn("review_required", kinds,
                       "final acceptance must not be suppressed by the progress quota")
@@ -380,13 +386,13 @@ class ProgressEchoTest(unittest.TestCase):
     def test_candidate_identity_has_one_fail_closed_source(self):
         running = {"state": "running", "currentHead": None, "startHead": "a" * 40,
                    "endHead": None}
-        self.assertIsNone(pi_board._phase_candidate_head(running))
+        self.assertIsNone(pi_events._phase_candidate_head(running))
         terminal = {"state": "completed", "currentHead": "b" * 40, "endHead": "c" * 40,
                     "startHead": "a" * 40}
-        self.assertEqual(pi_board._phase_candidate_head(terminal), "c" * 40)
+        self.assertEqual(pi_events._phase_candidate_head(terminal), "c" * 40)
         unknown = {"state": "unknown", "currentHead": "b" * 40, "startHead": "a" * 40,
                    "endHead": None}
-        self.assertIsNone(pi_board._phase_candidate_head(unknown))
+        self.assertIsNone(pi_events._phase_candidate_head(unknown))
 
     def test_verified_milestone_requires_a_matching_log(self):
         repo = Repo(self.tmp, name="echo-real")
@@ -395,8 +401,8 @@ class ProgressEchoTest(unittest.TestCase):
         checks = self.tmp / "checks-valid"
         self.run_pi_check(repo.root, checks)
         card, status = self.real_status(repo, checks, head, "echo-real-valid")
-        self.assertTrue(pi_board._verified_items(status))
-        result = pi_board.maybe_publish_progress(card, status, now=100, interval=600,
+        self.assertTrue(pi_events._verified_items(status))
+        result = pi_events.maybe_publish_progress(card, status, now=100, interval=600,
                                                  anomaly_seconds=180)
         self.assertIsNone(result["created"], "a verified milestone is board-only now")
         self.assertTrue(self.milestone_keys(card, "first_result|"))
@@ -406,9 +412,9 @@ class ProgressEchoTest(unittest.TestCase):
         (checks_missing / json.loads(receipt_missing.read_text())["log"]).unlink()
         card_missing, status_missing = self.real_status(repo, checks_missing, head,
                                                         "echo-real-missing")
-        self.assertEqual(pi_board._verified_items(status_missing), [])
+        self.assertEqual(pi_events._verified_items(status_missing), [])
         self.assertEqual(status_missing["phase"]["evidence"]["items"][0]["status"], "unknown")
-        pi_board.maybe_publish_progress(card_missing, status_missing, now=100,
+        pi_events.maybe_publish_progress(card_missing, status_missing, now=100,
                                         interval=600, anomaly_seconds=180)
         self.assertEqual(self.milestone_keys(card_missing, "first_result|"), [])
         # A content mismatch is not verified either.
@@ -418,9 +424,9 @@ class ProgressEchoTest(unittest.TestCase):
         log_path.write_bytes(log_path.read_bytes() + b"tampered\n")
         card_tampered, status_tampered = self.real_status(repo, checks_tampered, head,
                                                           "echo-real-tampered")
-        self.assertEqual(pi_board._verified_items(status_tampered), [])
+        self.assertEqual(pi_events._verified_items(status_tampered), [])
         self.assertEqual(status_tampered["phase"]["evidence"]["items"][0]["status"], "unknown")
-        pi_board.maybe_publish_progress(card_tampered, status_tampered, now=100,
+        pi_events.maybe_publish_progress(card_tampered, status_tampered, now=100,
                                         interval=600, anomaly_seconds=180)
         self.assertEqual(self.milestone_keys(card_tampered, "first_result|"), [])
         # A cancelled exit 0 is not a success.
@@ -429,14 +435,14 @@ class ProgressEchoTest(unittest.TestCase):
         data = json.loads(receipt_cancelled.read_text())
         data["cancelled"] = True
         receipt_cancelled.write_text(json.dumps(data), encoding="utf-8")
-        scan = pi_task._scan_checks(checks_cancelled)
+        scan = pi_evidence._scan_checks(checks_cancelled)
         self.assertIsNone(scan["receipts"]["latestSuccessful"])
         self.assertEqual(scan["receipts"]["failedAttempts"], 1)
         card_cancelled, status_cancelled = self.real_status(repo, checks_cancelled, head,
                                                             "echo-real-cancelled")
-        self.assertEqual(pi_board._verified_items(status_cancelled), [])
+        self.assertEqual(pi_events._verified_items(status_cancelled), [])
         self.assertEqual(status_cancelled["phase"]["evidence"]["items"][0]["status"], "failed")
-        pi_board.maybe_publish_progress(card_cancelled, status_cancelled, now=100,
+        pi_events.maybe_publish_progress(card_cancelled, status_cancelled, now=100,
                                         interval=600, anomaly_seconds=180)
         self.assertEqual(self.milestone_keys(card_cancelled, "first_result|"), [])
 
@@ -448,7 +454,7 @@ class ProgressEchoTest(unittest.TestCase):
         _card, status = self.real_status(repo, checks, head, "echo-items")
         item = status["phase"]["evidence"]["items"][0]
         self.assertEqual(item["exitCode"], 0)
-        info = pi_board._delivery_info(status)
+        info = pi_events._delivery_info(status)
         self.assertEqual(info["items"][0]["id"], "A1")
         self.assertEqual(info["items"][0]["exit"], 0)
         self.assertEqual(info["items"][0]["st"], "covered")
@@ -471,8 +477,8 @@ class ProgressEchoTest(unittest.TestCase):
             return {"status": "queued", "exitCode": 0, "timedOut": False,
                     "outputSha256": "0" * 64, "outputExcerpt": "", "argv0": argv[0]}
 
-        with mock.patch.object(pi_board, "_resolve_codex_bin", return_value="/bin/true"):
-            result = pi_board.dispatch_task(path, "echo-nodispatch", cli_runner=runner)
+        with mock.patch.object(pi_queue, "_resolve_codex_bin", return_value="/bin/true"):
+            result = pi_queue.dispatch_task(path, "echo-nodispatch", cli_runner=runner)
         self.assertFalse(result["dispatched"])
         self.assertEqual(calls, [], "an unverified receipt must never trigger a queue send")
 
@@ -491,13 +497,13 @@ class ProgressEchoTest(unittest.TestCase):
                     "error": "ambiguous after spawn", "outputSha256": "0" * 64,
                     "outputExcerpt": "", "argv0": argv[0]}
 
-        with mock.patch.object(pi_board, "_resolve_codex_bin", return_value="/bin/true"):
-            first = pi_board.dispatch_task(path, "echo-send", cli_runner=runner)
-            second = pi_board.dispatch_task(path, "echo-send", cli_runner=runner)
+        with mock.patch.object(pi_queue, "_resolve_codex_bin", return_value="/bin/true"):
+            first = pi_queue.dispatch_task(path, "echo-send", cli_runner=runner)
+            second = pi_queue.dispatch_task(path, "echo-send", cli_runner=runner)
         self.assertEqual(first["status"], "uncertain")
         self.assertEqual(len(calls), 1)
         self.assertFalse(second["dispatched"])
-        queue = pi_board.queue_view(path, "echo-send")
+        queue = pi_queue.queue_view(path, "echo-send")
         self.assertEqual(queue["uncertain"], 1)
         self.assertEqual(queue["queued"], 0)
 

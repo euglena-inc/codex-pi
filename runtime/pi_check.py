@@ -42,7 +42,7 @@ import uuid
 sys.dont_write_bytecode = True
 
 from pi_size import measure
-from pi_task import atomic, terminate
+from pi_core import atomic, terminate
 
 RUNNING_SUFFIX = ".running"
 GUARD_EXIT_CODE = 75

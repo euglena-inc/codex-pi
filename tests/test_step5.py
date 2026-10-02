@@ -21,6 +21,7 @@ from runtime_helpers import Repo, RUNTIME, base_env, cleanup_repos, cli_json, de
 
 sys.path.insert(0, str(RUNTIME))
 import pi_task  # noqa: E402
+import pi_phase  # noqa: E402
 
 
 class Step5Case(unittest.TestCase):
@@ -229,7 +230,7 @@ class SettleViewTest(unittest.TestCase):
         self.assertEqual(view["missing"][0]["command"], "python3 -c pass")
         self.receipt("A1", 0)
         self.assertEqual([item["id"] for item in self.settle()["missing"]], ["A2"])
-        quota = pi_task.settle_quota_path(self.repo.task_dir("settle"), "P-SETTLE")
+        quota = pi_phase.settle_quota_path(self.repo.task_dir("settle"), "P-SETTLE")
         worker = json.loads((self.repo.task_dir("settle") / "rounds" / "1" / "worker.json").read_text())
         self.assertEqual(worker["settleQuotaPath"], str(quota))
         quota.parent.mkdir(parents=True, exist_ok=True)

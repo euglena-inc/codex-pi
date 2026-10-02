@@ -23,6 +23,9 @@ from runtime_helpers import RUNTIME, Repo, base_env, cleanup_repos, default_conf
 
 sys.path.insert(0, str(RUNTIME))
 import pi_board  # noqa: E402
+import pi_store  # noqa: E402
+import pi_queue  # noqa: E402
+import pi_events  # noqa: E402
 
 BOARD = RUNTIME / "pi_board.py"
 HOOK = RUNTIME / "pi_handoff.py"
@@ -105,9 +108,9 @@ def make_cli_double(directory: Path, name: str = "codex-double", behavior: str =
 
 def board_only(repo, task_id: str = "unit-task", thread: str | None = None,
                state: str = "running", round_number: int = 3,
-               transport: str = pi_board.TRANSPORT_OFFLINE, codex_bin=None) -> dict:
+               transport: str = pi_store.TRANSPORT_OFFLINE, codex_bin=None) -> dict:
     board = {"schemaVersion": 1, "revision": 1, "createdAt": 1, "updatedAt": 1, "cards": {}}
-    card = pi_board._new_card(task_id, thread, "Unit task", "Unit goal", "brief.md", None,
+    card = pi_events._new_card(task_id, thread, "Unit task", "Unit goal", "brief.md", None,
                               repo.root, repo.state_dir, str(repo.root), transport, codex_bin, 1)
     card["pi"] = {"round": round_number, "state": state, "stage": "implementing", "updatedAt": 1}
     board["cards"][task_id] = card
@@ -134,10 +137,10 @@ def captured_runner(calls, status="queued"):
 # internally). Tests drive the same function in a child process so environment
 # (fake codex, handoff root) and concurrency semantics stay real.
 DISPATCH_SNIPPET = (
-    "import json, sys; sys.path.insert(0, sys.argv[1]); import pi_board; "
-    "_r, _c, board_file = pi_board.board_file_for_repo(sys.argv[2]); "
+    "import json, sys; sys.path.insert(0, sys.argv[1]); import pi_queue, pi_store; "
+    "_r, _c, board_file = pi_store.board_file_for_repo(sys.argv[2]); "
     "timeout = float(sys.argv[4]) if len(sys.argv) > 4 else None; "
-    "print(json.dumps(pi_board.dispatch_task(board_file, sys.argv[3], timeout=timeout)))")
+    "print(json.dumps(pi_queue.dispatch_task(board_file, sys.argv[3], timeout=timeout)))")
 
 
 def dispatch_argv(repo_root, task: str, timeout=None) -> list:
@@ -172,7 +175,7 @@ class BoardTest(unittest.TestCase):
         return repo, worktree
 
     def register(self, repo, task: str, env: dict, thread: str | None = None,
-                 transport: str = pi_board.TRANSPORT_CLI_QUEUE, **extra) -> dict:
+                 transport: str = pi_store.TRANSPORT_CLI_QUEUE, **extra) -> dict:
         args = ["register", "--repo", str(repo.root), "--task", task, "--transport", transport]
         if thread is not None:
             args += ["--thread", thread]
@@ -226,7 +229,7 @@ class BoardTest(unittest.TestCase):
         repo.start("board-offline", worktree, env=env)
         self.assertEqual(repo.wait_terminal("board-offline", env=env)["state"], "completed")
         double, marker = make_cli_double(self.tmp)
-        result = self.register(repo, "board-offline", env, transport=pi_board.TRANSPORT_OFFLINE,
+        result = self.register(repo, "board-offline", env, transport=pi_store.TRANSPORT_OFFLINE,
                                codex_bin=None)
         self.assertEqual(result["mode"], "offline")
         self.assertIsNone(result["queueArgvTemplate"])
@@ -323,11 +326,11 @@ class BoardTest(unittest.TestCase):
         env = self.h_env(self.tmp)
         double, marker = make_cli_double(self.tmp)
         board = board_only(repo, task_id="batch-task", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
+                           transport=pi_store.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
         card = board["cards"]["batch-task"]
         events = []
         for index in range(4):
-            events.append(pi_board.add_event(card, "resource_breach", 3, f"check-{index}:p:100",
+            events.append(pi_events.add_event(card, "resource_breach", 3, f"check-{index}:p:100",
                                              f"breach {index}", {"round": 3, "head": None},
                                              {"guardPath": "p"}, "resolve or repair", index))
         write_board(repo, board)
@@ -350,8 +353,8 @@ class BoardTest(unittest.TestCase):
         env = self.h_env(self.tmp)
         double, marker = make_cli_double(self.tmp, behavior="slow", seconds=8)
         board = board_only(repo, task_id="uncertain-task", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
-        pi_board.add_event(board["cards"]["uncertain-task"], "task_timeout", 3, "exit=124",
+                           transport=pi_store.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
+        pi_events.add_event(board["cards"]["uncertain-task"], "task_timeout", 3, "exit=124",
                            "timed out", {"round": 3, "head": None}, {}, "resolve", 1)
         write_board(repo, board)
         first = self.dispatch(repo, "uncertain-task", env, timeout=2.0)
@@ -385,8 +388,8 @@ class BoardTest(unittest.TestCase):
         env = self.h_env(self.tmp)
         double, marker = make_cli_double(self.tmp, behavior="crash")
         board = board_only(repo, task_id="crash-task", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
-        pi_board.add_event(board["cards"]["crash-task"], "resource_breach", 3, "check:p:100",
+                           transport=pi_store.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
+        pi_events.add_event(board["cards"]["crash-task"], "resource_breach", 3, "check:p:100",
                            "breach", {"round": 3, "head": None}, {}, "resolve", 1)
         write_board(repo, board)
         first = self.dispatch(repo, "crash-task", env)
@@ -408,8 +411,8 @@ class BoardTest(unittest.TestCase):
         env = self.h_env(self.tmp)
         double, marker = make_cli_double(self.tmp, behavior="fail", code=2)
         board = board_only(repo, task_id="nonzero-task", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
-        pi_board.add_event(board["cards"]["nonzero-task"], "resource_breach", 3, "check:p:100",
+                           transport=pi_store.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
+        pi_events.add_event(board["cards"]["nonzero-task"], "resource_breach", 3, "check:p:100",
                            "breach", {"round": 3, "head": None}, {}, "resolve", 1)
         write_board(repo, board)
         self.assertEqual(self.dispatch(repo, "nonzero-task", env)["status"], "uncertain")
@@ -425,8 +428,8 @@ class BoardTest(unittest.TestCase):
         bad.write_text("this is not an executable format\n", encoding="utf-8")
         bad.chmod(0o755)
         board = board_only(repo, task_id="not-started", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE, codex_bin=str(bad))
-        pi_board.add_event(board["cards"]["not-started"], "resource_breach", 3, "check:p:100",
+                           transport=pi_store.TRANSPORT_CLI_QUEUE, codex_bin=str(bad))
+        pi_events.add_event(board["cards"]["not-started"], "resource_breach", 3, "check:p:100",
                            "breach", {"round": 3, "head": None}, {}, "resolve", 1)
         write_board(repo, board)
         first = self.dispatch(repo, "not-started", env)
@@ -444,8 +447,8 @@ class BoardTest(unittest.TestCase):
         env = self.h_env(self.tmp)
         double, marker = make_cli_double(self.tmp)
         board = board_only(repo, task_id="bad-queue", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
-        pi_board.add_event(board["cards"]["bad-queue"], "review_required", 3, "completed:abc:0",
+                           transport=pi_store.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
+        pi_events.add_event(board["cards"]["bad-queue"], "review_required", 3, "completed:abc:0",
                            "terminal", {"round": 3, "head": "a" * 40}, {}, "review", 1)
         write_board(repo, board)
         queue_path = repo.state_dir / "board.queue.json"
@@ -473,8 +476,8 @@ class BoardTest(unittest.TestCase):
         env = self.h_env(self.tmp)
         double, marker = make_cli_double(self.tmp)
         board = board_only(repo, task_id="paused-task", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
-        pi_board.add_event(board["cards"]["paused-task"], "review_required", 3, "completed:abc:0",
+                           transport=pi_store.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
+        pi_events.add_event(board["cards"]["paused-task"], "review_required", 3, "completed:abc:0",
                            "terminal", {"round": 3, "head": "a" * 40}, {}, "review", 1)
         write_board(repo, board)
         board_json("pause", "--repo", repo.root, "--task", "paused-task", env=env)
@@ -487,8 +490,8 @@ class BoardTest(unittest.TestCase):
 
         # Interrupt route pause: only an explicit resume clears it.
         board = board_only(repo, task_id="interrupt-task", thread=THREAD_B,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
-        pi_board.add_event(board["cards"]["interrupt-task"], "review_required", 3, "completed:def:0",
+                           transport=pi_store.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
+        pi_events.add_event(board["cards"]["interrupt-task"], "review_required", 3, "completed:def:0",
                            "terminal", {"round": 3, "head": "b" * 40}, {}, "review", 1)
         write_board(repo, board)
         run_hook({"hook_event_name": "Interrupt", "session_id": THREAD_B,
@@ -509,7 +512,7 @@ class BoardTest(unittest.TestCase):
     # ------------------------------------------------------------------
     def _review_board(self, repo, task_id: str, head: str) -> Path:
         board = board_only(repo, task_id=task_id, thread=THREAD_A, state="completed", round_number=2)
-        pi_board.add_event(board["cards"][task_id], "review_required", 2, f"completed:{head}:0",
+        pi_events.add_event(board["cards"][task_id], "review_required", 2, f"completed:{head}:0",
                            "terminal", {"round": 2, "head": head}, {"stateRef": "s"},
                            "review the candidate", 1)
         return write_board(repo, board)
@@ -523,15 +526,15 @@ class BoardTest(unittest.TestCase):
         second = repo._git("rev-parse", "HEAD")
         self.assertNotEqual(first, second)
         board_file = self._review_board(repo, "commit-task", first)
-        board, _ = pi_board.read_board(board_file)
-        event = pi_board.pending_events(board["cards"]["commit-task"])[0]
+        board, _ = pi_store.read_board(board_file)
+        event = pi_events.pending_events(board["cards"]["commit-task"])[0]
         # Historical candidate: an older commit than HEAD is still reviewable.
         accepted = board_json("decide", "--repo", repo.root, "--task", "commit-task",
                               "--event-id", event["id"], "--decision", "accept",
                               "--reviewed-head", first, env=env)
         self.assertTrue(accepted["aggregate"])
         self.assertEqual(accepted["reviewedHead"], first.lower())
-        board, _ = pi_board.read_board(board_file)
+        board, _ = pi_store.read_board(board_file)
         self.assertEqual(board["cards"]["commit-task"]["codex"]["review"], "accepted")
 
     def test_accept_rejects_nonexistent_short_non_commit_and_wrong_commits(self):
@@ -541,8 +544,8 @@ class BoardTest(unittest.TestCase):
         real = repo._git("rev-parse", "HEAD")
         blob = repo._git("rev-parse", "HEAD:file.txt")
         board_file = self._review_board(repo, "oid-task", real)
-        board, _ = pi_board.read_board(board_file)
-        event = pi_board.pending_events(board["cards"]["oid-task"])[0]
+        board, _ = pi_store.read_board(board_file)
+        event = pi_events.pending_events(board["cards"]["oid-task"])[0]
         cases = [
             (blob, "not a commit"),
             ("a" * 40, "not a commit"),
@@ -566,7 +569,7 @@ class BoardTest(unittest.TestCase):
                              "--reviewed-head", other, env=env, expect=2)
         self.assertIn("does not resolve to the event candidate", mismatch.stderr)
         # Faults cannot be accepted and the event remains unhandled.
-        board, _ = pi_board.read_board(board_file)
+        board, _ = pi_store.read_board(board_file)
         self.assertFalse(board["cards"]["oid-task"]["events"][0]["handled"])
 
     def test_old_round_decision_is_history_only_and_conflicting_replay_conflicts(self):
@@ -578,10 +581,10 @@ class BoardTest(unittest.TestCase):
         new_head = repo._git("rev-parse", "HEAD")
         board = board_only(repo, task_id="round-task", thread=THREAD_A, round_number=4)
         card = board["cards"]["round-task"]
-        old_event = pi_board.add_event(card, "review_required", 3, "old",
+        old_event = pi_events.add_event(card, "review_required", 3, "old",
                                        "round 3 terminal", {"round": 3, "head": old_head},
                                        {}, "review", 1)
-        new_event = pi_board.add_event(card, "review_required", 4, "new",
+        new_event = pi_events.add_event(card, "review_required", 4, "new",
                                        "round 4 terminal", {"round": 4, "head": new_head},
                                        {}, "review", 2)
         write_board(repo, board)
@@ -608,10 +611,10 @@ class BoardTest(unittest.TestCase):
         board = board_only(repo)
         card = board["cards"]["unit-task"]
         for index in range(60):
-            pi_board.add_event(card, "resource_breach", 3, f"check-{index}:path:100",
+            pi_events.add_event(card, "resource_breach", 3, f"check-{index}:path:100",
                                f"breach {index}", {"round": 3, "head": None},
                                {"guardPath": "p"}, "resolve or repair", 2 + index)
-        self.assertEqual(len(pi_board.pending_events(card)), 60)
+        self.assertEqual(len(pi_events.pending_events(card)), 60)
         self.assertTrue(card["overflow"]["active"])
         write_board(repo, board)
         env = self.h_env(self.tmp)
@@ -623,17 +626,17 @@ class BoardTest(unittest.TestCase):
         repo, _worktree = self.make()
         board = board_only(repo)
         card = board["cards"]["unit-task"]
-        event = pi_board.add_event(card, "resource_breach", 3, "check:path:100", "s", {}, {}, "q", 1)
+        event = pi_events.add_event(card, "resource_breach", 3, "check:path:100", "s", {}, {}, "q", 1)
         event.update(handled=True, handledAt=2, decision="resolved")
-        pi_board._prune_events(card)
-        for index in range(pi_board.MAX_HANDLED_EVENTS + 5):
-            extra = pi_board.add_event(card, "resource_breach", 3, f"other-{index}:p:1",
+        pi_events._prune_events(card)
+        for index in range(pi_store.MAX_HANDLED_EVENTS + 5):
+            extra = pi_events.add_event(card, "resource_breach", 3, f"other-{index}:p:1",
                                        "s", {}, {}, "q", 3 + index)
             extra.update(handled=True, handledAt=4 + index, decision="resolved")
-            pi_board._prune_events(card)
-        self.assertIsNone(pi_board.find_event(card, event["id"]))
+            pi_events._prune_events(card)
+        self.assertIsNone(pi_events.find_event(card, event["id"]))
         self.assertIn(event["id"], card["handled"])
-        self.assertIsNone(pi_board.add_event(card, "resource_breach", 3, "check:path:100",
+        self.assertIsNone(pi_events.add_event(card, "resource_breach", 3, "check:path:100",
                                              "s", {}, {}, "q", 99))
 
     def test_terminal_projection_and_dedup(self):
@@ -641,7 +644,7 @@ class BoardTest(unittest.TestCase):
         env = self.h_env(self.tmp, PI_DOUBLE_MODE="ok")
         repo.start("board-terminal", worktree, env=env)
         self.assertEqual(repo.wait_terminal("board-terminal", env=env)["state"], "completed")
-        self.register(repo, "board-terminal", env, transport=pi_board.TRANSPORT_OFFLINE)
+        self.register(repo, "board-terminal", env, transport=pi_store.TRANSPORT_OFFLINE)
         card = self.card(repo, "board-terminal")
         events = [event for event in card["events"] if event["kind"] == "review_required"]
         self.assertEqual(len(events), 1)
@@ -657,7 +660,7 @@ class BoardTest(unittest.TestCase):
         repo.start("board-checks", worktree, env=env)
         repo.wait_round_state("board-checks", "running")
         checks = repo.task_dir("board-checks") / "rounds" / "1" / "round.checks"
-        self.register(repo, "board-checks", env, transport=pi_board.TRANSPORT_OFFLINE)
+        self.register(repo, "board-checks", env, transport=pi_store.TRANSPORT_OFFLINE)
         plain = self.synth_receipt(checks, "plain-failure", 3)
         self.refresh(repo, "board-checks", env)
         card = self.card(repo, "board-checks")
@@ -721,7 +724,7 @@ class BoardTest(unittest.TestCase):
             }), encoding="utf-8")
 
         try:
-            self.register(repo, "board-growing-breach", env, transport=pi_board.TRANSPORT_OFFLINE)
+            self.register(repo, "board-growing-breach", env, transport=pi_store.TRANSPORT_OFFLINE)
             emit(100)
             self.refresh(repo, "board-growing-breach", env)
             emit(900)
@@ -789,7 +792,7 @@ class BoardTest(unittest.TestCase):
     def test_monitor_exception_becomes_a_visible_unhealthy_lease(self):
         repo, _worktree = self.make()
         board = board_only(repo, task_id="monitor-boom", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE)
+                           transport=pi_store.TRANSPORT_CLI_QUEUE)
         board_file = write_board(repo, board)
         original = pi_board.build_status
 
@@ -804,9 +807,9 @@ class BoardTest(unittest.TestCase):
         finally:
             pi_board.build_status = original
         self.assertFalse(result["ok"])
-        monitors, problem = pi_board.read_monitors(board_file)
+        monitors, problem = pi_store.read_monitors(board_file)
         self.assertIsNone(problem)
-        record = pi_board.monitor_for(monitors, "monitor-boom")
+        record = pi_store.monitor_for(monitors, "monitor-boom")
         self.assertFalse(record.get("healthy"))
         self.assertIn("simulated status failure", record.get("error") or "")
 
@@ -831,8 +834,8 @@ class BoardTest(unittest.TestCase):
         env = self.h_env(self.tmp)
         double, marker = make_cli_double(self.tmp)
         board = board_only(repo, task_id="race-task", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
-        pi_board.add_event(board["cards"]["race-task"], "review_required", 3, "completed:abc:0",
+                           transport=pi_store.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
+        pi_events.add_event(board["cards"]["race-task"], "review_required", 3, "completed:abc:0",
                            "terminal", {"round": 3, "head": "a" * 40}, {}, "review", 1)
         write_board(repo, board)
         procs = [subprocess.Popen(dispatch_argv(repo.root, "race-task"),
@@ -854,8 +857,8 @@ class BoardTest(unittest.TestCase):
         env = self.h_env(self.tmp)
         double, marker = make_cli_double(self.tmp)
         board = board_only(repo, task_id="resent-task", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
-        pi_board.add_event(board["cards"]["resent-task"], "review_required", 3, "completed:abc:0",
+                           transport=pi_store.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
+        pi_events.add_event(board["cards"]["resent-task"], "review_required", 3, "completed:abc:0",
                            "terminal", {"round": 3, "head": "a" * 40}, {}, "review", 1)
         write_board(repo, board)
         self.assertTrue(self.dispatch(repo, "resent-task", env)["dispatched"])
@@ -871,7 +874,7 @@ class BoardTest(unittest.TestCase):
         env = self.h_env(self.tmp)
         double, marker = make_cli_double(self.tmp)
         board = board_only(repo, task_id="other-task", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
+                           transport=pi_store.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
         write_board(repo, board)
         result = self.dispatch(repo, "missing-task", env)
         self.assertFalse(result["dispatched"])
@@ -931,20 +934,20 @@ class BoardTest(unittest.TestCase):
     def test_packet_byte_limit_keeps_omitted_events_unclaimed(self):
         repo, _worktree = self.make()
         board = board_only(repo, task_id="size-task", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE)
+                           transport=pi_store.TRANSPORT_CLI_QUEUE)
         card = board["cards"]["size-task"]
         events = []
         for index in range(4):
-            events.append(pi_board.add_event(card, "resource_breach", 3,
-                                             f"size-{index}:p:1", "s" * pi_board.MAX_SUMMARY,
+            events.append(pi_events.add_event(card, "resource_breach", 3,
+                                             f"size-{index}:p:1", "s" * pi_store.MAX_SUMMARY,
                                              {"round": 3, "head": None},
                                              {"guardPath": "p"}, "q" * 300, index))
-        original = pi_board.MAX_PACKET_CHARS
-        pi_board.MAX_PACKET_CHARS = 700
+        original = pi_queue.MAX_PACKET_CHARS
+        pi_queue.MAX_PACKET_CHARS = 700
         try:
-            text, included = pi_board.build_packet(card, events)
+            text, included = pi_queue.build_packet(card, events)
         finally:
-            pi_board.MAX_PACKET_CHARS = original
+            pi_queue.MAX_PACKET_CHARS = original
         self.assertGreaterEqual(len(included), 1)
         self.assertLess(len(included), 4, "the byte boundary must omit at least one event")
         self.assertLessEqual(len(text.encode("utf-8")), 700)
@@ -959,13 +962,13 @@ class BoardTest(unittest.TestCase):
         repo, _worktree = self.make()
         env = self.h_env(self.tmp)
         board = board_only(repo, task_id="claim-task", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE)
-        event = pi_board.add_event(board["cards"]["claim-task"], "review_required", 3,
+                           transport=pi_store.TRANSPORT_CLI_QUEUE)
+        event = pi_events.add_event(board["cards"]["claim-task"], "review_required", 3,
                                    "completed:abc:0", "terminal",
                                    {"round": 3, "head": "a" * 40}, {}, "review", 1)
         board_file = write_board(repo, board)
         now = time.time()
-        self.assertEqual(pi_board._claim_queue(board_file, "claim-task", [event["id"]], now,
+        self.assertEqual(pi_queue._claim_queue(board_file, "claim-task", [event["id"]], now,
                                                "packet-live"), [event["id"]])
         targeted = run_board("rearm", "--repo", repo.root, "--task", "claim-task",
                              "--event-id", event["id"], env=env, expect=2)
@@ -974,28 +977,28 @@ class BoardTest(unittest.TestCase):
         self.assertEqual(bulk["clearedClaims"], 0)
         self.assertEqual(bulk["refusedInflight"], [event["id"]])
         calls = []
-        blocked = pi_board.dispatch_task(board_file, "claim-task",
+        blocked = pi_queue.dispatch_task(board_file, "claim-task",
                                          cli_runner=captured_runner(calls))
         self.assertFalse(blocked["dispatched"])
         self.assertEqual(calls, [], "a live inflight claim must never be claimed twice")
         # Pause/resume must not clear or duplicate the live claim.
         board_json("pause", "--repo", repo.root, "--task", "claim-task", env=env)
         board_json("resume", "--repo", repo.root, "--task", "claim-task", env=env)
-        queue, _ = pi_board.read_queue(board_file)
+        queue, _ = pi_queue.read_queue(board_file)
         self.assertEqual(queue["tasks"]["claim-task"]["claims"][event["id"]]["status"], "inflight")
         # Age it: rearm marks uncertain, then explicit recovery clears it.
         claims = queue["tasks"]["claim-task"]["claims"]
         claims[event["id"]]["at"] = now - 10_000
-        pi_board._write_queue(board_file, queue)
+        pi_queue._write_queue(board_file, queue)
         marked = board_json("rearm", "--repo", repo.root, "--task", "claim-task", env=env)
         self.assertEqual(marked["markedUncertain"], [event["id"]])
         recovered = board_json("rearm", "--repo", repo.root, "--task", "claim-task",
                                "--event-id", event["id"], env=env)
         self.assertEqual(recovered["clearedClaims"], 1)
         # A late result from the old packet must not overwrite the recovered state.
-        pi_board._finish_queue(board_file, "claim-task", [event["id"]],
+        pi_queue._finish_queue(board_file, "claim-task", [event["id"]],
                                {"status": "queued", "exitCode": 0}, time.time(), "packet-live")
-        queue, _ = pi_board.read_queue(board_file)
+        queue, _ = pi_queue.read_queue(board_file)
         entry = queue["tasks"]["claim-task"]
         self.assertNotIn(event["id"], entry["claims"])
         self.assertEqual(entry["lastSkippedFinalize"]["packetId"], "packet-live")
@@ -1005,8 +1008,8 @@ class BoardTest(unittest.TestCase):
         env = self.h_env(self.tmp)
         double, marker = make_cli_double(self.tmp, behavior="spam")
         board = board_only(repo, task_id="spam-task", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
-        pi_board.add_event(board["cards"]["spam-task"], "review_required", 3, "completed:abc:0",
+                           transport=pi_store.TRANSPORT_CLI_QUEUE, codex_bin=str(double))
+        pi_events.add_event(board["cards"]["spam-task"], "review_required", 3, "completed:abc:0",
                            "terminal", {"round": 3, "head": "a" * 40}, {}, "review", 1)
         write_board(repo, board)
         result = self.dispatch(repo, "spam-task", env)
@@ -1018,22 +1021,22 @@ class BoardTest(unittest.TestCase):
     def test_near_full_packet_keeps_the_mandatory_drain_instruction(self):
         repo, _worktree = self.make()
         board = board_only(repo, task_id="near-full", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE)
+                           transport=pi_store.TRANSPORT_CLI_QUEUE)
         card = board["cards"]["near-full"]
         events = []
         for index in range(4):
             evidence = {"briefRef": "b" * 1336} if index == 0 else {"guardPath": "p"}
-            events.append(pi_board.add_event(card, "resource_breach", 3,
+            events.append(pi_events.add_event(card, "resource_breach", 3,
                                              f"near-{index}:p:1", "s" * 100,
                                              {"round": 3, "head": None}, evidence,
                                              "q" * 100, index))
-        text, included = pi_board.build_packet(card, events)
+        text, included = pi_queue.build_packet(card, events)
         self.assertTrue(included)
         self.assertLess(len(included), 4, "a near-full packet must omit events, not the instruction")
         self.assertIn("pending event(s)", text)
         self.assertIn("same turn", text)
         self.assertIn("pi_board.py show", text)
-        self.assertLessEqual(len(text.encode("utf-8")), pi_board.MAX_PACKET_CHARS)
+        self.assertLessEqual(len(text.encode("utf-8")), pi_queue.MAX_PACKET_CHARS)
         for event in included:
             self.assertIn(event["id"], text)
         omitted = [event for event in events if event not in included]
@@ -1043,44 +1046,44 @@ class BoardTest(unittest.TestCase):
     def test_limit_count_overflow_keeps_the_drain_instruction(self):
         repo, _worktree = self.make()
         board = board_only(repo, task_id="count-full", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE)
+                           transport=pi_store.TRANSPORT_CLI_QUEUE)
         card = board["cards"]["count-full"]
-        events = [pi_board.add_event(card, "resource_breach", 3, f"count-{i}:p:1", "s",
+        events = [pi_events.add_event(card, "resource_breach", 3, f"count-{i}:p:1", "s",
                                      {"round": 3, "head": None}, {}, "q", i)
                   for i in range(5)]
-        text, included = pi_board.build_packet(card, events)
-        self.assertEqual(len(included), pi_board.MAX_PACKET_EVENTS)
+        text, included = pi_queue.build_packet(card, events)
+        self.assertEqual(len(included), pi_queue.MAX_PACKET_EVENTS)
         self.assertIn("pending event(s)", text)
         self.assertIn("same turn", text)
-        self.assertLessEqual(len(text.encode("utf-8")), pi_board.MAX_PACKET_CHARS)
+        self.assertLessEqual(len(text.encode("utf-8")), pi_queue.MAX_PACKET_CHARS)
 
     def test_utf8_near_full_packet_keeps_drain_and_byte_bound(self):
         repo, _worktree = self.make()
         board = board_only(repo, task_id="utf8-near", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE)
+                           transport=pi_store.TRANSPORT_CLI_QUEUE)
         card = board["cards"]["utf8-near"]
-        events = [pi_board.add_event(card, "resource_breach", 3, f"multi-{i}:p:1", "é" * 200,
+        events = [pi_events.add_event(card, "resource_breach", 3, f"multi-{i}:p:1", "é" * 200,
                                      {"round": 3, "head": None}, {"briefRef": "é" * 300},
                                      "q" * 120, i) for i in range(4)]
-        text, included = pi_board.build_packet(card, events)
+        text, included = pi_queue.build_packet(card, events)
         self.assertTrue(included)
-        self.assertLessEqual(len(text.encode("utf-8")), pi_board.MAX_PACKET_CHARS)
+        self.assertLessEqual(len(text.encode("utf-8")), pi_queue.MAX_PACKET_CHARS)
         self.assertIn("pending event(s)", text, "the drain instruction must survive the byte reserve")
 
     def test_oversized_fallback_with_remaining_events(self):
         repo, _worktree = self.make()
         board = board_only(repo, task_id="oversize-many", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE)
+                           transport=pi_store.TRANSPORT_CLI_QUEUE)
         card = board["cards"]["oversize-many"]
-        events = [pi_board.add_event(card, "resource_breach", 3, f"big-{i}:p:1", "x" * 300,
+        events = [pi_events.add_event(card, "resource_breach", 3, f"big-{i}:p:1", "x" * 300,
                                      {"round": 3, "head": None}, {}, "q" * 300, i)
                   for i in range(3)]
-        original = pi_board.MAX_PACKET_CHARS
-        pi_board.MAX_PACKET_CHARS = 300
+        original = pi_queue.MAX_PACKET_CHARS
+        pi_queue.MAX_PACKET_CHARS = 300
         try:
-            text, included = pi_board.build_packet(card, events)
+            text, included = pi_queue.build_packet(card, events)
         finally:
-            pi_board.MAX_PACKET_CHARS = original
+            pi_queue.MAX_PACKET_CHARS = original
         self.assertEqual(included, [events[0]])
         self.assertIn(events[0]["id"], text)
         self.assertTrue("board_ref=" in text or "show" in text)
@@ -1100,19 +1103,19 @@ class BoardTest(unittest.TestCase):
     def test_packet_utf8_byte_limit_is_bounded(self):
         repo, _worktree = self.make()
         board = board_only(repo, task_id="utf8-task", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE)
+                           transport=pi_store.TRANSPORT_CLI_QUEUE)
         card = board["cards"]["utf8-task"]
         events = []
         for index in range(3):
-            events.append(pi_board.add_event(card, "resource_breach", 3, f"utf8-{index}:p:1",
+            events.append(pi_events.add_event(card, "resource_breach", 3, f"utf8-{index}:p:1",
                                              "é" * 200, {"round": 3, "head": None},
                                              {"guardPath": "p"}, "q" * 120, index))
-        original = pi_board.MAX_PACKET_CHARS
-        pi_board.MAX_PACKET_CHARS = 1500
+        original = pi_queue.MAX_PACKET_CHARS
+        pi_queue.MAX_PACKET_CHARS = 1500
         try:
-            text, included = pi_board.build_packet(card, events)
+            text, included = pi_queue.build_packet(card, events)
         finally:
-            pi_board.MAX_PACKET_CHARS = original
+            pi_queue.MAX_PACKET_CHARS = original
         self.assertTrue(included)
         self.assertLessEqual(len(text.encode("utf-8")), 1500,
                              "the packet limit must be enforced in UTF-8 bytes")
@@ -1120,17 +1123,17 @@ class BoardTest(unittest.TestCase):
     def test_oversized_event_falls_back_with_id_and_board_ref(self):
         repo, _worktree = self.make()
         board = board_only(repo, task_id="oversize-task", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE)
+                           transport=pi_store.TRANSPORT_CLI_QUEUE)
         card = board["cards"]["oversize-task"]
-        event = pi_board.add_event(card, "resource_breach", 3, "huge:p:1", "x" * 300,
+        event = pi_events.add_event(card, "resource_breach", 3, "huge:p:1", "x" * 300,
                                    {"round": 3, "head": None}, {"guardPath": "p"},
                                    "q" * 300, 1)
-        original = pi_board.MAX_PACKET_CHARS
-        pi_board.MAX_PACKET_CHARS = 300
+        original = pi_queue.MAX_PACKET_CHARS
+        pi_queue.MAX_PACKET_CHARS = 300
         try:
-            text, included = pi_board.build_packet(card, [event])
+            text, included = pi_queue.build_packet(card, [event])
         finally:
-            pi_board.MAX_PACKET_CHARS = original
+            pi_queue.MAX_PACKET_CHARS = original
         self.assertEqual(included, [event], "an oversized event must not be silently dropped")
         self.assertIn(event["id"], text, "the fallback keeps the exact event id")
         self.assertTrue("show" in text or "board_ref=" in text,
@@ -1140,15 +1143,15 @@ class BoardTest(unittest.TestCase):
     def test_overflow_packet_directs_draining_in_the_same_turn(self):
         repo, _worktree = self.make()
         board = board_only(repo, task_id="drain-task", thread=THREAD_A,
-                           transport=pi_board.TRANSPORT_CLI_QUEUE)
+                           transport=pi_store.TRANSPORT_CLI_QUEUE)
         card = board["cards"]["drain-task"]
         events = []
         for index in range(55):
-            events.append(pi_board.add_event(card, "resource_breach", 3, f"drain-{index}:p:1",
+            events.append(pi_events.add_event(card, "resource_breach", 3, f"drain-{index}:p:1",
                                              f"breach {index}", {"round": 3, "head": None},
                                              {"guardPath": "p"}, "resolve", index))
         self.assertTrue(card["overflow"]["active"])
-        text, included = pi_board.build_packet(card, events)
+        text, included = pi_queue.build_packet(card, events)
         self.assertTrue(included)
         self.assertIn("overflow=", text)
         self.assertIn("same turn", text)

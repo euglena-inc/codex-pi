@@ -17,6 +17,10 @@ from runtime_helpers import (RUNTIME, Repo, base_env, cleanup_repos, cli_json, d
 
 sys.path.insert(0, str(RUNTIME))
 import pi_board  # noqa: E402
+import pi_store  # noqa: E402
+import pi_queue  # noqa: E402
+import pi_evidence  # noqa: E402
+import pi_events  # noqa: E402
 import pi_task  # noqa: E402
 
 THREAD = "11111111-2222-3333-4444-555555555555"
@@ -38,8 +42,8 @@ class DeliveryCardTest(unittest.TestCase):
         self.round_dir.mkdir(parents=True)
 
     def make_card(self, repo="/repo", task="card-task") -> dict:
-        return pi_board._new_card(task, THREAD, "Title", "Goal", "brief.md", None, repo,
-                                  "/common", "/worktree", pi_board.TRANSPORT_CLI_QUEUE,
+        return pi_events._new_card(task, THREAD, "Title", "Goal", "brief.md", None, repo,
+                                  "/common", "/worktree", pi_store.TRANSPORT_CLI_QUEUE,
                                   "/bin/true", 1)
 
     def write_report(self, text: str) -> None:
@@ -47,7 +51,7 @@ class DeliveryCardTest(unittest.TestCase):
             json.dumps({"final_text": text}), encoding="utf-8")
 
     def review_event(self, card, items, fingerprint="fp", kind="review_required", head=HEAD):
-        event = pi_board.add_event(
+        event = pi_events.add_event(
             card, kind, 2, fingerprint, "phase P is delivery-ready", {"round": 2, "head": head},
             {"stateRef": str(self.round_dir / "round.state.json"),
              "briefRef": str(self.round_dir / "brief.md")},
@@ -59,7 +63,7 @@ class DeliveryCardTest(unittest.TestCase):
 
     # ------------------------------------------------------------------
     def test_limit_constant_is_1200_bytes(self):
-        self.assertEqual(pi_board.MAX_PACKET_CHARS, CARD_LIMIT)
+        self.assertEqual(pi_queue.MAX_PACKET_CHARS, CARD_LIMIT)
 
     def test_card_has_every_item_line_full_sha_policy_report_and_one_hint(self):
         card = self.make_card()
@@ -72,7 +76,7 @@ class DeliveryCardTest(unittest.TestCase):
         ]
         event = self.review_event(card, items)
         self.write_report("完成。" * 400)
-        text, included = pi_board.build_packet(card, [event])
+        text, included = pi_queue.build_packet(card, [event])
         self.assertEqual(included, [event])
         self.assertLessEqual(nbytes(text), CARD_LIMIT)
         self.assertIn(HEAD, text, "the full candidate SHA is on the card")
@@ -81,7 +85,7 @@ class DeliveryCardTest(unittest.TestCase):
         self.assertIn("round=2", text)
         self.assertIn("task=card-task", text)
         for item in items:
-            self.assertIn(pi_task.acceptance_line(item["id"], item["st"], item["exit"],
+            self.assertIn(pi_evidence.acceptance_line(item["id"], item["st"], item["exit"],
                                                   item["counts"]), text.splitlines())
         self.assertIn("A1 exit=0 run=12 pass=12 fail=0 skip=0", text)
         self.assertIn("A2 exit=3 [failed]", text)
@@ -100,7 +104,7 @@ class DeliveryCardTest(unittest.TestCase):
         card = self.make_card()
         event = self.review_event(card, [])
         self.write_report("all done")
-        text, _ = pi_board.build_packet(card, [event])
+        text, _ = pi_queue.build_packet(card, [event])
         self.assertIn("report=all done", text)
 
     def test_many_items_are_capped_and_card_stays_within_the_limit(self):
@@ -108,9 +112,9 @@ class DeliveryCardTest(unittest.TestCase):
         items = [{"id": f"ITEM-{i}", "st": "covered", "exit": 0,
                   "counts": {"run": 5, "pass": 5, "fail": 0, "skip": 0}} for i in range(40)]
         event = self.review_event(card, items)
-        event["delivery"] = {"items": items[:pi_board.MAX_CARD_ITEMS],
-                             "more": len(items) - pi_board.MAX_CARD_ITEMS}
-        text, included = pi_board.build_packet(card, [event])
+        event["delivery"] = {"items": items[:pi_events.MAX_CARD_ITEMS],
+                             "more": len(items) - pi_events.MAX_CARD_ITEMS}
+        text, included = pi_queue.build_packet(card, [event])
         self.assertEqual(included, [event])
         self.assertLessEqual(nbytes(text), CARD_LIMIT)
         self.assertIn("+32 more items (show)", text)
@@ -122,7 +126,7 @@ class DeliveryCardTest(unittest.TestCase):
         events = [self.review_event(card, items, fingerprint=f"fp-{i}",
                                     head=f"{i:040x}") for i in range(5)]
         self.write_report("r" * 3000)
-        text, included = pi_board.build_packet(card, events)
+        text, included = pi_queue.build_packet(card, events)
         self.assertLessEqual(nbytes(text), CARD_LIMIT)
         self.assertTrue(included)
         self.assertLess(len(included), 5)
@@ -138,24 +142,24 @@ class DeliveryCardTest(unittest.TestCase):
         # A task identity this long makes even a bare event block exceed the card.
         card = self.make_card(repo="/r/" + "x" * 1500, task="t" + "y" * 40)
         event = self.review_event(card, [])
-        text, included = pi_board.build_packet(card, [event])
+        text, included = pi_queue.build_packet(card, [event])
         self.assertEqual(included, [event], "an oversized event is not silently dropped")
         self.assertIn(event["id"], text)
         self.assertLessEqual(nbytes(text), CARD_LIMIT)
         # Many pending events with the same problem still produce one bounded fallback.
         more = [self.review_event(card, [], fingerprint=f"o{i}") for i in range(3)]
-        text, included = pi_board.build_packet(card, more)
+        text, included = pi_queue.build_packet(card, more)
         self.assertEqual(included, [more[0]])
         self.assertIn(more[0]["id"], text)
         self.assertLessEqual(nbytes(text), CARD_LIMIT)
 
     def test_non_review_event_names_the_anomaly_question(self):
         card = self.make_card()
-        event = pi_board.add_event(card, pi_board.PROGRESS_EVENT_KIND, 2, "fp-a",
+        event = pi_events.add_event(card, pi_events.PROGRESS_EVENT_KIND, 2, "fp-a",
                                    "check 'A1' has an unresolved failure observed for 200s",
                                    {"round": 2, "head": HEAD}, {},
                                    "Anomaly: choose pause, cancel or let Pi repair.", 1)
-        text, _ = pi_board.build_packet(card, [event])
+        text, _ = pi_queue.build_packet(card, [event])
         self.assertIn("ask=Anomaly: choose pause, cancel or let Pi repair.", text)
         self.assertIn("note=check 'A1' has an unresolved failure", text)
         self.assertLessEqual(nbytes(text), CARD_LIMIT)
@@ -166,7 +170,7 @@ class DeliveryCardTest(unittest.TestCase):
             {"id": "unit", "exitCode": 0, "testCounts": {"run": 2, "pass": 2, "fail": 0,
                                                          "skip": 0}},
             {"id": "lint", "exitCode": None, "testCounts": None}]}}}
-        info = pi_board._delivery_info(status)
+        info = pi_events._delivery_info(status)
         self.assertEqual([(i["id"], i["st"], i["exit"]) for i in info["items"]],
                          [("unit", "covered", 0), ("lint", "unknown", None)])
 
