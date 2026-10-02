@@ -259,7 +259,7 @@ class CodemodeIntegrationTest(unittest.TestCase):
         self.assertIsNone(ok["error"])
         self.assertEqual(ok["leftover"], 0)
         self.assertIn('"value":41', self.case_text(ok))
-        branch = self.case("store-branch")
+        branch = self.case("store-later")
         self.assertIn('"ok":41', self.case_text(branch))
         self.assertIn('"bad":"undefined"', self.case_text(branch))
         self.assertIsNotNone(self.report.get("sessionFile"))
@@ -276,7 +276,7 @@ class CodemodeIntegrationTest(unittest.TestCase):
         self.assertEqual(len(case["codemode"]), 1)
         self.assertTrue(case["codemode"][0]["isError"])
         self.assertIn("probe failure", self.case_text(case))
-        for name in ("store-branch", "store-resume"):
+        for name in ("store-later", "store-resume"):
             self.assertNotIn('"bad":7', self.case_text(self.case(name)))
 
 
@@ -288,10 +288,12 @@ def main() -> int:
     except ProbeUnavailable as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 2
-    temporary = tempfile.TemporaryDirectory(prefix="codex-pi-codemode-probe-")
+    # mkdtemp + explicit cleanup: a TemporaryDirectory finalizer would still delete the
+    # evidence after CODEX_PI_PROBE_KEEP asked to retain it.
+    root = Path(tempfile.mkdtemp(prefix="codex-pi-codemode-probe-")).resolve()
     keep = bool(os.environ.get("CODEX_PI_PROBE_KEEP"))
     try:
-        layout = build_workdir(Path(temporary.name).resolve())
+        layout = build_workdir(root)
         report = run_probe_layout(layout["root"], package_root, entry, pi_version)
         print(f"probe: pi={pi_version} node={report.get('node')} "
               f"model={report.get('model')} cases={len(report.get('cases', {}))}")
@@ -307,10 +309,11 @@ def main() -> int:
             print(f"probe properties: failed={failed}")
         return 0 if result.wasSuccessful() else 1
     finally:
+        # One rule for success and failure: keep only when explicitly requested.
         if keep:
-            print(f"probe evidence retained outside tracked files: {temporary.name}")
+            print(f"probe evidence retained outside tracked files: {root}")
         else:
-            temporary.cleanup()
+            shutil.rmtree(root, ignore_errors=True)
 
 
 if __name__ == "__main__":

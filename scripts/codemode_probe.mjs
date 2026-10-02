@@ -241,9 +241,9 @@ async function main() {
 		{ text: "store-fail done" },
 	]);
 
-	await runCase(session, "store-branch", [
+	await runCase(session, "store-later", [
 		{ code: "return JSON.stringify({ok: load('probe-ok'), bad: typeof load('probe-bad')});" },
-		{ text: "store-branch done" },
+		{ text: "store-later done" },
 	]);
 
 	await runCase(session, "abort", [

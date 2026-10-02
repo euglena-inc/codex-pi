@@ -18,16 +18,28 @@ python3 scripts/check_public_privacy.py
 
 | 属性 | 观测 | 负向对照 |
 | --- | --- | --- |
-| 原生注册与装载证明 | `codemode` 在 active/all 工具中；`worker.ready` 含 `codemode:true` 且在首个工具执行前存在 | 同一探针里 stub 缺失导出时离线 harness 不写 marker 并阻断全部调用 |
+| 原生注册与装载证明 | 真实探针里 `codemode` 在 active/all 工具中；`worker.ready` 含 `codemode:true` 且在首个工具执行前存在 | 离线 harness 里 stub 缺失导出时不写 marker 并阻断全部调用（真实探针只覆盖成功注册路径） |
 | `models` 缺失 | 脚本内 `typeof models === "undefined"` | `typeof tools === "object"`（真实工具面仍在） |
 | 结构化成功/失败 | 成功 `check` 返回 `ok:true, exit_code:0`；失败返回 `ok:false, exit_code:1`，嵌套调用 `isError:true` | 失败脚本的 codemode 外层仍可成功返回该结构化数据；语义由 `ok` 判断 |
 | 嵌套禁止写 | 写入主检出路径被 `forbidden-path` 拒绝，目标文件未变，`worker-blocks.jsonl` 有记录 | 同一脚本写入 worktree 路径成功 |
 | 截止时间约束 | 省略 options 的脚本在约 2 秒（配置的有界缺省）超时；`timeout_ms:999999999` 被压到命令上限约 6 秒 | 快速脚本在默认截止时间内正常完成 |
 | 非法选项 | `timeout_ms:0` 的脚本在运行前被拒，无嵌套调用 | 合法 options 的脚本正常执行 |
 | 取消传播 | 会话 abort 后嵌套 bash 子进程不再存活，codemode 结果显式失败/取消 | 未 abort 的同一脚本由截止时间正常收束 |
-| store 成功与 resume | 成功脚本写入的值在本会话与从会话文件恢复的新会话中都可 `load` | 失败脚本写入的值在分支与 resume 后均为 `undefined` |
+| store 成功与 resume | 成功脚本写入的值在同一会话的后续脚本与从会话文件恢复的新会话中都可 `load` | 失败脚本写入的值在同一分支后续脚本与 resume 后均为 `undefined`；未验证真正的分支/fork 切换 |
 
 探针一次运行约 10 秒，退出 0 仅表示 9 项观测全部通过，不代表主会话验收。
+
+### 保留原始证据
+
+`CODEX_PI_PROBE_KEEP=1 python3 scripts/validate_codemode.py` 在进程退出后保留临时目录并打印其路径；未设置该变量时，无论成功或失败都在 `finally` 中删除该探针目录。验证方式是在 probe 子进程退出后由父进程直接读取保留路径下的 `report.json`：
+
+```sh
+OUT=$(CODEX_PI_PROBE_KEEP=1 python3 scripts/validate_codemode.py)
+RETAINED=$(printf '%s\n' "$OUT" | sed -n 's/^probe evidence retained outside tracked files: //p' | tail -1)
+test -r "$RETAINED/report.json"      # the probe process has already exited
+```
+
+未设置 `CODEX_PI_PROBE_KEEP` 的同一条命令不会留下 `codex-pi-codemode-probe-*` 目录。保留目录属于私有路径，不进入公开仓库。
 
 ## 离线回归
 

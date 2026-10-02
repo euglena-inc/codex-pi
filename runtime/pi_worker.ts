@@ -1,13 +1,17 @@
 /**
  * Codex-Pi worker extension (Pi >= 1.0.0).
  *
- * Loaded explicitly with `pi --no-extensions -e <tools>/pi_worker.ts`. It has no
- * dependencies: only a type-only import from the host package and Node built-ins.
+ * Loaded explicitly with `pi --no-extensions -e <tools>/pi_worker.ts`. It imports Node
+ * built-ins and the host package that loads it; the host import registers Pi's public
+ * codemode extension at load time.
  *
- * - Proves it loaded by writing `worker.ready` next to `worker.json`.
+ * - Proves it loaded by writing `worker.ready` next to `worker.json` only after the
+ *   native codemode registration returned.
  * - Guards every tool call: main checkout and other worktrees are forbidden,
  *   writes stay inside the allowed roots, bash gets a default timeout that is
  *   clamped to a ceiling. Anything it cannot decide is blocked.
+ * - Normalizes a codemode script's first-line options to a bounded deadline and
+ *   output budget; nested `tools.*` calls pass the same guard.
  * - Registers the native tools `check`, `progress` and `readiness`, which call
  *   the task's frozen Python helpers so receipts stay byte-compatible.
  * - Injects the worker contract as a system prompt section on every run.
