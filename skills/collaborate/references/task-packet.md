@@ -1,115 +1,75 @@
-# Pi 任务包标准
+# Task packet
 
-供 **Codex 主会话**在准备派工或整块返修时使用。Skill 管决策，任务说明管交付，公共 runner 管执行、证据与通知。标准化信息，不替模型规定每一步。主会话的可复用整任务分析与两次交付责任边界以 [Skill](../SKILL.md) 为唯一权威；本文只定义任务包产物、模板与交付格式。
+For the main session preparing a dispatch or a whole-outcome repair. Rules and the whole-task analysis: [the Skill](../SKILL.md); commands: [runtime](runtime.md). Write in the user's language; keep APIs, paths and commands verbatim.
 
-## 最小产物与唯一权威
+## Artifacts
 
-| 产物 | 内容与归属 |
-| --- | --- |
-| 任务规格 | 目标、已定设计、关键事实、范围与验收。优先引用已有项目设计/阶段说明；缺失才写 `task.md`。 |
-| 派工提示 | 用下面的短模板生成 `brief.md`，引用准确规格与验收项，不全文复制设计。小任务可直接以任务规格作为 brief，不强制两份 Markdown。 |
-| 阶段合同 | 完整阶段使用现有 `phase-contract.json` / `--contract-file`，是 runner 对本次设计的冻结快照，不成为第二份 PLAN。旧活跃任务不为套模板重启或热改合同。 |
-| 交付报告 | Pi 完成后按下方格式给出。复用已有报告文件或 runner 最终消息；不强制再建 `delivery.md`。 |
+- **Specification**: goal, settled design, facts, scope, acceptance. Reference the existing project design; write `task.md` only if none exists.
+- **Brief** (`brief.md`): the short prompt below, pointing at the spec and acceptance IDs; never copy the design or the Skill. A repair writes a new brief; dispatched ones are not rewritten.
+- **Phase contract**: `--contract-file`, a frozen snapshot, not a second PLAN. **Delivery report**: Pi's final message below.
 
-优先使用仓库现有任务目录。路径、阶段数和文件名是建议，不是门禁。持久设计可按仓库规则入库；私有数据、运行日志、凭据和任务本地指针留在获准证据位置。runner 已保存不可变 brief/round，无需把所有提示和日志再次提交。设计冻结后返修写新 brief，保留原版，不覆盖旧日志或追加改写已派发的规格。
+## Specification template
 
-## 任务规格模板
-
-保持下列信息顺序，可合并短项。已有权威文件承载的内容给精确引用即可。条件性内容不适用时省略，不填机械占位表。
+Omit what does not apply; link, do not restate.
 
 ```markdown
-# <阶段/任务> · <可审阅成果>
-
-## 目标、当前阶段与后续计划
-整体目标 → 本阶段完整结果 → 后续已授权计划与真实依赖；本块到哪里结束，哪些后继不属于本次。
-现有计划/设计/阶段合同的唯一入口。复杂结果写清成果导向的任务、依赖/顺序、责任边界与完成质量，不写编码步骤或固定函数。
-明确本次需要证明的闭合结果，以及它涉及的实际入口、数据形态与重要状态序列；过大的结果细化为真实冻结合同，保留总体要求、失败历史、暂停和预算。
-
-## 基线、范围与关键事实
-- 仓库、准确基线、隔离工作树；允许修改和必须保留的范围。
-- 派工和交付以实际 Git 差异核对范围，包含 PLAN/设计文件及 dirty/untracked 工作；不能只依赖文字声明。
-- 影响设计的已核实接口/字段/数据语义：事实 → 源码或原证位置/版本。
-- 未确定项及如何验证；只有真正改变权限、设计或验收的未知才回主会话裁决。
-- 输入与证据供给：已允许且可读的具体来源，缺失/禁止来源，以及可独立推进的部分。
-
-## 设计决定、难点与验证
-- 谁持有事实、谁可写；经过哪些现有公开接口；必须满足的外部合同。
-- 关键状态转移、幂等/并发/恢复、错误与 unknown 的语义（按任务需要）。
-- 对可能影响结果的难点：难点 → 已选方案/必要决定 → 失败或解锁路径 → 验证方式；关键设计不留给 Pi 猜。
-- 共享机制的 owner、唯一权威接口、实际行为证明及依赖它的后继；相关异步成功、错误与异常返回如何遵守同一规则。
-- 相关时写清空值、时区、单位、分页/去重或序列化口径，给一个决定性的边界算例。
-其余实现由 Pi 自行决定。
-
-## 并行协作（适用时）
-引用现有设计中的两路完整结果与共享契约；写清本路任务/会话/工作树、同伴任务与准确输入提交、可独立推进和必须等待的部分，以及共享修改与测试资源归属。
-指定一个 Pi 任务负责授权范围内的整合、修复和最终组合检查；本路交付边界与总体阶段完成边界分别明确。拆分和整合不重置已有失败次数或预算。
-
-## 交付与验收
-| ID | 可观察通过条件 | 实际检查命令/原证 | 必须拒绝的反例 |
-| --- | --- | --- | --- |
-| <稳定ID> | <行为及结果，不能只有exit0> | <确切命令、证据类型与位置> | <该边界的失败情形> |
-补充整合/提交/文档范围；人工或外部证明单独标明，模拟不能替代。
-检查、原始证据、源码与依赖版本必须对得上；缺失、跳过、未知都不是通过。
-评价决定验收时，引用基于真实公共接口记录和独立预期事实的有效/无效校准原证，写清准备位置及依赖；旧记录不冒充当前候选或未见题。区分当前承诺的阻断缺陷与后续增强，设计通过不等于实现通过。
-
-## 自主修复、预算与升级条件
-Pi 可自行完成的实现、测试和普通返修；只在共同根因需要改变设计/授权时回报。
-命令与阶段预算、资源范围；缺失必要输入时保留成果并指出解锁条件。
-若本块有真实依赖，列少量“成果 → 前置 → 验证”的里程碑；不要按读代码/编码/测试拆阶段。
+# <phase/task> - <reviewable result>
+## Goal, phase, later plan
+Overall goal -> this phase's complete result -> authorized follow-ups and real dependencies; where this block ends.
+## Baseline, scope, facts
+Repo, exact baseline, worktree; allowed and protected changes. Verified facts with source or version; unknowns and how to verify; allowed inputs and gaps.
+## Design, difficulties, verification
+Fact owners and writers; public interfaces; states, idempotency, concurrency, recovery, meaning of errors and unknown. Each consequential difficulty -> solution -> failure or unlock path -> verification. One decisive boundary example where units, time zones, nulls, paging or dedup matter.
+## Two-line parallel work (if any)
+This line's outcome, sibling task and input commit, what waits, shared edits and resources, integration owner, combined acceptance.
+## Acceptance
+| ID | Observable pass condition | Real command / evidence | Counter-example that must fail |
+Missing, skipped or unknown is not a pass; manual or external proof is marked.
+## Repair, budget, escalation
+What Pi fixes alone; command and phase budgets, resource scope; escalate only for a design contradiction, an authority change or repeated ineffective repair, with the minimal reproduction.
 ```
 
-Pi 每次完成一次完整交付后，主会话复用同一次（可更新的）整任务分析核对准确候选与原证，定位当前症状与共同根因，再判断同一根因或设计变化对后续任务与真实依赖的影响，把结论收敛进现有设计与下一份 brief。交付通过可以只是确认既有方案仍有效，不必重写或重复已有效的调查；只有影响设计的难点才需要新的方案与验证。
+## Must-ask checklist
 
-事实核实深度服从风险。公开API变更应核对安装版本的公开合同；数据任务应核对真实字段与含义。没有必要时不调用真实网络/付费模型，不因为模板提到样本就读取受禁目录。模型能力和规格质量都会影响结果，详细规格不能替代验证。
+Settle each applicable item in the specification. If one is left open, Pi takes the conservative reading and reports a spec gap.
 
-代码演进任务必须明确版本策略：新项目直接替换时只支持目标版本，不默认增加旧版 fallback；保留历史原证不等于运行时兼容旧格式。已有用户的暂停、预算和“终态后停止”条件优先，不能因 runner 支持自动补齐而解除。
+1. Which record or version wins when several exist: by content only (never by name, mtime or order).
+2. Byte-identical rerun and replay: same input must give the same output and the same files.
+3. An existing or same-name target: overwrite, refuse or version.
+4. Dependence on time, timezone, environment or network.
+5. Empty, missing and unknown values: never zero; block and list them.
 
-## 派工短提示模板
+## Dispatch prompt
 
 ```text
-完成 <任务/阶段的整块成果>。基线 <准确commit>；仅在 <工作树> 实施。
-先读 <现有约束入口> 和 <规格路径/必要章节>；阶段验收以 <合同路径及验收ID> 为准。
-已定：<本阶段任务/依赖与本次最重要的设计决定；难点→已选方案→验证见规格>。范围：<允许变更及保护项>。
-并行时：<本路完整结果、同伴输入/等待条件、共享修改与资源归属、Pi集成负责人及组合验收边界>。
-自行选择实现并完成针对性验证、普通修复和授权内提交；不要停在代码写完或局部PASS。
-正式检查使用本任务冻结 pi_check 和本轮 checksDir，按实际命令保留退出码、日志和失败。
-关键输入：<允许来源、明确缺口>；不得从 <受禁来源> 绕过限制获取。
-发生 <设计矛盾/权限改变/重复无效修复等具体条件> 时，交付原证和最小决策问题。
-按任务包交付格式返回准确候选、验收映射、未完成项；到 <本次完成边界> 停止。
+Complete <whole result>. Baseline <commit>; work only in <worktree>.
+Read <constraints> and <spec path/sections>; acceptance is <contract path and IDs>.
+Settled: <key decision and difficulty -> solution -> verification>. Scope: <allowed; protected>.
+Own implementation, targeted checks, ordinary repairs and scoped commits; do not stop at code written or a partial PASS.
+Run formal checks with this task's frozen pi_check and this round's checksDir.
+Inputs: <allowed sources; gaps>; do not bypass <forbidden sources>.
+On <design contradiction / authority change / repeated ineffective repair> return the evidence and one decision question.
+If a must-ask item is open, take the conservative reading and report a spec gap.
+Report in the delivery format; stop at <completion boundary>.
 ```
 
-删除不适用的行。约束只写本次有意义的差异，不把全部仓库规则和 Skill 复制进提示。语言随用户，API/路径/字段/命令原样保持。执行统一用 `--prompt-file` 与公共插件，不从参考材料复制 `pi --no-session`、长 shell 字符串或 `| tail` 验收命令；不创建无记录的另一个 Pi 会话。
+Delete lines that do not apply; do not paste repository rules. Dispatch through `--prompt-file`.
 
-## 对接现有机器合同
+## Mapping to the contract
 
-使用 [runtime 指南](runtime.md) 和现有 `runtime/pi_phase.py` 校验器，不新造 schema/调度脚本。将规格映射到：
+Fields of `runtime/pi_phase.py`: `phaseId`, `goal`, `result`, `baseline`, `scope`, `designRef` + `designSha256` (a real worktree file), `acceptanceItems[]` (`id`, `description`, `checkId`, `command`, `passCondition`, `evidence`, optional `minRun`, `forbidSkip`), `budgetSeconds`, `commandTimeoutSeconds`, `resourceLimits`, `autonomousRepair`, `escalateWhen`. Commands must be real; an unbuilt gate is part of the deliverable, never a placeholder PASS. Check before dispatch: spec and contract share goal and boundary, inputs exist, pass conditions are falsifiable.
 
-| 规格内容 | 现有字段 |
-| --- | --- |
-| 阶段身份、目标、完整结果 | `schemaVersion: 1`、`phaseId`、`goal`、`result` |
-| 代码与设计冻结 | `baseline`、`scope`、`designRef`、`designSha256` |
-| 验收映射 | `acceptanceItems[]`: `id`、`description`、`checkId`、`command`、`passCondition`、`evidence`；计数有意义且可解析时加 `minRun`、`forbidSkip` |
-| 时间和资源预算 | `budgetSeconds`、`commandTimeoutSeconds`、`resourceLimits` |
-| 自修、回到主会话的条件 | `autonomousRepair`、`escalateWhen`；必要时 `preconditions`、`nextPhaseRef` |
-
-`designRef`必须指向工作树内真实文件，hash由文件内容计算，基线必须可解析。规格可以直接作为设计文件；复杂设计另有 authority 时引用它，不复制一份。短 brief 不宣称是机器合同。命令必须实际对应项目能力，不能为填字段发明；尚待实现的 gate 要明确归本块交付，不能占位 PASS。预算沿既有授权，返修不重置。
-
-准备完检查：**规格与合同是否同一目标/边界？输入是否实际可供给？通过条件能否被原证证伪？** 必需历史回执缺失时，不伪造空文件，也不把“缺失故障相同”写成“没有回归”。受禁数据先由获授权路径提供准确白名单和冻结包，不能自行跨越边界。可先完成独立代码与局部验证，完整验收仍保持未通过。
-
-## Pi 交付格式
+## Delivery format
 
 ```markdown
-结果：<完成待审 / 部分完成 / 阻塞>，不能自行写“主会话已验收”。
-候选：<完整commit、worktree、dirty及其归属>；任务/阶段/round：<准确身份>。
-变更：<对用户行为和事实owner的影响；必要设计取舍>。
-整合（适用时）：<准确同伴提交、组合候选、本路与组合检查范围、尚未完成的依赖>。
-验收：<验收ID → 实际命令/exit/计数 → 本轮receipt与原证 → 对应候选>。
-未完成：<缺失/失败/跳过/未知、影响、尝试过的修复及下一步所需事实>。
-证据限制：<被覆盖/哈希不符/历史版本不适用；分别保留，不冒用为当前通过>。
+Result: <ready for review / partial / blocked>; never "accepted".
+Candidate: <full commit, worktree, dirty files and owner>; task/phase/round.
+Changes: <effect on behavior and fact owners; design trade-offs>.
+Integration (if any): <peer commits, combined candidate, checks run, open dependencies>.
+Acceptance: <ID -> command, exit, counts -> receipt and evidence -> candidate>.
+Open: <missing, failed, skipped or unknown items; impact; repairs tried; facts needed>.
+Spec gaps: <must-ask items left open and the reading chosen>.
+Evidence limits: <superseded, mismatched or inapplicable evidence, kept apart>.
 ```
 
-日志和运行回执只链接不粘贴。命令退出0、Pi总结、局部PASS、相同失败名称都不能替代阶段验收。Pi报告是索引，Codex审查确切候选和原证；不每轮重读全仓、不重复已有效检查。材料有秘密时只引用获准位置，禁止打印 token、cookie 或连接串。不要默认删除临时诊断/失败证据、推送、发布或执行外部动作。
-
-## 同根因返修补充
-
-沿用上面格式，但只补本轮差异：被拒候选与验收项、共同根因、准确复现/反例、相关入口（已复现/可达未验证/排除）、修复决定、允许范围与受影响检查、仍有效的证据，以及该根因或设计变化对后续任务与依赖的影响。整任务分析、两次交付与接手责任以 [Skill](../SKILL.md) 为准，本文不重复 pin/上限或计数规则。未经新授权，不启动后继阶段。不能因主会话发现一个问题就回到逐函数指挥，也不能把未做过的检查说成已验证。
+Link logs, do not paste. Exit 0, Pi's summary or a local PASS never replace acceptance. Keep secrets out; no pushing or external action by default. A same-cause repair brief adds only the differences: rejected candidate and items, shared cause, reproduction, related entries (reproduced, reachable, excluded), fix decision, scope, affected checks, valid evidence, downstream effect.
