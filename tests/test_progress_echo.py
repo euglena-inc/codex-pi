@@ -149,6 +149,22 @@ class ProgressEchoTest(unittest.TestCase):
         status["phase"]["evidence"] = snapshot
         return card, status
 
+    def echo(self, card, status, start, wait=200, interval=600):
+        """Observe a failure at ``start`` and again ``wait`` seconds later.
+
+        Only a sustained anomaly may enqueue an echo; the first observation just
+        records it. Returns the second call's result.
+        """
+        pi_board.maybe_publish_progress(card, status, now=start, interval=interval,
+                                        anomaly_seconds=180)
+        return pi_board.maybe_publish_progress(card, status, now=start + wait,
+                                               interval=interval, anomaly_seconds=180)
+
+    def milestone_keys(self, card, prefix):
+        phases = (card.get("notify") or {}).get("phases") or {}
+        return [key for entry in phases.values() for key in entry.get("milestones", {})
+                if key.startswith(prefix)]
+
     def head(self, repo: Repo) -> str:
         return subprocess.check_output(["git", "-C", str(repo.root), "rev-parse", "HEAD"],
                                        text=True).strip()
@@ -182,62 +198,65 @@ class ProgressEchoTest(unittest.TestCase):
         self.assertEqual(self.pending(card), [])
         self.assertEqual(card["notify"]["phases"]["P1"]["count"], 0)
 
-    def test_first_verified_result_publishes_and_deduplicates(self):
+    def test_ordinary_milestone_stays_on_the_board_and_never_enqueues(self):
         card = make_card()
         status = base_status(self.checks_dir, card, items=[covered_item()])
         first = pi_board.maybe_publish_progress(card, status, now=100, interval=600,
                                                 anomaly_seconds=180)
-        self.assertIsNotNone(first["created"])
-        event = first["created"]
-        self.assertEqual(event["kind"], pi_board.PROGRESS_EVENT_KIND)
-        self.assertEqual(event["phaseId"], "P1")
-        self.assertEqual(event["contractHash"], CONTRACT)
-        self.assertEqual(event["factSource"], "verified_receipt")
-        self.assertEqual(card["notify"]["phases"]["P1"]["count"], 1)
-        again = pi_board.maybe_publish_progress(card, status, now=101, interval=600,
-                                                anomaly_seconds=180)
-        self.assertIsNone(again["created"])
-        self.assertEqual(len(self.pending(card)), 1)
-
-    def test_two_milestones_interval_merge_and_quota(self):
-        card = make_card()
-        status = base_status(self.checks_dir, card, items=[covered_item()])
-        first = pi_board.maybe_publish_progress(card, status, now=1000, interval=600,
-                                                anomaly_seconds=180)
-        event_one = first["created"]
-        self.assertIsNotNone(event_one)
-        # Within the interval a new milestone is merged into the pending packet,
-        # not queued as a second notification.
+        self.assertIsNone(first["created"])
+        self.assertIsNone(first["merged"])
+        self.assertEqual(self.pending(card), [])
+        ledger = card["notify"]["phases"]["P1"]
+        self.assertEqual(ledger["count"], 0, "ordinary milestones never spend the quota")
+        recorded = [value for key, value in ledger["milestones"].items()
+                    if key.startswith("first_result|")]
+        self.assertEqual(len(recorded), 1)
+        self.assertTrue(recorded[0]["boardOnly"])
+        self.assertEqual(recorded[0]["factSource"], "verified_receipt")
+        # check/repair self-reports with evidence are board-only too.
         checking = base_status(self.checks_dir, card, items=[covered_item()])
         checking["progress"] = {"round": 1, "activity": "checking", "step": "running tests",
                                 "evidenceRefs": ["round.checks/A1.log"], "completedCriteria": [],
                                 "updatedAt": 1200}
-        merged = pi_board.maybe_publish_progress(card, checking, now=1200, interval=600,
+        again = pi_board.maybe_publish_progress(card, checking, now=1200, interval=600,
+                                                anomaly_seconds=180)
+        self.assertIsNone(again["created"])
+        self.assertEqual(self.pending(card), [])
+        self.assertTrue(any(key.startswith("check_checking|") for key in ledger["milestones"]))
+        # The board projection shows the milestones without a queue event.
+        path = self.board_file(card)
+        refresh = pi_board.refresh_with_status(path, card["taskId"], status, now=300, block=False)
+        self.assertEqual(refresh["newEvents"], [])
+
+    def test_two_anomalies_interval_merge_and_quota(self):
+        card = make_card()
+        items = [failed_item(f"A{i}") for i in range(1, 5)]
+        status = base_status(self.checks_dir, card, items=items)
+        first = self.echo(card, status, 1000, wait=200)
+        event_one = first["created"]
+        self.assertIsNotNone(event_one)
+        self.assertEqual(event_one["evidence"]["reason"], "sustained_anomaly")
+        self.assertIn("Anomaly", event_one["question"])
+        self.assertIn("pause", event_one["question"])
+        # Within the interval a new anomaly is merged into the pending packet,
+        # not queued as a second notification.
+        merged = pi_board.maybe_publish_progress(card, status, now=1300, interval=600,
                                                  anomaly_seconds=180)
         self.assertIsNone(merged["created"])
         self.assertIsNotNone(merged["merged"])
         self.assertEqual(merged["merged"]["id"], event_one["id"])
-        self.assertIn("checking", merged["merged"]["summary"])
-        self.assertEqual(merged["merged"]["evidence"]["factSource"],
-                         "pi_self_report_unverified",
-                         "pi self-reports stay explicitly unverified in the echo")
+        self.assertIn("A2", merged["merged"]["summary"])
         self.assertEqual(card["notify"]["phases"]["P1"]["count"], 1)
-        # After the interval the next distinct milestone is a second notification.
-        repairing = base_status(self.checks_dir, card, items=[covered_item()])
-        repairing["progress"] = {"round": 1, "activity": "repairing", "step": "fixing",
-                                 "evidenceRefs": [], "completedCriteria": ["A1"],
-                                 "updatedAt": 1700}
-        second = pi_board.maybe_publish_progress(card, repairing, now=1700, interval=600,
+        # After the interval the next distinct anomaly is a second notification.
+        second = pi_board.maybe_publish_progress(card, status, now=1900, interval=600,
                                                  anomaly_seconds=180)
         event_two = second["created"]
         self.assertIsNotNone(event_two)
         self.assertNotEqual(event_two["id"], event_one["id"])
         self.assertEqual(card["notify"]["phases"]["P1"]["count"], 2)
-        self.assertEqual(len(self.pending(card)), 1, "older pending progress is superseded")
-        # A third milestone (new candidate) cannot exceed the two-notification quota.
-        third_status = base_status(self.checks_dir, card, candidate=HEAD_B, round_number=2,
-                                   items=[covered_item(candidate=HEAD_B)])
-        third = pi_board.maybe_publish_progress(card, third_status, now=2400, interval=600,
+        self.assertEqual(len(self.pending(card)), 1, "older pending echo is superseded")
+        # A third anomaly cannot exceed the two-notification quota.
+        third = pi_board.maybe_publish_progress(card, status, now=2600, interval=600,
                                                 anomaly_seconds=180)
         self.assertIsNone(third["created"])
         self.assertEqual(card["notify"]["phases"]["P1"]["count"], 2)
@@ -246,17 +265,16 @@ class ProgressEchoTest(unittest.TestCase):
     def test_quota_persists_across_a_board_round_trip(self):
         card = make_card()
         path = self.board_file(card)
-        status = base_status(self.checks_dir, card, items=[covered_item()])
-        refresh = pi_board.refresh_with_status(path, card["taskId"], status, now=100, block=False)
+        items = [failed_item("A1"), failed_item("A2")]
+        status = base_status(self.checks_dir, card, items=items)
+        pi_board.refresh_with_status(path, card["taskId"], status, now=100, block=False)
+        refresh = pi_board.refresh_with_status(path, card["taskId"], status, now=300, block=False)
         self.assertEqual(len(refresh["newEvents"]), 1)
         stored = self.read_card(path, card["taskId"])
         self.assertEqual(stored["notify"]["phases"]["P1"]["count"], 1)
         # A fresh read (restart) keeps the spend and continues with the second.
         card2 = self.read_card(path, card["taskId"])
-        status2 = base_status(self.checks_dir, card2, items=[covered_item()])
-        status2["progress"] = {"round": 1, "activity": "repairing", "step": "fix",
-                               "evidenceRefs": [], "completedCriteria": ["A1"],
-                               "updatedAt": 2000}
+        status2 = base_status(self.checks_dir, card2, items=items)
         second = pi_board.maybe_publish_progress(card2, status2, now=2000, interval=600,
                                                  anomaly_seconds=180)
         self.assertIsNotNone(second["created"])
@@ -264,37 +282,35 @@ class ProgressEchoTest(unittest.TestCase):
 
     def test_pause_suppresses_and_resume_allows(self):
         card = make_card(paused=True)
-        status = base_status(self.checks_dir, card, items=[covered_item()])
-        blocked = pi_board.maybe_publish_progress(card, status, now=100, interval=600,
-                                                  anomaly_seconds=180)
+        status = base_status(self.checks_dir, card, items=[failed_item()])
+        blocked = self.echo(card, status, 100)
         self.assertIsNone(blocked["created"])
         card["paused"] = False
-        allowed = pi_board.maybe_publish_progress(card, status, now=100, interval=600,
-                                                  anomaly_seconds=180)
+        allowed = self.echo(card, status, 100)
         self.assertIsNotNone(allowed["created"])
         # A route (interrupt) pause is equally blocking.
         route_paused = make_card(task_id="echo-route")
         path = self.board_file(route_paused, "echo-route")
         pi_board.pause_route(THREAD_A, now=1)
-        route_status = base_status(self.checks_dir, route_paused, items=[covered_item()])
-        blocked = pi_board.maybe_publish_progress(route_paused, route_status, now=100,
-                                                  interval=600, anomaly_seconds=180)
+        route_status = base_status(self.checks_dir, route_paused, items=[failed_item()])
+        blocked = self.echo(route_paused, route_status, 100)
         self.assertIsNone(blocked["created"])
         pi_board.resume_route(THREAD_A)
-        allowed = pi_board.maybe_publish_progress(route_paused, route_status, now=100,
-                                                  interval=600, anomaly_seconds=180)
+        allowed = self.echo(route_paused, route_status, 100)
         self.assertIsNotNone(allowed["created"])
         del path
 
     def test_stale_candidate_is_superseded_not_reported_as_current(self):
         card = make_card(task_id="echo-stale")
         path = self.board_file(card, "echo-stale")
-        first_status = base_status(self.checks_dir, card, items=[covered_item()])
+        first_status = base_status(self.checks_dir, card, items=[failed_item()])
         pi_board.refresh_with_status(path, "echo-stale", first_status, now=1000, block=False)
+        pi_board.refresh_with_status(path, "echo-stale", first_status, now=1200, block=False)
         self.assertEqual(len(self.pending(self.read_card(path, "echo-stale"))), 1)
         second_status = base_status(self.checks_dir, card, candidate=HEAD_B, round_number=2,
-                                    items=[covered_item(candidate=HEAD_B)])
-        refresh = pi_board.refresh_with_status(path, "echo-stale", second_status, now=1700,
+                                    items=[failed_item(candidate=HEAD_B)])
+        pi_board.refresh_with_status(path, "echo-stale", second_status, now=1800, block=False)
+        refresh = pi_board.refresh_with_status(path, "echo-stale", second_status, now=2000,
                                                block=False)
         stored = self.read_card(path, "echo-stale")
         self.assertTrue(refresh["newEvents"])
@@ -382,9 +398,8 @@ class ProgressEchoTest(unittest.TestCase):
         self.assertTrue(pi_board._verified_items(status))
         result = pi_board.maybe_publish_progress(card, status, now=100, interval=600,
                                                  anomaly_seconds=180)
-        self.assertIsNotNone(result["created"])
-        self.assertEqual(result["created"]["factSource"], "verified_receipt")
-        self.assertEqual(result["created"]["evidence"]["logVerified"], True)
+        self.assertIsNone(result["created"], "a verified milestone is board-only now")
+        self.assertTrue(self.milestone_keys(card, "first_result|"))
         # A missing log stays unknown and can never claim a verified result.
         checks_missing = self.tmp / "checks-missing"
         receipt_missing = self.run_pi_check(repo.root, checks_missing)
@@ -393,9 +408,9 @@ class ProgressEchoTest(unittest.TestCase):
                                                         "echo-real-missing")
         self.assertEqual(pi_board._verified_items(status_missing), [])
         self.assertEqual(status_missing["phase"]["evidence"]["items"][0]["status"], "unknown")
-        result_missing = pi_board.maybe_publish_progress(card_missing, status_missing, now=100,
-                                                         interval=600, anomaly_seconds=180)
-        self.assertIsNone(result_missing["created"])
+        pi_board.maybe_publish_progress(card_missing, status_missing, now=100,
+                                        interval=600, anomaly_seconds=180)
+        self.assertEqual(self.milestone_keys(card_missing, "first_result|"), [])
         # A content mismatch is not verified either.
         checks_tampered = self.tmp / "checks-tampered"
         receipt_tampered = self.run_pi_check(repo.root, checks_tampered)
@@ -405,9 +420,9 @@ class ProgressEchoTest(unittest.TestCase):
                                                           "echo-real-tampered")
         self.assertEqual(pi_board._verified_items(status_tampered), [])
         self.assertEqual(status_tampered["phase"]["evidence"]["items"][0]["status"], "unknown")
-        result_tampered = pi_board.maybe_publish_progress(card_tampered, status_tampered, now=100,
-                                                          interval=600, anomaly_seconds=180)
-        self.assertIsNone(result_tampered["created"])
+        pi_board.maybe_publish_progress(card_tampered, status_tampered, now=100,
+                                        interval=600, anomaly_seconds=180)
+        self.assertEqual(self.milestone_keys(card_tampered, "first_result|"), [])
         # A cancelled exit 0 is not a success.
         checks_cancelled = self.tmp / "checks-cancelled"
         receipt_cancelled = self.run_pi_check(repo.root, checks_cancelled)
@@ -421,10 +436,23 @@ class ProgressEchoTest(unittest.TestCase):
                                                             "echo-real-cancelled")
         self.assertEqual(pi_board._verified_items(status_cancelled), [])
         self.assertEqual(status_cancelled["phase"]["evidence"]["items"][0]["status"], "failed")
-        result_cancelled = pi_board.maybe_publish_progress(card_cancelled, status_cancelled,
-                                                           now=100, interval=600,
-                                                           anomaly_seconds=180)
-        self.assertIsNone(result_cancelled["created"])
+        pi_board.maybe_publish_progress(card_cancelled, status_cancelled, now=100,
+                                        interval=600, anomaly_seconds=180)
+        self.assertEqual(self.milestone_keys(card_cancelled, "first_result|"), [])
+
+    def test_snapshot_items_carry_exit_and_counts_for_the_card(self):
+        repo = Repo(self.tmp, name="echo-items")
+        head = self.head(repo)
+        checks = self.tmp / "checks-items"
+        self.run_pi_check(repo.root, checks)
+        _card, status = self.real_status(repo, checks, head, "echo-items")
+        item = status["phase"]["evidence"]["items"][0]
+        self.assertEqual(item["exitCode"], 0)
+        info = pi_board._delivery_info(status)
+        self.assertEqual(info["items"][0]["id"], "A1")
+        self.assertEqual(info["items"][0]["exit"], 0)
+        self.assertEqual(info["items"][0]["st"], "covered")
+        self.assertEqual(info["more"], 0)
 
     def test_unverified_receipt_never_dispatches(self):
         repo = Repo(self.tmp, name="echo-real-send")
@@ -451,8 +479,10 @@ class ProgressEchoTest(unittest.TestCase):
     def test_progress_event_uncertain_send_is_never_auto_resent(self):
         card = make_card(task_id="echo-send")
         path = self.board_file(card, "echo-send")
-        status = base_status(self.checks_dir, card, items=[covered_item()])
+        status = base_status(self.checks_dir, card, items=[failed_item()])
         pi_board.refresh_with_status(path, "echo-send", status, now=100, block=False)
+        refreshed = pi_board.refresh_with_status(path, "echo-send", status, now=300, block=False)
+        self.assertEqual(len(refreshed["newEvents"]), 1)
         calls = []
 
         def runner(argv, timeout):

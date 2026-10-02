@@ -346,23 +346,27 @@ class PhaseTest(unittest.TestCase):
             self.assertFalse(self.fake_marker.exists(),
                              "ordinary progress must never invoke the queue CLI")
             revision = json.loads((repo.state_dir / "board.json").read_text(encoding="utf-8"))["revision"]
-            # A repairing update with evidence is a real milestone; it may
-            # notify once, but repeating the identical write must not queue a
-            # second time and refresh itself never dispatches.
+            # A repairing update with evidence is a real milestone; it stays on
+            # the board ledger only (never queued), and repeating the identical
+            # write adds nothing. Refresh itself never dispatches.
             run_cli("progress", "--repo", str(worktree), "--task", "progress-task",
                     "--activity", "repairing", "--next", "retry the check", "--blocker", "",
                     env=env, expect=0)
             self.refresh(repo, "progress-task", env)
             self.assertGreater(json.loads((repo.state_dir / "board.json").read_text(encoding="utf-8"))["revision"],
                                revision)
-            milestones = self.pending(repo, "progress-task", "progress_update")
-            self.assertEqual(len(milestones), 1)
+            self.assertEqual(self.pending(repo, "progress-task", "progress_update"), [])
+            ledger = next(iter(self.card(repo, "progress-task")["notify"]["phases"].values()))
+            recorded = [key for key, value in ledger["milestones"].items()
+                        if key.startswith("check_repairing|") and value.get("boardOnly")]
+            self.assertEqual(len(recorded), 1, "the milestone is kept on the board only")
+            self.assertEqual(ledger["count"], 0)
             run_cli("progress", "--repo", str(worktree), "--task", "progress-task",
                     "--activity", "repairing", "--next", "retry the check", "--blocker", "",
                     env=env, expect=0)
             self.refresh(repo, "progress-task", env)
-            self.assertEqual(len(self.pending(repo, "progress-task", "progress_update")), 1)
-            self.assertEqual(len(self.pending(repo, "progress-task")), 1,
+            self.assertEqual(self.pending(repo, "progress-task", "progress_update"), [])
+            self.assertEqual(self.pending(repo, "progress-task"), [],
                              "repeated identical milestones must not add events")
             self.assertFalse(self.fake_marker.exists())
             # Invalid input is refused without touching evidence.
@@ -964,14 +968,17 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(card["evidence"]["candidateHead"], new_head,
                          "the short board candidate and the phase candidate share one source")
         self.assertNotEqual(card["evidence"]["candidateHead"], start_head)
-        milestones = self.pending(repo, "mid-head", "progress_update")
-        self.assertEqual(len(milestones), 1)
-        event = milestones[0]
-        self.assertEqual(event["candidate"]["head"], new_head)
-        self.assertEqual(event["evidence"]["factSource"], "verified_receipt")
-        self.assertEqual(event["evidence"]["logVerified"], True)
-        self.assertEqual(Path(event["evidence"]["receiptRef"]).name, new_receipt)
-        self.assertNotIn(old_receipt, event["evidence"]["receiptRef"])
+        self.assertEqual(self.pending(repo, "mid-head", "progress_update"), [],
+                         "a verified milestone no longer enqueues")
+        ledger = next(iter(card["notify"]["phases"].values()))
+        recorded = [(key, value) for key, value in ledger["milestones"].items()
+                    if key.startswith("first_result|")]
+        self.assertEqual(len(recorded), 1)
+        self.assertIn(new_head, recorded[0][0], "the milestone is bound to the new candidate")
+        self.assertNotIn(start_head, recorded[0][0])
+        self.assertEqual(recorded[0][1]["factSource"], "verified_receipt")
+        self.assertTrue(recorded[0][1]["boardOnly"])
+        del new_receipt, old_receipt
         repo.wait_terminal("mid-head", env=env, timeout=30)
 
     def test_active_head_probe_failure_keeps_old_evidence_out_of_board_and_queue(self):
@@ -1325,17 +1332,20 @@ class PhaseTest(unittest.TestCase):
              "--timeout-seconds", "900", "--", *shlex.split(command)], cwd=str(worktree),
             capture_output=True, text=True, env=env, timeout=60)
         self.assertEqual(check.returncode, 0, check.stderr)
-        # While the round is active the verified snapshot item produces one
-        # bounded progress echo bound to the same candidate as the board.
+        # While the round is active the verified snapshot item is recorded as a
+        # board-only milestone bound to the same candidate as the board.
         self.register(repo, "snap-task", env, transport="cli-queue", thread=THREAD_A)
         board_json("refresh", "--repo", str(repo.root), "--task", "snap-task", env=env)
         active_card = self.card(repo, "snap-task")
         self.assertEqual(active_card["phase"]["candidate"], candidate)
         self.assertEqual(active_card["evidence"]["candidateHead"], candidate)
-        milestones = self.pending(repo, "snap-task", "progress_update")
-        self.assertEqual(len(milestones), 1)
-        self.assertEqual(milestones[0]["candidate"]["head"], candidate)
-        self.assertEqual(milestones[0]["evidence"]["factSource"], "verified_receipt")
+        self.assertEqual(self.pending(repo, "snap-task", "progress_update"), [])
+        ledger = next(iter(active_card["notify"]["phases"].values()))
+        recorded = [(key, value) for key, value in ledger["milestones"].items()
+                    if key.startswith("first_result|")]
+        self.assertEqual(len(recorded), 1)
+        self.assertIn(candidate, recorded[0][0])
+        self.assertEqual(recorded[0][1]["factSource"], "verified_receipt")
         repo.wait_terminal("snap-task")
 
         def writer_free():
@@ -1365,10 +1375,14 @@ class PhaseTest(unittest.TestCase):
         card = self.card(repo, "snap-task")
         self.assertEqual(card["phase"]["candidate"], candidate)
         self.assertEqual(card["evidence"]["candidateHead"], candidate)
-        self.assertEqual(len(self.pending(repo, "snap-task", "progress_update")), 1)
+        self.assertEqual(self.pending(repo, "snap-task", "progress_update"), [],
+                         "the board-only milestone never became a queue event")
         review = self.pending(repo, "snap-task", "review_required")
         self.assertEqual(len(review), 1)
         self.assertEqual(review[0]["candidate"]["head"], candidate)
+        delivery = review[0]["delivery"]["items"]
+        self.assertEqual([(i["id"], i["st"], i["exit"]) for i in delivery],
+                         [("A1", "covered", 0)], "the card gets per-item exit evidence")
         frozen = json.loads((repo.task_dir("snap-task") / "phase.json").read_text(encoding="utf-8"))
         decided = board_json("decide", "--repo", str(repo.root), "--task", "snap-task",
                              "--event-id", review[0]["id"], "--decision", "accept",

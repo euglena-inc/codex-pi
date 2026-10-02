@@ -558,7 +558,8 @@ class LifecycleTest(unittest.TestCase):
         self.assertIn(str(repo.root.resolve()), blocked.stderr)
         self.assertEqual(snapshot_files(task_dir), before)
         # result may still read common-dir evidence from any checkout of the project.
-        result = cli_json("result", "--repo", str(worktree), "--task", "frozen", env=env)
+        result = cli_json("result", "--repo", str(worktree), "--task", "frozen", "--full",
+                          env=env)
         self.assertEqual(result["state"], "completed")
         self.assertEqual(result["repo"], str(repo.root.resolve()))
 

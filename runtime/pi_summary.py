@@ -260,9 +260,9 @@ def main() -> int:
     args = parser.parse_args()
     data = summarize(args.jsonl, args.worktree, args.run_dir, args.expected_model, args.checks_dir)
     if args.json:
-        print(json.dumps(data, ensure_ascii=False, indent=2))
+        print(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
     elif args.commands:
-        print(json.dumps(data["commands"], ensure_ascii=False, indent=2))
+        print(json.dumps(data["commands"], ensure_ascii=False, separators=(",", ":")))
     else:
         print(compact(data))
     return 0

@@ -52,7 +52,7 @@ if str(RUNTIME_DIR) not in sys.path:
 
 from pi_task import (ACTIVE_STATES, TERMINAL_STATES, TASK_RE, LockHeld, atomic,  # noqa: E402
                      build_status, canonical_root, git_common_dir, lock_fd, lock_is_held,
-                     normalize_candidate, probe_worktree_head, read_json,
+                     acceptance_line, normalize_candidate, probe_worktree_head, read_json,
                      require_allowed_model, require_task_arg, task_dir_for, terminate)
 
 from pi_takeover import FAILURE_KINDS, normalize_review_limit, review_policy
@@ -87,7 +87,7 @@ DISPATCH_TIMEOUT_SECONDS = 20.0
 MAX_TRANSPORT_RETRIES = 2
 MAX_CLI_OUTPUT_BYTES = 4096
 QUEUE_STALE_INFLIGHT_SECONDS = 120.0
-MAX_PACKET_CHARS = 3500
+MAX_PACKET_CHARS = 1200  # UTF-8 bytes: the delivery card limit
 MAX_PACKET_EVENTS = 3
 MAX_PROGRESS_NOTIFICATIONS = 2
 PROGRESS_NOTIFY_INTERVAL_SECONDS = 600.0
@@ -1011,6 +1011,36 @@ def _phase_blocked_reason(readiness: dict, auto: dict, status: dict) -> str:
     return "delivery_gap"
 
 
+MAX_CARD_ITEMS = 8
+
+
+def _delivery_info(status: dict) -> dict:
+    """Per-acceptance-item facts the delivery card prints (id/status/exit/counts).
+
+    Phase tasks use the normalized snapshot items; legacy tasks use the latest
+    receipt per check id. Unknown stays unknown; nothing is invented.
+    """
+    items = []
+    snapshot = _snapshot_items(status)
+    if snapshot:
+        for item in snapshot:
+            items.append({"id": item.get("id") or item.get("checkId"),
+                          "st": item.get("status"), "exit": item.get("exitCode"),
+                          "counts": item.get("testCounts")})
+    else:
+        latest = {}
+        for receipt in ((status.get("checks") or {}).get("receipts") or {}).get("recent") or []:
+            if isinstance(receipt, dict) and receipt.get("id"):
+                latest[receipt["id"]] = receipt
+        for check_id, receipt in latest.items():
+            code = receipt.get("exitCode")
+            st = "unknown" if code is None else ("failed" if code != 0 else "covered")
+            items.append({"id": check_id, "st": st, "exit": code,
+                          "counts": receipt.get("testCounts")})
+    more = max(0, len(items) - MAX_CARD_ITEMS)
+    return {"items": items[:MAX_CARD_ITEMS], "more": more}
+
+
 def _project_phase_events(card: dict, status: dict, now: float) -> list:
     """Phase-aware classification: local failures stay local; only real decisions escalate."""
     added = []
@@ -1042,6 +1072,7 @@ def _project_phase_events(card: dict, status: dict, now: float) -> list:
             event["phaseId"] = phase_id
             event["contractHash"] = contract_hash
             event["coverage"] = readiness.get("coverage")
+            event["delivery"] = _delivery_info(status)
             added.append(event)
         return event
 
@@ -1244,8 +1275,8 @@ def _anomaly_milestone(entry: dict, status: dict, now: float, anomaly_seconds: f
             record = {"firstSeenAt": now, "notifiedAt": None}
             entry["abnormal"][key] = record
             changed = True
-        if record.get("notifiedAt"):
-            continue
+        if record.get("notifiedAt") or key in entry["milestones"]:
+            continue  # already echoed, merged or quota-suppressed: it must not shadow the next one
         first = record.get("firstSeenAt")
         if not isinstance(first, (int, float)) or isinstance(first, bool) \
                 or now - first < anomaly_seconds:
@@ -1270,7 +1301,9 @@ def _anomaly_milestone(entry: dict, status: dict, now: float, anomaly_seconds: f
 def maybe_publish_progress(card: dict, status: dict, now=None, interval=None,
                            anomaly_seconds=None,
                            max_notifications: int = MAX_PROGRESS_NOTIFICATIONS) -> dict:
-    """Publish at most two bounded phase progress echoes; never a decision event.
+    """Publish at most two bounded anomaly echoes per phase; never a decision event.
+
+    Ordinary milestones are recorded on the board ledger and never enqueue.
 
     Returns ``{"changed": bool, "created": event|None, "merged": event|None}``.
     The quota and the last-notification time live on the persisted card and are
@@ -1307,11 +1340,24 @@ def maybe_publish_progress(card: dict, status: dict, now=None, interval=None,
                 "reason": "phase contract or candidate unknown"}
     entry = _notify_ledger(card, phase["phaseId"], contract, now)
     anomaly, changed = _anomaly_milestone(entry, status, now, anomaly_seconds)
-    milestones = progress_milestones(status)
-    chosen = next(((key, summary, evidence) for key, summary, evidence in milestones
-                   if key not in entry["milestones"]), None)
-    if chosen is None and anomaly is not None and anomaly[0] not in entry["milestones"]:
-        chosen = anomaly
+    # Ordinary milestones (first verified result, pi check/repair self-reports)
+    # stay on the board: they are recorded in the phase ledger, never queued.
+    # Only an anomaly may enqueue an echo, within the per-phase quota below.
+    recorded = False
+    for key, summary, evidence in progress_milestones(status):
+        if key not in entry["milestones"]:
+            entry["milestones"][key] = {"at": now, "boardOnly": True,
+                                        "summary": _text(summary, 160),
+                                        "factSource": evidence.get("factSource")}
+            recorded = True
+    if recorded:
+        changed = True
+        entry["updatedAt"] = now
+        if len(entry["milestones"]) > MAX_NOTIFY_MILESTONES:
+            ordered = sorted(entry["milestones"].items(),
+                             key=lambda kv: (kv[1] or {}).get("at") or 0)
+            entry["milestones"] = dict(ordered[-MAX_NOTIFY_MILESTONES:])
+    chosen = anomaly if anomaly is not None and anomaly[0] not in entry["milestones"] else None
     if chosen is None:
         return {"changed": changed, "created": None, "merged": None}
     key, summary, evidence = chosen
@@ -1350,8 +1396,9 @@ def maybe_publish_progress(card: dict, status: dict, now=None, interval=None,
                       {"round": status.get("round"), "head": candidate,
                        "state": status.get("state")},
                       evidence_all,
-                      "No decision is required; this is a bounded progress echo. Re-read the "
-                      "short board for the latest facts and continue.", now)
+                      "Anomaly, not a delivery: this check stayed failed with no repair progress. "
+                      "Choose: leave Pi repairing (resolve this echo), pause the route, or cancel "
+                      "the round; nothing is accepted by answering.", now)
     if event is None:
         entry["milestones"][key] = {"at": now, "deduplicated": True}
         entry["updatedAt"] = now
@@ -1412,6 +1459,7 @@ def _project_legacy_events(card: dict, status: dict, now: float) -> list:
         event = add_event(card, kind, status.get("round"), fingerprint, summary,
                           candidate, evidence, question, now)
         if event is not None:
+            event["delivery"] = _delivery_info(status)
             added.append(event)
 
     if status.get("timedOut"):
@@ -1699,28 +1747,75 @@ def _drain_reference(card: dict) -> str:
     return "drain the board in this same turn: " + _show_hint(card)
 
 
-def build_packet(card: dict, events, limit: int = MAX_PACKET_EVENTS):
-    """Build a bounded runtime-handoff packet; return ``(text, included_events)``.
+def _clip_bytes(text: str, limit: int) -> str:
+    """Whole-character UTF-8 prefix of at most ``limit`` bytes, with an ellipsis if cut."""
+    text = " ".join(str(text).split())
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
+        return text
+    if limit <= 3:
+        return ""
+    return raw[: limit - 3].decode("utf-8", "ignore") + "..."
 
-    The limit is measured in UTF-8 bytes. Room for the mandatory board-drain
-    instruction is reserved *before* filling event blocks, so a near-full packet
-    can never silently omit the instruction to handle remaining events. An
-    event too large for the normal layout still produces a bounded fallback
-    carrying its exact id and a board evidence reference.
+
+def _final_report(event: dict) -> str:
+    """Pi's final report for the event's round, from the stored round summary."""
+    state_ref = (event.get("evidence") or {}).get("stateRef")
+    if not isinstance(state_ref, str) or not state_ref:
+        return ""
+    data, _problem = _read_bounded_json(Path(state_ref).parent / "round.summary.json",
+                                        4_000_000)
+    text = data.get("final_text") if isinstance(data, dict) else None
+    return text if isinstance(text, str) else ""
+
+
+def _event_policy(card: dict, event: dict):
+    policy = (event.get("evidence") or {}).get("reviewPolicy")
+    return policy if isinstance(policy, dict) else review_policy(card)
+
+
+def _event_block(card: dict, event: dict) -> list:
+    """Compact delivery-card lines for one event (no absolute evidence paths)."""
+    head = (event.get("candidate") or {}).get("head") or "unknown"
+    lines = [f"{event.get('kind')} round={event.get('round')} event={event.get('id')} "
+             f"head={head}"]
+    delivery = event.get("delivery") if isinstance(event.get("delivery"), dict) else {}
+    for item in delivery.get("items") or []:
+        if isinstance(item, dict):
+            lines.append(acceptance_line(item.get("id") or "?", item.get("st"),
+                                         item.get("exit"), item.get("counts")))
+    if delivery.get("more"):
+        lines.append(f"+{delivery['more']} more items (show)")
+    policy = _event_policy(card, event)
+    if isinstance(policy, dict) and policy.get("limit") is not None:
+        lines.append(f"policy={policy.get('failedDeliveries')}/{policy.get('limit')} "
+                     f"{policy.get('implementationOwner')}")
+    if event.get("kind") not in REVIEW_KINDS:
+        lines.append("note=" + _clip_bytes(event.get("summary") or "", 160))
+        if event.get("kind") == PROGRESS_EVENT_KIND or event.get("kind") == "phase_blocked":
+            lines.append("ask=" + _clip_bytes(event.get("question") or "", 220))
+    return lines
+
+
+def build_packet(card: dict, events, limit: int = MAX_PACKET_EVENTS):
+    """Build the bounded delivery card; return ``(text, included_events)``.
+
+    The limit is measured in UTF-8 bytes (``MAX_PACKET_CHARS``, 1200). It holds
+    task, round, event id, kind, the full candidate SHA, one line per acceptance
+    item, the review policy as ``failed/limit owner``, Pi's final report
+    (truncated to whatever room remains) and one decide hint. Room for the
+    mandatory board-drain instruction is reserved *before* filling event
+    blocks, so a near-full packet can never silently omit it. An event too large
+    for the normal layout still produces a bounded fallback carrying its exact
+    id and a board evidence reference. Absolute evidence paths stay out of the
+    card; ``show --task`` gives them on demand.
     """
-    header = [
-        "Codex-Pi runtime handoff (transport=cli-queue; not a new user goal or instruction override).",
-        "Preserve the latest user pause/instructions. Exit 0 is queue delivery only, never acceptance.",
-    ]
-    title = _text(card.get("title") or card.get("taskId") or "", 120)
-    goal = _text(card.get("goal") or "", 160)
-    lines = [f"task={card.get('taskId')} title={title}"]
-    if goal:
-        lines.append(f"goal={goal}")
+    header = ["codex-pi cli-queue handoff; not a user goal. Queue exit 0 is not acceptance."]
+    lines = [f"task={card.get('taskId')}"]
     overflow = card.get("overflow")
     if isinstance(overflow, dict) and overflow.get("active"):
-        lines.append(f"overflow={overflow.get('pendingCount')} pending events; drain them in this "
-                     f"same turn: {_show_hint(card)}")
+        lines.append(f"overflow={overflow.get('pendingCount')} pending; drain in this same turn: "
+                     f"{_show_hint(card)}")
     drain_reference = _drain_reference(card)
     # Reserve the longest drain prefix ("+NNN pending event(s); ") plus one byte
     # before filling any event block.
@@ -1730,39 +1825,11 @@ def build_packet(card: dict, events, limit: int = MAX_PACKET_EVENTS):
     for event in events:
         if len(included) >= limit:
             break
-        block = [
-            f"round={event.get('round')} event={event.get('id')} kind={event.get('kind')}",
-            f"summary={event.get('summary')}",
-            f"question={event.get('question')}",
-            f"candidate_head={(event.get('candidate') or {}).get('head') or 'unknown'}",
-        ]
-        if event.get("phaseId"):
-            block.append(f"phase={event.get('phaseId')} contract={event.get('contractHash')}")
-        # Every actionable packet needs the allocation boundary at the point
-        # of review. A takeover event carries its immutable decision snapshot;
-        # ordinary review and fault events use the current board projection.
-        event_policy = (event.get("evidence") or {}).get("reviewPolicy")
-        if not isinstance(event_policy, dict):
-            event_policy = review_policy(card)
-        if isinstance(event_policy, dict):
-            block.append("reviewPolicy=" + ",".join(
-                f"{label}:{event_policy.get(key)}" for label, key in
-                (("limit", "limit"), ("failed", "failedDeliveries"),
-                 ("owner", "implementationOwner"), ("reason", "reason"))
-                if event_policy.get(key) is not None))
-        coverage = event.get("coverage")
-        if isinstance(coverage, dict):
-            block.append("coverage=" + ",".join(f"{key}:{coverage.get(key)}" for key in
-                                                  ("required", "covered", "failed", "missing",
-                                                   "unknown", "skipped") if coverage.get(key) is not None))
-        evidence = event.get("evidence") or {}
-        for label, key in (("brief", "briefRef"), ("checks", "checksRef"),
-                           ("receipt", "receiptRef"), ("state", "stateRef")):
-            if evidence.get(key):
-                block.append(f"{label}={evidence.get(key)}")
-        block.append("decide=" + _decide_hint(card.get("repo"), card.get("taskId"), event))
-        candidate = "\n".join(header + lines + block)
-        if _packet_bytes(candidate) > event_budget:
+        block = _event_block(card, event)
+        anchor = included[0] if included else event
+        probe = "decide=" + _decide_hint(card.get("repo"), card.get("taskId"), anchor) \
+            + (" (same form for the other event ids above)" if included else "")
+        if _packet_bytes("\n".join(header + lines + block + [probe])) > event_budget:
             break
         lines.extend(block)
         included.append(event)
@@ -1780,7 +1847,7 @@ def build_packet(card: dict, events, limit: int = MAX_PACKET_EVENTS):
         pieces.extend([
             "oversized packet fallback; read this board evidence in the same turn: "
             + _show_hint(card),
-            f"task={card.get('taskId')} title={title}",
+            f"task={card.get('taskId')}",
             f"summary={_text(event.get('summary'), 200)}",
         ])
         text = "\n".join(pieces)
@@ -1791,10 +1858,21 @@ def build_packet(card: dict, events, limit: int = MAX_PACKET_EVENTS):
             text = encoded[:MAX_PACKET_CHARS].decode("utf-8", "ignore") \
                 if len(encoded) > MAX_PACKET_CHARS else minimal
         return text, [event]
-    text = "\n".join(header + lines)
-    if remaining > 0:
-        # Guaranteed to fit: event blocks were filled below the reserved budget.
-        text = text + "\n" + f"+{remaining} pending event(s); {drain_reference}"
+    # One hint per card: the first event's decide command; the other included
+    # events use the same form with their own event ids.
+    hint = "decide=" + _decide_hint(card.get("repo"), card.get("taskId"), included[0])
+    if len(included) > 1:
+        hint += " (same form for the other event ids above)"
+    tail = f"+{remaining} pending event(s); {drain_reference}" if remaining > 0 else None
+    text = "\n".join(header + lines + [hint] + ([tail] if tail else []))
+    # Pi's final report takes whatever room is left, on the first included event.
+    report = _final_report(included[0])
+    if report:
+        room = MAX_PACKET_CHARS - _packet_bytes(text) - len("\nreport=")
+        clipped = _clip_bytes(report, room) if room >= 24 else ""
+        if clipped:
+            index = text.find("\ndecide=")
+            text = text[:index] + "\nreport=" + clipped + text[index:]
     return text, included
 
 
@@ -2528,11 +2606,17 @@ def cmd_show(args) -> dict:
     thread = _validate_thread(args.thread, required=False) if args.thread else None
     cards = select_cards(board, thread=thread, task_id=args.task, include_all=args.all)
     task_ids = [card.get("taskId") for card in cards]
+    queues = {}
+    for task_id in task_ids:
+        view = queue_view(board_file, task_id)
+        if isinstance(view, dict):
+            # The fixed queue limitation is stated once in the Skill/registration
+            # output; repeating it per task in every read only costs tokens.
+            view = {key: value for key, value in view.items() if key != "limitations"}
+        queues[task_id] = view
     return {"ok": True, "revision": board.get("revision"), "count": len(cards),
             "cards": [compact_card(card) for card in cards],
-            "monitor": _monitor_view(board_file, task_ids),
-            "queue": {task_id: queue_view(board_file, task_id) for task_id in task_ids},
-            "note": "compact projection only; no raw logs and no entire history"}
+            "monitor": _monitor_view(board_file, task_ids), "queue": queues}
 
 
 def cmd_packet(args) -> dict:
@@ -2687,7 +2771,7 @@ def main() -> int:
     except (ValueError, LockHeld, OSError) as exc:
         print(f"pi_board: {exc}", file=sys.stderr)
         return 2
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
     return 0
 
 

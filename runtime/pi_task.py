@@ -1547,6 +1547,8 @@ def evaluate_acceptance_items(contract: dict, candidate_head, checks: dict, chec
             entry["logRef"] = str(checks_dir / newest["log"])
             entry["evidenceLevel"] = "receipt_metadata"
             counts = newest.get("testCounts")
+            entry["exitCode"] = newest.get("exitCode")
+            entry["testCounts"] = counts if isinstance(counts, dict) else None
             contract_status, contract_reason = _receipt_contract_violation(spec, contract, newest)
             if contract_status is not None:
                 entry.update(status=contract_status, reason=contract_reason,
@@ -3634,9 +3636,9 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
     processes = {"taskLockHeld": task_held, "supervisorLeaseHeld": supervisor_alive}
     for key in ("supervisorPid", "piPid"):
         processes[key] = _pid_value(state.get(key))
-    notes = ["status is a bounded read-only snapshot; it generates no summary and parses no transcript",
-             "process existence and quiet logs are never progress or failure",
-             "exit 0 means the Pi process completed execution only; acceptance stays not_verified"]
+    # Fixed explanatory notes (exit 0 is not acceptance, activity is not progress)
+    # live once in the Skill and in ``result``; status only carries conditional facts.
+    notes = []
     if raw_state in ACTIVE_STATES and not supervisor_alive:
         notes.append("the recorded state is active but no supervisor lease is held; ownership is "
                     "unknown, not progress")
@@ -3722,9 +3724,6 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
                                          selected_number)
         notes.append(f"phase contract state is {phase_problem}; phase readiness is unknown")
     progress = read_progress(selected_dir)
-    if progress is not None:
-        notes.append("progress is Pi's self-report; it is separate from supervisor observation and "
-                     "check receipts and is never acceptance")
     return {
         "schemaVersion": 1, "task": task, "repo": frozen.get("repo") or str(root),
         "worktree": frozen.get("worktree"), "readOnly": bool(frozen.get("readOnly")),
@@ -3818,8 +3817,69 @@ def build_result(repo_arg: str, task_arg: str, round_arg=None) -> dict:
     }
 
 
+def acceptance_line(check_id, status, exit_code=None, counts=None) -> str:
+    """One compact evidence line shared by the delivery card and ``result``.
+
+    ``<id> exit=<n> run=.. pass=.. fail=.. skip=..`` for a check with a known
+    exit code; ``<id> missing`` / ``<id> unknown`` when there is no usable
+    receipt. A known non-covered status is appended in brackets.
+    """
+    check_id = str(check_id)[:60]
+    if status == "missing":
+        return f"{check_id} missing"
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        return f"{check_id} {status if status in ('failed', 'skipped') else 'unknown'}"
+    parts = [check_id, f"exit={exit_code}"]
+    if isinstance(counts, dict):
+        for key in VALID_COUNT_KEYS:
+            value = counts.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                parts.append(f"{key}={value}")
+    if status in ("failed", "skipped"):
+        parts.append(f"[{status}]")
+    return " ".join(parts)
+
+
+COMPACT_FINAL_CHARS = 1200
+
+
+def compact_result(full: dict) -> dict:
+    """Default ``result`` view derived from the full shape (``--full`` keeps it)."""
+    summary = full.get("summary") if isinstance(full.get("summary"), dict) else None
+    checks = []
+    if summary is not None:
+        for receipt in ((summary.get("checks") or {}).get("receipts") or []):
+            code = receipt.get("exit_code")
+            status = "unknown" if code is None else ("failed" if code != 0 else "covered")
+            checks.append(acceptance_line(receipt.get("id") or "?", status, code,
+                                          receipt.get("test_counts")))
+        if (summary.get("checks") or {}).get("total") == 0:
+            checks = ["no check receipts recorded (missing evidence)"]
+    selected = next((item for item in full.get("rounds") or []
+                     if item.get("round") == full.get("round")), {})
+    notes = [note for note in full.get("notes") or []
+             if isinstance(note, str) and not note.startswith("acceptance requires")]
+    view = {
+        "schemaVersion": 1, "view": "compact", "task": full.get("task"),
+        "round": full.get("round"), "latestRound": full.get("latestRound"),
+        "state": full.get("state"), "exitCode": full.get("exitCode"),
+        "timedOut": full.get("timedOut"), "cancelled": full.get("cancelled"),
+        "execution": full.get("execution"), "acceptance": full.get("acceptance"),
+        "candidateHead": selected.get("endHead"), "model": full.get("model"),
+        "usage": (summary or {}).get("usage"), "usageComplete": full.get("usageComplete"),
+        "costUsd": (summary or {}).get("reported_cost_usd"),
+        "checks": checks,
+        "final": ((summary or {}).get("final_excerpt") or "")[:COMPACT_FINAL_CHARS],
+        "evidence": {"roundDir": (full.get("evidence") or {}).get("roundDir"),
+                     "summaryJson": (full.get("evidence") or {}).get("summaryJson")},
+        "notes": notes, "more": "result --full returns the complete shape",
+    }
+    return view
+
+
 def cmd_result(args) -> dict:
-    return build_result(args.repo, args.task, args.round)
+    full = build_result(args.repo, args.task, args.round)
+    return full if args.full else compact_result(full)
 
 
 def cmd_status(args) -> dict:
@@ -3843,10 +3903,9 @@ def cmd_wait(args) -> dict:
             break
         time.sleep(min(0.3, max(0.05, deadline - time.monotonic())))
     wait = {"timeoutMs": timeout_ms, "timedOut": timed_out,
-            "note": "waiting never cancels the worker; repeat bounded waits only when needed",
-            "instruction": ("repeat short bounded waits only when needed; process user steering between "
-                            "calls; avoid verbose unchanged narration; collect the full result once when "
-                            "the round is delivered")}
+            "note": "waiting never cancels the worker; this command is a diagnostic only",
+            "instruction": ("do not call wait again: end the turn and let the supervisor's queue "
+                            "event deliver the result; read result once after that event")}
     if state in TERMINAL_STATES:
         result = build_result(args.repo, args.task, args.round)
         result["wait"] = wait
@@ -4110,6 +4169,8 @@ def build_parser() -> argparse.ArgumentParser:
     result = sub.add_parser("result", help="bounded latest state and evidence pointers")
     add_repo_task(result)
     result.add_argument("--round", type=int)
+    result.add_argument("--full", action="store_true",
+                        help="previous full shape (per-round evidence, summaryText); default is compact")
     result.set_defaults(func=cmd_result)
 
     status = sub.add_parser("status", help="fast read-only round/check snapshot (no summary generation)")
@@ -4189,7 +4250,7 @@ def main() -> int:
             except OSError:
                 pass
     result = args.func(args)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
     return 0
 
 

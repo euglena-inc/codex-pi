@@ -14,13 +14,13 @@ The Pi execution path starts only Pi. The opted-in board transport invokes only 
 python3 runtime/pi_task.py project  --repo <path-inside-project>
 python3 runtime/pi_task.py start    --repo <path> --task <id> --worktree <linked-checkout> --prompt-file <brief>
 python3 runtime/pi_task.py continue --repo <path> --task <id> --prompt-file <follow-up>
-python3 runtime/pi_task.py result   --repo <path> --task <id> [--round N]
+python3 runtime/pi_task.py result   --repo <path> --task <id> [--round N] [--full]
 python3 runtime/pi_task.py wait     --repo <path> --task <id> [--round N] [--timeout-ms 60000]
 python3 runtime/pi_task.py cancel   --repo <path> --task <id>
 python3 runtime/pi_task.py --help
 ```
 
-Every command prints one JSON object to stdout and exits non-zero with an
+Every command prints one single-line compact JSON object to stdout (`result` is a compact view unless `--full`) and exits non-zero with an
 actionable stderr message on error. `PI_BIN` overrides the Pi executable (test
 double or explicit path only). Helpers used by the Pi worker are
 `runtime/pi_summary.py` and `runtime/pi_check.py`.
@@ -42,7 +42,7 @@ double or explicit path only). Helpers used by the Pi worker are
 
 ## Host continuation
 
-`pi_board.py` projects bounded execution/check evidence into a shared local board. The existing Pi supervisor refreshes it roughly every 15 seconds and on terminal exit. It enqueues only actionable events to the exact registered desktop task UUID. Idle delivery starts a turn; busy delivery waits for the current turn to end. A local observation does not call a model. A real owner turn still loads its normal context.
+`pi_board.py` projects bounded execution/check evidence into a shared local board. The existing Pi supervisor refreshes it roughly every 15 seconds and on terminal exit. It enqueues only actionable events (a delivery card of at most 1200 UTF-8 bytes; ordinary progress milestones stay on the board) to the exact registered desktop task UUID. Idle delivery starts a turn; busy delivery waits for the current turn to end. A local observation does not call a model. A real owner turn still loads its normal context.
 
 Event content and main decisions are distinct from queue claims. Claims use a short file lock, released before the bounded CLI invocation. A confirmed send is not repeatedly sent while review is pending. An ambiguous post-spawn failure is uncertain, requiring explicit recovery; the queue has no caller idempotency key. Pause and uncertain delivery are visible through compact recovery evidence. Short hooks provide interruption/recovery and suppress overlapping legacy Stop notifications for a board route; no synchronous hook waiting or heartbeat is required.
 

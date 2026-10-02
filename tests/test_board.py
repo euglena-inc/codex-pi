@@ -292,13 +292,14 @@ class BoardTest(unittest.TestCase):
         self.assertTrue(Path(result["queuePath"]).exists())
         self.assertTrue(Path(result["routePath"]).is_file())
         self.assertTrue(result["limitations"])
-        self.assertIn("runtime handoff", packet)
-        self.assertIn("never acceptance", packet)
-        self.assertIn("title=Queue task", packet)
-        self.assertIn("goal=Deliver the queue event", packet)
+        self.assertIn("handoff", packet)
+        self.assertIn("not acceptance", packet)
+        self.assertIn("task=board-queue", packet)
         self.assertIn("review_required", packet)
-        self.assertIn("candidate_head=", packet)
+        self.assertRegex(packet, r"head=[0-9a-f]{40}")
+        self.assertIn("policy=0/2 pi", packet)
         self.assertIn("decide=python3", packet)
+        self.assertLessEqual(len(packet.encode("utf-8")), 1200, "the delivery card limit")
         card = self.card(repo, "board-queue")
         self.assertFalse(card["events"][0]["handled"], "queueing is not handling")
         self.assertEqual(card["codex"]["review"], "pending")
@@ -955,14 +956,14 @@ class BoardTest(unittest.TestCase):
                                              {"round": 3, "head": None},
                                              {"guardPath": "p"}, "q" * 300, index))
         original = pi_board.MAX_PACKET_CHARS
-        pi_board.MAX_PACKET_CHARS = 2000
+        pi_board.MAX_PACKET_CHARS = 700
         try:
             text, included = pi_board.build_packet(card, events)
         finally:
             pi_board.MAX_PACKET_CHARS = original
         self.assertGreaterEqual(len(included), 1)
         self.assertLess(len(included), 4, "the byte boundary must omit at least one event")
-        self.assertLessEqual(len(text), pi_board.MAX_PACKET_CHARS)
+        self.assertLessEqual(len(text.encode("utf-8")), 700)
         for event in included:
             self.assertIn(event["id"], text)
         omitted = [event for event in events if event not in included]

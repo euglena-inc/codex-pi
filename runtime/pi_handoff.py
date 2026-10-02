@@ -1164,7 +1164,7 @@ def main() -> int:
     except (ValueError, LockHeld, OSError) as exc:
         print(f"pi_handoff: {exc}", file=sys.stderr)
         return 2
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
     return 0
 
 
