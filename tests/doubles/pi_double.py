@@ -107,7 +107,8 @@ def write_ready() -> None:
     round_dir = Path(json.loads(Path(config).read_text(encoding="utf-8"))["roundDir"])
     target = round_dir / "worker.ready"
     temp = target.with_suffix(".tmp")
-    temp.write_text(json.dumps({"piVersion": "1.0.0", "pid": os.getpid(), "at": time.time()}))
+    temp.write_text(json.dumps({"piVersion": "1.0.0", "pid": os.getpid(), "at": time.time(),
+                                    "codemode": True}))
     os.replace(temp, target)
 
 

@@ -92,7 +92,7 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(recorded[0]["sessionId"], "alpha")
         self.assertEqual(recorded[0]["model"], "deepseek/deepseek-flash")
         self.assertEqual(recorded[0]["thinking"], "max")
-        self.assertEqual(recorded[0]["tools"], "read,write,edit,bash,check,progress,readiness")
+        self.assertEqual(recorded[0]["tools"], "read,write,edit,bash,check,progress,readiness,codemode")
         self.assertTrue(recorded[0]["noExtensions"] and recorded[0]["noSkills"]
                         and recorded[0]["noPromptTemplates"])
         self.assertFalse(recorded[0]["noContextFiles"], "AGENTS.md discovery must stay enabled")
@@ -107,7 +107,7 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(result["state"], "completed")
         self.assertTrue(json.loads((repo.task_dir("ro") / "task.json").read_text())["readOnly"])
         recorded = json.loads(trace.read_text().splitlines()[0])
-        self.assertEqual(recorded["tools"], "read,grep,find,ls,check,progress,readiness")
+        self.assertEqual(recorded["tools"], "read,grep,find,ls,check,progress,readiness,codemode")
         self.assertIn("read-only", (repo.task_dir("ro") / "rounds" / "1" / "contract.md").read_text())
 
     def test_project_selected_newapi_model_is_pinned_and_passed_to_pi(self):

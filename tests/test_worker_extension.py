@@ -91,10 +91,21 @@ class LoadAndGuardTest(ExtensionCase):
     def test_load_writes_the_ready_marker_and_registers_everything(self):
         out = self.run_steps([{"op": "registered"}])
         ready = json.loads((self.round_dir / "worker.ready").read_text())
-        self.assertEqual(sorted(ready), ["at", "piVersion", "pid"])
+        self.assertEqual(sorted(ready), ["at", "codemode", "piVersion", "pid"])
+        self.assertIs(ready["codemode"], True)
         self.assertIsInstance(ready["pid"], int)
-        self.assertEqual(out[0]["tools"], ["check", "progress", "readiness"])
+        self.assertEqual(out[0]["tools"], ["check", "codemode", "progress", "readiness"])
         self.assertEqual(out[0]["events"], ["agent_before_settle", "before_agent_start", "tool_call"])
+
+    def test_missing_codemode_export_writes_no_marker_and_blocks_every_call(self):
+        out = self.run_steps([{"op": "registered"},
+                              self.call("read", path=str(self.worktree / "a"))],
+                             env={"PI_STUB_UNAVAILABLE": "1",
+                                  "CODEX_PI_WORKER_CONFIG": str(self.tmp / "worker.json")})
+        self.assertFalse((self.round_dir / "worker.ready").exists())
+        self.assertEqual(out[0]["tools"], ["check", "progress", "readiness"])
+        self.assertTrue(out[1]["blocked"])
+        self.assertIn("undecidable", out[1]["reason"])
 
     def test_missing_config_writes_no_marker_and_blocks_every_call(self):
         out = self.run_steps([self.call("read", path=str(self.worktree / "a")),
@@ -192,6 +203,51 @@ class LoadAndGuardTest(ExtensionCase):
             self.assertEqual(entry["sections"], {"codex_pi_worker": "CONTRACT TEXT"})
 
 
+class CodemodeGuardTest(ExtensionCase):
+    def test_omitted_options_get_the_bounded_default_and_output_budget(self):
+        out = self.run_steps([self.call("codemode", code="return 1;")])[0]
+        self.assertFalse(out["blocked"], out)
+        self.assertEqual(out["input"]["code"],
+                         '// @options: {"max_output_tokens":10000,"timeout_ms":30000}\nreturn 1;')
+
+    def test_requested_options_are_honored_and_clamped(self):
+        code = '// @options: {"timeout_ms": 45000, "max_output_tokens": 500}\nreturn 1;'
+        out = self.run_steps([self.call("codemode", code=code)])[0]
+        self.assertFalse(out["blocked"], out)
+        self.assertEqual(out["input"]["code"],
+                         '// @options: {"max_output_tokens":500,"timeout_ms":45000}\nreturn 1;')
+        huge = '// @options: {"timeout_ms": 999999999, "max_output_tokens": 999999}\nreturn 1;'
+        out = self.run_steps([self.call("codemode", code=huge)])[0]
+        self.assertFalse(out["blocked"], out)
+        self.assertEqual(out["input"]["code"],
+                         '// @options: {"max_output_tokens":10000,"timeout_ms":120000}\nreturn 1;')
+
+    def test_invalid_options_or_sources_fail_closed(self):
+        codes = ["", "   ", "// @options: {not json}\nreturn 1;",
+                 '// @options: {"unknown": 1}\nreturn 1;',
+                 '// @options: {"timeout_ms": 0}\nreturn 1;',
+                 '// @options: {"timeout_ms": 1.5}\nreturn 1;',
+                 '// @options: {"max_output_tokens": -1}\nreturn 1;',
+                 '// @options: {"timeout_ms": 1000}']
+        out = self.run_steps([self.call("codemode", code=code) for code in codes])
+        for entry in out:
+            self.assertTrue(entry["blocked"], entry)
+        self.assertEqual({r["rule"] for r in self.blocks()}, {"undecidable"})
+
+    def test_code_text_is_not_scanned_for_forbidden_paths(self):
+        code = f"return {json.dumps(str(self.main / 'secret.txt'))};"
+        out = self.run_steps([self.call("codemode", code=code)])[0]
+        self.assertFalse(out["blocked"], out)
+
+    def test_nested_codemode_and_non_string_code_are_blocked(self):
+        nested = self.call("codemode", code="return 1;")
+        nested["parentToolCallId"] = "call-1"
+        out = self.run_steps([nested, self.call("codemode", code=7), self.call("codemode")])
+        for entry in out:
+            self.assertTrue(entry["blocked"], entry)
+            self.assertIn("undecidable", entry["reason"])
+
+
 class StubMixin:
     def stub_tools(self, readiness):
         """Replace pi_task.py with a stub that records its argv and prints scripted JSON."""
@@ -283,6 +339,47 @@ class NativeToolsTest(StubMixin, ExtensionCase):
         self.assertIn("--completed-criteria", progress)
         self.assertEqual(progress[progress.index("--evidence-ref") + 1], "r.md")
         self.assertEqual(readiness[0], "readiness")
+
+
+class StructuredResultTest(StubMixin, ExtensionCase):
+    PY = f"{sys.executable}"
+
+    def tool(self, name, **params):
+        return self.run_steps([{"op": "tool", "name": name, "params": params}])[0]
+
+    def test_check_success_and_failure_carry_explicit_structured_results(self):
+        ok = self.tool("check", id="s1", command=f"{self.PY} -c pass")
+        self.assertNotIn("isError", ok)
+        self.assertEqual(ok["structuredContent"]["ok"], True)
+        self.assertEqual(ok["structuredContent"]["exit_code"], 0)
+        self.assertIsNone(ok["structuredContent"]["error"])
+        bad = self.tool("check", id="s2", command=f"{self.PY} -c \"raise SystemExit(3)\"")
+        self.assertTrue(bad["isError"])
+        self.assertEqual(bad["structuredContent"]["ok"], False)
+        self.assertEqual(bad["structuredContent"]["exit_code"], 3)
+        self.assertTrue(bad["structuredContent"]["error"])
+
+    def test_progress_and_readiness_structured_semantics(self):
+        self.stub_tools({"status": "not_ready", "readinessReason": "missing",
+                         "coverage": {"required": 2}, "gaps": [{"id": "A", "status": "missing"}]})
+        progress = self.tool("progress", activity="checking")
+        self.assertNotIn("isError", progress)
+        self.assertEqual(progress["structuredContent"]["ok"], True)
+        self.assertEqual(progress["structuredContent"]["activity"], "checking")
+        self.assertEqual(progress["structuredContent"]["code"], 0)
+        readiness = self.tool("readiness")
+        self.assertNotIn("isError", readiness)
+        self.assertEqual(readiness["structuredContent"]["ok"], True)
+        self.assertEqual(readiness["structuredContent"]["status"], "not_ready")
+        self.assertEqual(readiness["structuredContent"]["gaps"], [{"id": "A", "status": "missing"}])
+        (self.tools / "pi_task.py").write_text("raise SystemExit(5)\n")
+        failed = self.tool("progress", activity="blocked")
+        self.assertTrue(failed["isError"])
+        self.assertEqual(failed["structuredContent"]["ok"], False)
+        self.assertEqual(failed["structuredContent"]["code"], 5)
+        unavailable = self.tool("readiness")
+        self.assertTrue(unavailable["isError"])
+        self.assertEqual(unavailable["structuredContent"]["ok"], False)
 
 
 class SettleTest(StubMixin, ExtensionCase):

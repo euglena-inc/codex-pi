@@ -42,7 +42,8 @@ def compose_brief(task: dict, round_number: int, prompt: str, prior: dict | None
              "every round of this session."]
     if round_number > 1:
         lines.append(f"Round-1 brief: {task_dir / 'rounds' / '1' / 'brief.md'}")
-    lines += ["Use the native tools `check` (recorded checks), `progress` and `readiness`.",
+    lines += ["Use the native tools `check` (recorded checks), `progress`, `readiness` and "
+              "`codemode` (batch independent reads/checks; nested calls are guarded).",
               f'Only "{tools_dir}" and "{round_dir / "round.checks"}" may be written '
               "outside the worktree.",
               FORBIDDEN_RULE_TEXT]
@@ -135,6 +136,14 @@ def compose_contract(task: dict) -> str:
         "- progress(activity, step?, next?, blocker?, completedCriteria?, evidenceRefs?): "
         "self-reported progress, never acceptance.",
         "- readiness(): read-only delivery check of the contract against the receipts.",
+        "- codemode(code): run JavaScript in the QuickJS sandbox. `tools.<name>(args)` calls the "
+        "same guarded tools; every nested call passes the same guard and a blocked call rejects. "
+        "Use `Promise.allSettled` to batch independent reads and checks, filter large output before "
+        "it reaches you, and await every call. Inspect the structured result (for example a failed "
+        "check still fulfils with exit/timeout data); resolve is not success. Parallel checks need "
+        "independent resources and unique ids; serialize dependent writes and commits. Only a "
+        "successful script keeps its `store`/`load` values, and completed calls are not undone. "
+        "Codemode does not make the shell guard an OS sandbox.",
         "Every bash call has a finite timeout (a default is filled in and a ceiling clamps larger "
         "values). Close fixtures with try/finally; a catch-and-print is not verification.",
         f'Only "{tools_dir}" and this round\'s checks directory may be written outside '

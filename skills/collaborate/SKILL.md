@@ -11,7 +11,7 @@ This Skill is the single authority for roles, model policy, the whole-task analy
 
 - The existing Codex main task designs, dispatches, reviews and, at the limit, implements; Pi implements. No extra Codex agent, nested model or automatic model review. Codex CLI is only the `queue` transport and plugin management, never `exec`, `resume` or `fork`.
 - Model: `.agents/codex-pi.json` selects one of `ALLOWED_MODELS` (`pi_task.py project` lists them; default `deepseek/deepseek-flash`, thinking `max`). `start` freezes it per task; later config edits affect only new tasks. No fallback: an unavailable model fails the round and keeps the evidence. Pi must be >= 1.0.0.
-- The worker runs with Pi extensions, skills and prompt templates disabled. The user's goal and project contracts govern scope and acceptance; config constraints and checks are references, not success claims. Resolve routine choices without extra approval gates.
+- The worker runs with Pi extensions, skills and prompt templates disabled. The user's goal and project contracts govern scope and acceptance; config constraints and checks are references, not success claims. Resolve routine choices without extra approval gates. The explicit worker extension registers native codemode: simple calls stay direct, while batching, branching or filtering large output can run in a script whose nested `tools.*` calls keep the same per-call guard. Scripts must await every call and inspect structured failures instead of assuming a fulfilled promise succeeded; each parallel check needs independent resources and a unique id, and dependent writes/commits stay serialized.
 
 ## Whole-task analysis (the single reusable design act)
 

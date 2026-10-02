@@ -2,6 +2,10 @@
 
 当前 Codex 主任务负责设计、派工与验收；Pi 的模型由项目配置选择（模型政策只在 [协作 Skill](skills/collaborate/SKILL.md) 中陈述）。项目只需 `.agents/codex-pi.json` 和自己的领域约束，公共插件维护进程、同会话返修、看板和原始证据。
 
+## 0.7.0 原生 codemode
+
+新 worker 在显式 worker 扩展内注册 Pi 公共 `createCodemodeExtension({models:false, mode:"on"})`；`--no-extensions`、skills 与 prompt templates 隔离不变，也不重复注册 `builtin:codemode`。`codemode` 加入只读和可写两种任务工具选择，不扩大底层只读能力。脚本只能通过 `tools.<name>` 调用同一守卫下的工具：每次嵌套调用都经过 Pi 的 `tool_call`/`tool_result` 校验和现有路径守卫（禁止路径仍 fail closed，并写入 `worker-blocks.jsonl`）；嵌套 `codemode` 被禁止。脚本首行 `// @options` 按上游语义解析，脚本截止时间以 phase 命令上限为顶并带有界缺省，非法选项在运行前拒绝；取消会传播到嵌套工具，已完成的调用不回滚。`check`/`progress`/`readiness` 增加 `outputSchema`/`structuredContent`：失败检查仍写不可变回执并给出显式 exit/timeout/cancel 语义，调用方必须检查语义失败而不是 Promise 是否 fulfil。`store`/`load` 仍是 Pi 自有会话分支状态，仅成功脚本提交、可原生 resume，不新增持久化层；旧冻结 worker 的证据解释保持。真实 Pi 1.0.0 / QuickJS 探针与脱敏限制见 [验证记录](docs/validation/codemode-0.7.0-20261003.md)。
+
 ## 0.6.5 聚焦 Codex-Pi
 
 Sol-Luna 已迁出为独立个人 Skill，使用 Codex 原生子代理，不需要此插件调度。插件只分发 `$collaborate` 和 Pi 运行时；对照工具及原生协作资料随独立 Skill 维护。现有 Pi 任务、hooks 和冻结 helper 行为保留。旧安装中的 Sol-Luna 入口需通过正常插件更新移除，不手改缓存。

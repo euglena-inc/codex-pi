@@ -56,7 +56,7 @@ class LaunchTest(Step5Case):
         self.assertEqual(recorded["workerConfig"], str(self.round_dir("launch") / "worker.json"))
         for flag in ("-p", "--mode", "json", "--no-skills", "--no-prompt-templates"):
             self.assertIn(flag, recorded["argv"])
-        self.assertEqual(recorded["tools"], "read,write,edit,bash,check,progress,readiness")
+        self.assertEqual(recorded["tools"], "read,write,edit,bash,check,progress,readiness,codemode")
         self.assertEqual((tools / "pi_worker.ts").read_bytes(), (RUNTIME / "pi_worker.ts").read_bytes())
         helper_hashes = json.loads((self.repo.task_dir("launch") / "task.json").read_text())["helperHashes"]
         self.assertEqual(helper_hashes["pi_worker.ts"],
@@ -165,7 +165,7 @@ class LoadProofTest(Step5Case):
         self.start("loaded", env)
         self.assertEqual(self.repo.wait_terminal("loaded", env=env)["state"], "completed")
         ready = json.loads((self.round_dir("loaded") / "worker.ready").read_text())
-        self.assertEqual(sorted(ready), ["at", "piVersion", "pid"])
+        self.assertEqual(sorted(ready), ["at", "codemode", "piVersion", "pid"])
 
 
 class SettleViewTest(unittest.TestCase):

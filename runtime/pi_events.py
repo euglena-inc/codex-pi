@@ -929,4 +929,4 @@ def _decide_hint(repo, task_id, event: dict) -> str:
     options = "accept|reject|changes_requested" if review else "resolve|reject|changes_requested"
     return (f'python3 {shlex.quote(str(BOARD_CLI))} decide '
             f'--repo {shlex.quote(str(repo))} --task {shlex.quote(str(task_id))} '
-            f'--event-id EVENT --decision {options} (EVENT/head/phase/contract above)')
+            f'--event-id EVENT --decision {options}')

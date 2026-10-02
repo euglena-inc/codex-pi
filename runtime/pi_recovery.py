@@ -134,8 +134,10 @@ def adopt_runtime(repo,task_id,helper_files,source,dry_run=False):
     if not isinstance(frozen,dict) or frozen.get('task')!=task_id \
             or Path(frozen.get('repo','')).resolve()!=root:
         raise ValueError('runtime recovery requires the exact frozen task/repository identity')
-    if not str(frozen.get('runtimeVersion','')).startswith('0.6.'):
-        raise ValueError('0.5.x worker snapshots cannot be adopted or migrated')
+    version_parts=str(frozen.get('runtimeVersion') or '').split('.')
+    if len(version_parts)<2 or not all(part.isdigit() for part in version_parts[:2]) \
+            or (int(version_parts[0]),int(version_parts[1]))<(0,6):
+        raise ValueError('worker snapshots older than 0.6 cannot be adopted or migrated')
     locks=[]
     try:
         for path in [common/'codex-pi/.admission.lock',task_dir/'.task.lock',task_dir/'.supervisor.lock']:

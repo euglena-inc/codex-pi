@@ -51,6 +51,10 @@ interface Verdict {
 const PATH_TOOLS = new Set(["read", "write", "edit", "grep", "find", "ls"]);
 const WRITE_TOOLS = new Set(["write", "edit"]);
 const NATIVE_TOOLS = new Set(["check", "progress", "readiness"]);
+const CODEMODE_TOOL = "codemode";
+const CODEMODE_OPTIONS_PREFIX = "// @options:";
+const CODEMODE_MAX_OUTPUT_TOKENS = 10_000;
+const CODEMODE_MAX_TIMEOUT_MS = 2_147_483_647;
 const SPLIT = /[\s'"`;|&()<>=,:{}\[\]$]+/;
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/;
 
@@ -139,8 +143,78 @@ function forbiddenVerdict(found: string, cfg: WorkerConfig): Verdict {
 	};
 }
 
+function isSafeInteger(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Upstream-compatible `// @options:` parsing with the worker's bounds applied: the phase command
+ * cap is the deadline ceiling and an omitted deadline gets the bounded bash default. The source is
+ * never scanned for forbidden strings; every nested call passes the guard on its own.
+ */
+export function normalizeCodemode(code: string, cfg: WorkerConfig): string {
+	if (code.trim() === "") throw new Error("expected non-empty JavaScript source");
+	const newline = code.indexOf("\n");
+	const firstLine = (newline === -1 ? code : code.slice(0, newline)).replace(/\r$/, "");
+	const trimmed = firstLine.trimStart();
+	let body = code;
+	let requestedTimeout: number | undefined;
+	let requestedOutput: number | undefined;
+	if (trimmed.startsWith(CODEMODE_OPTIONS_PREFIX)) {
+		if (newline === -1 || code.slice(newline).trim() === "") {
+			throw new Error("the @options line must be followed by JavaScript source");
+		}
+		body = code.slice(newline).replace(/^\r?\n/, "");
+		const raw = trimmed.slice(CODEMODE_OPTIONS_PREFIX.length).trim();
+		if (!raw) throw new Error("@options must be a JSON object");
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(raw);
+		} catch (error) {
+			throw new Error(`@options must be valid JSON: ${String(error)}`);
+		}
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+			throw new Error("@options must be a JSON object");
+		}
+		for (const key of Object.keys(parsed)) {
+			if (key !== "max_output_tokens" && key !== "timeout_ms") {
+				throw new Error(`@options does not support ${key}`);
+			}
+		}
+		const fields = parsed as { max_output_tokens?: unknown; timeout_ms?: unknown };
+		if (fields.max_output_tokens !== undefined) {
+			if (!isSafeInteger(fields.max_output_tokens)) {
+				throw new Error("@options max_output_tokens must be a non-negative safe integer");
+			}
+			requestedOutput = fields.max_output_tokens;
+		}
+		if (fields.timeout_ms !== undefined) {
+			if (!isSafeInteger(fields.timeout_ms) || fields.timeout_ms === 0 || fields.timeout_ms > CODEMODE_MAX_TIMEOUT_MS) {
+				throw new Error(`@options timeout_ms must be a positive integer up to ${CODEMODE_MAX_TIMEOUT_MS}`);
+			}
+			requestedTimeout = fields.timeout_ms;
+		}
+	}
+	const ceilingMs = Math.min(Math.floor(cfg.bashCeilingSeconds * 1000), CODEMODE_MAX_TIMEOUT_MS);
+	const defaultMs = Math.min(Math.floor(cfg.bashDefaultTimeoutSeconds * 1000), ceilingMs);
+	const timeoutMs = Math.min(requestedTimeout ?? defaultMs, ceilingMs);
+	const maxOutputTokens = Math.min(requestedOutput ?? CODEMODE_MAX_OUTPUT_TOKENS, CODEMODE_MAX_OUTPUT_TOKENS);
+	return `${CODEMODE_OPTIONS_PREFIX} ${JSON.stringify({ max_output_tokens: maxOutputTokens, timeout_ms: timeoutMs })}\n${body}`;
+}
+
 /** Decide one tool call. Throws on anything it cannot decide (the caller blocks). */
-export function judge(toolName: string, input: Record<string, unknown>, cfg: WorkerConfig): Verdict {
+export function judge(toolName: string, input: Record<string, unknown>, cfg: WorkerConfig,
+	nested = false): Verdict {
+	if (toolName === CODEMODE_TOOL) {
+		if (nested) return invalid(toolName, "a codemode script cannot call codemode");
+		if (typeof input.code !== "string") return invalid(toolName, "codemode code is not a string");
+		try {
+			input.code = normalizeCodemode(input.code, cfg);
+		} catch (error) {
+			return invalid(toolName, `invalid codemode source: ${String(error)}`);
+		}
+		return { block: false };
+	}
 	if (toolName === "bash") {
 		if (typeof input.command !== "string") return invalid(toolName, "bash command is not a string");
 		const found = forbiddenReference(input.command, cfg);
@@ -298,53 +372,79 @@ function lastJson(text: string): Record<string, any> | null {
 	return null;
 }
 
-function textResult(text: string, details: unknown, isError = false) {
-	return { content: [{ type: "text" as const, text }], details: details as never, ...(isError ? { isError: true } : {}) };
+function textResult(text: string, details: unknown, structured: unknown, isError = false) {
+	return { content: [{ type: "text" as const, text }], details: details as never,
+		structuredContent: structured as never, ...(isError ? { isError: true } : {}) };
 }
+
+function checkStructured(id: string, ok: boolean, patch: Record<string, unknown> = {}) {
+	return { id, ok, exit_code: null, timed_out: false, cancelled: false, receipt: null,
+		test_counts: null, log_tail: null, error: null, ...patch };
+}
+
+const CHECK_OUTPUT_SCHEMA = {
+	type: "object",
+	properties: {
+		id: { type: "string" }, ok: { type: "boolean" },
+		exit_code: { type: ["integer", "null"] }, timed_out: { type: "boolean" },
+		cancelled: { type: "boolean" }, receipt: { type: ["string", "null"] },
+		test_counts: { type: ["object", "null"] }, log_tail: { type: ["string", "null"] },
+		error: { type: ["string", "null"] },
+	},
+	required: ["id", "ok", "exit_code", "timed_out", "cancelled"],
+} as never;
+
+const PROGRESS_OUTPUT_SCHEMA = {
+	type: "object",
+	properties: {
+		ok: { type: "boolean" }, activity: { type: "string" }, code: { type: ["integer", "null"] },
+		output: { type: ["object", "null"] }, error: { type: ["string", "null"] },
+	},
+	required: ["ok", "activity", "code"],
+} as never;
+
+const READINESS_OUTPUT_SCHEMA = {
+	type: "object",
+	properties: {
+		ok: { type: "boolean" }, code: { type: ["integer", "null"] }, status: { type: ["string", "null"] },
+		reason: { type: ["string", "null"] }, coverage: { type: ["object", "null"] },
+		gaps: { type: ["array", "null"] }, error: { type: ["string", "null"] },
+	},
+	required: ["ok", "code"],
+} as never;
 
 function helperArgs(cfg: WorkerConfig, command: string): string[] {
 	return [path.join(cfg.toolsDir, "pi_task.py"), command, "--repo", cfg.repo, "--task", cfg.task, "--round", String(cfg.round)];
 }
 
-function piVersion(): string {
-	try {
-		let dir = path.dirname(fs.realpathSync(process.argv[1]));
-		for (let i = 0; i < 8; i++) {
-			const file = path.join(dir, "package.json");
-			if (fs.existsSync(file)) {
-				const data = JSON.parse(fs.readFileSync(file, "utf8"));
-				if (data.name === "@earendil-works/pi-coding-agent" && typeof data.version === "string") return data.version;
-			}
-			dir = path.dirname(dir);
-		}
-	} catch {
-		// fall through
-	}
-	return "unknown";
-}
-
-function writeReady(cfg: WorkerConfig): void {
+function writeReady(cfg: WorkerConfig, version: string): void {
 	const target = path.join(cfg.roundDir, "worker.ready");
 	const temp = `${target}.${process.pid}.tmp`;
-	fs.writeFileSync(temp, JSON.stringify({ piVersion: piVersion(), pid: process.pid, at: Date.now() / 1000 }));
+	fs.writeFileSync(temp, JSON.stringify({ piVersion: version, pid: process.pid,
+		at: Date.now() / 1000, codemode: true }));
 	fs.renameSync(temp, target);
 }
 
-export default function (pi: ExtensionAPI) {
+export default async function (pi: ExtensionAPI) {
 	let cfg: WorkerConfig | null = null;
 	try {
+		// The load proof is written only after the native codemode tool registered: a Pi without
+		// the public export, or a failing registration, must not let the round claim it loaded.
 		cfg = loadConfig(process.env.CODEX_PI_WORKER_CONFIG);
-		writeReady(cfg);
+		const host = await import("@earendil-works/pi-coding-agent");
+		host.createCodemodeExtension({ models: false, mode: "on" })(pi);
+		writeReady(cfg, typeof host.VERSION === "string" ? host.VERSION : "unknown");
 	} catch (error) {
-		cfg = null; // no marker: the round fails WORKER_EXTENSION_NOT_LOADED
+		cfg = null; // no marker: the round fails WORKER_EXTENSION_NOT_LOADED and every call blocks
 		void error;
 	}
 
 	pi.on("tool_call", async (event) => {
 		const toolName = String((event as { toolName?: unknown }).toolName);
+		const nested = Boolean((event as { parentToolCallId?: unknown }).parentToolCallId);
 		try {
 			if (!cfg) return { block: true, reason: "undecidable: worker configuration is unavailable; blocked" };
-			const verdict = judge(toolName, (event as { input: Record<string, unknown> }).input, cfg);
+			const verdict = judge(toolName, (event as { input: Record<string, unknown> }).input, cfg, nested);
 			if (!verdict.block) return undefined;
 			logBlock(cfg, toolName, verdict);
 			return { block: true, reason: verdict.reason };
@@ -412,25 +512,37 @@ export default function (pi: ExtensionAPI) {
 			required: ["id", "command"],
 			additionalProperties: false,
 		} as never,
+		outputSchema: CHECK_OUTPUT_SCHEMA,
 		async execute(_id: string, params: any, signal: AbortSignal | undefined) {
-			if (!cfg) return textResult("worker configuration is unavailable", {}, true);
-			if (!ID_RE.test(String(params.id))) return textResult(`invalid check id ${String(params.id)}`, {}, true);
+			if (!cfg) {
+				const error = "worker configuration is unavailable";
+				return textResult(error, {}, checkStructured("", false, { error }), true);
+			}
+			const checkId = String(params.id);
+			if (!ID_RE.test(checkId)) {
+				return textResult(`invalid check id ${checkId}`, {}, checkStructured(checkId, false,
+					{ error: "invalid check id" }), true);
+			}
 			let argv: string[];
 			try {
 				argv = shlexSplit(String(params.command));
 			} catch (error) {
-				return textResult(`cannot parse command: ${String(error)}`, {}, true);
+				return textResult(`cannot parse command: ${String(error)}`, {}, checkStructured(checkId, false,
+					{ error: `cannot parse command: ${String(error)}` }), true);
 			}
-			if (argv.length === 0) return textResult("empty command", {}, true);
+			if (argv.length === 0) {
+				return textResult("empty command", {}, checkStructured(checkId, false, { error: "empty command" }), true);
+			}
 			let timeout = cfg.checkTimeoutSeconds;
 			if (typeof params.timeoutSeconds === "number" && Number.isFinite(params.timeoutSeconds) && params.timeoutSeconds > 0) {
 				timeout = Math.min(params.timeoutSeconds, cfg.checkTimeoutSeconds);
 			}
-			const args = [path.join(cfg.toolsDir, "pi_check.py"), "--output-dir", cfg.checksDir, "--id", String(params.id),
+			const args = [path.join(cfg.toolsDir, "pi_check.py"), "--output-dir", cfg.checksDir, "--id", checkId,
 				"--timeout-seconds", String(timeout)];
 			if (params.watchPath !== undefined || params.maxBytes !== undefined) {
 				if (typeof params.watchPath !== "string" || typeof params.maxBytes !== "number") {
-					return textResult("watchPath and maxBytes must be given together", {}, true);
+					return textResult("watchPath and maxBytes must be given together", {}, checkStructured(checkId, false,
+						{ error: "watchPath and maxBytes must be given together" }), true);
 				}
 				args.push("--watch-path", params.watchPath, "--max-bytes", String(Math.trunc(params.maxBytes)));
 			}
@@ -438,15 +550,25 @@ export default function (pi: ExtensionAPI) {
 			const result = await run(cfg.python, args, cfg.worktree, signal);
 			const summary = lastJson(result.stdout);
 			if (!summary) {
-				return textResult(`pi_check produced no receipt summary (exit ${result.code}): ${result.stderr.slice(-500)}`, { code: result.code }, true);
+				const error = `pi_check produced no receipt summary (exit ${result.code}): ${result.stderr.slice(-500)}`;
+				return textResult(error, { code: result.code },
+					checkStructured(checkId, false, { exit_code: result.code, error }), true);
 			}
 			const failed = summary.exit_code !== 0 || summary.timed_out === true || summary.cancelled === true;
+			const structured = checkStructured(checkId, !failed, {
+				exit_code: typeof summary.exit_code === "number" ? summary.exit_code : null,
+				timed_out: summary.timed_out === true, cancelled: summary.cancelled === true,
+				receipt: typeof summary.receipt === "string" ? summary.receipt : null,
+				test_counts: summary.test_counts && typeof summary.test_counts === "object" ? summary.test_counts : null,
+				log_tail: typeof summary.log_tail === "string" ? summary.log_tail : null,
+				error: failed ? (summary.timed_out ? "timed_out" : summary.cancelled ? "cancelled" : `exit ${summary.exit_code}`) : null,
+			});
 			const counts = summary.test_counts && typeof summary.test_counts === "object"
 				? ` counts=${JSON.stringify(summary.test_counts)}` : "";
 			const lines = [`check ${params.id}: exit=${summary.exit_code}${summary.timed_out ? " TIMED_OUT" : ""}${summary.cancelled ? " CANCELLED" : ""}${counts}`,
 				`receipt=${summary.receipt}`];
 			if (typeof summary.log_tail === "string") lines.push("log_tail:", summary.log_tail);
-			return textResult(lines.join("\n"), summary, failed);
+			return textResult(lines.join("\n"), summary, structured, failed);
 		},
 	});
 
@@ -468,16 +590,25 @@ export default function (pi: ExtensionAPI) {
 			required: ["activity"],
 			additionalProperties: false,
 		} as never,
+		outputSchema: PROGRESS_OUTPUT_SCHEMA,
 		async execute(_id: string, params: any, signal: AbortSignal | undefined) {
-			if (!cfg) return textResult("worker configuration is unavailable", {}, true);
-			const args = [...helperArgs(cfg, "progress"), "--activity", String(params.activity)];
+			const activity = String(params.activity);
+			if (!cfg) {
+				const error = "worker configuration is unavailable";
+				return textResult(error, {}, { ok: false, activity, code: null, output: null, error }, true);
+			}
+			const args = [...helperArgs(cfg, "progress"), "--activity", activity];
 			for (const [flag, key] of [["--step", "step"], ["--next", "next"], ["--blocker", "blocker"]] as const) {
 				if (typeof params[key] === "string") args.push(flag, params[key]);
 			}
 			for (const item of Array.isArray(params.completedCriteria) ? params.completedCriteria : []) args.push("--completed-criteria", String(item));
 			for (const item of Array.isArray(params.evidenceRefs) ? params.evidenceRefs : []) args.push("--evidence-ref", String(item));
 			const result = await run(cfg.python, args, cfg.worktree, signal, 60000);
-			return textResult(result.code === 0 ? result.stdout.trim() : (result.stderr || result.stdout).trim(), { code: result.code }, result.code !== 0);
+			const text = (result.code === 0 ? result.stdout : (result.stderr || result.stdout)).trim();
+			const output = result.code === 0 ? lastJson(result.stdout) : null;
+			const structured = { ok: result.code === 0, activity, code: result.code, output,
+				error: result.code === 0 ? null : (text.slice(-500) || `exit ${result.code}`) };
+			return textResult(text, { code: result.code }, structured, result.code !== 0);
 		},
 	});
 
@@ -487,14 +618,26 @@ export default function (pi: ExtensionAPI) {
 		description: "Mechanical delivery check of the phase contract against recorded receipts (read-only; never acceptance).",
 		promptSnippet: "Check delivery readiness",
 		parameters: { type: "object", properties: {}, additionalProperties: false } as never,
+		outputSchema: READINESS_OUTPUT_SCHEMA,
 		async execute(_id: string, _params: any, signal: AbortSignal | undefined) {
-			if (!cfg) return textResult("worker configuration is unavailable", {}, true);
+			if (!cfg) {
+				const error = "worker configuration is unavailable";
+				return textResult(error, {}, { ok: false, code: null, status: null, reason: null, coverage: null, gaps: null, error }, true);
+			}
 			const result = await run(cfg.python, helperArgs(cfg, "readiness"), cfg.worktree, signal, 60000);
 			const data = result.code === 0 ? lastJson(result.stdout) : null;
-			if (!data) return textResult((result.stderr || result.stdout).trim(), { code: result.code }, true);
+			if (!data) {
+				const error = (result.stderr || result.stdout).trim();
+				return textResult(error, { code: result.code },
+					{ ok: false, code: result.code, status: null, reason: null, coverage: null, gaps: null,
+						error: error.slice(-500) || "readiness unavailable" }, true);
+			}
 			const gaps = (data.gaps ?? []).map((gap: any) => `${gap.id}:${gap.status}`).join(", ");
+			const structured = { ok: true, code: 0, status: data.status ?? null,
+				reason: data.readinessReason ?? null, coverage: data.coverage ?? null,
+				gaps: data.gaps ?? null, error: null };
 			return textResult(`readiness=${data.status} reason=${data.readinessReason} coverage=${JSON.stringify(data.coverage)}${gaps ? ` gaps=${gaps}` : ""}`,
-				{ status: data.status, coverage: data.coverage, gaps: data.gaps });
+				{ status: data.status, coverage: data.coverage, gaps: data.gaps }, structured);
 		},
 	});
 }

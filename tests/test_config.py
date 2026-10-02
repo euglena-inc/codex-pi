@@ -207,17 +207,25 @@ class ConfigTest(unittest.TestCase):
         self.assertFalse(marker.exists())
 
     def test_optional_private_project_paths_are_read_only(self):
+        # The synthetic path always runs; the private paths, when configured, add a live check
+        # without turning an absent environment into a skipped test.
+        trap, marker = make_pi_trap(self.tmp / "bin")
+        env = base_env(PI_BIN=str(trap))
+        repo = Repo(self.tmp, name="readonly", config=default_config())
+        data = cli_json("project", "--repo", str(repo.root), env=env)
+        self.assertEqual(data["repo"], str(repo.root.resolve()))
+        self.assertEqual(data["limits"]["allowedModels"],
+                         ["deepseek/deepseek-flash", "newapi/glm-5.3"])
+        self.assertFalse(marker.exists())
         project_path = os.environ.get("CODEX_PI_PRIVATE_PROJECT")
         primary_path = os.environ.get("CODEX_PI_PRIVATE_PRIMARY")
         if not project_path or not primary_path:
-            self.skipTest("optional private project paths are not configured")
+            return
         project = Path(project_path)
         primary = Path(primary_path)
         if not (project.is_dir() and (project / ".agents" / "codex-pi.json").is_file()
                 and primary.is_dir()):
-            self.skipTest("authorized user project paths are not present")
-        trap, marker = make_pi_trap(self.tmp / "bin")
-        env = base_env(PI_BIN=str(trap))
+            return
         data = cli_json("project", "--repo", str(project), env=env)
         self.assertEqual(data["repo"], str(project.resolve()))
         self.assertEqual(data["config"]["model"], "deepseek/deepseek-flash")

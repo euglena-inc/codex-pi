@@ -11,8 +11,12 @@
 // Environment (CODEX_PI_WORKER_CONFIG) is inherited from the caller. The extension is
 // imported only after the scenario is read, so its load-time behavior is observable.
 import fs from "node:fs";
+import { register } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+
+// The extension imports the host package by name; map it to the offline stub before loading.
+register("./host_resolver.mjs", import.meta.url);
 
 const [, , extension, scenarioFile] = process.argv;
 const scenario = JSON.parse(fs.readFileSync(scenarioFile, "utf8"));
@@ -31,7 +35,7 @@ const pi = {
 };
 
 const module = await import(pathToFileURL(path.resolve(extension)).href);
-module.default(pi);
+await module.default(pi);
 
 const ctx = { cwd: process.cwd(), hasUI: false, ui: { notify() {} } };
 const out = [];
@@ -40,6 +44,7 @@ for (const step of scenario.steps) {
 	try {
 		if (step.op === "tool_call") {
 			const event = { type: "tool_call", toolCallId: `call-${++counter}`, toolName: step.toolName, input: structuredClone(step.input ?? {}) };
+			if (step.parentToolCallId) event.parentToolCallId = step.parentToolCallId;
 			let result;
 			for (const handler of handlers.get("tool_call") ?? []) {
 				result = await handler(event, ctx);
