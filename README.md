@@ -1,14 +1,10 @@
-# Codex + Pi / Sol + Luna
+# Codex + Pi
 
 当前 Codex 主任务负责设计、派工与验收；Pi 的模型由项目配置选择（模型政策只在 [协作 Skill](skills/collaborate/SKILL.md) 中陈述）。项目只需 `.agents/codex-pi.json` 和自己的领域约束，公共插件维护进程、同会话返修、看板和原始证据。
 
-插件提供两条独立路线：`$collaborate` 保留 Codex-Pi；[`$sol-luna`](skills/sol-luna/SKILL.md) 使用 **Sol 6.1 Medium＋原生 Luna Max**。同一插件可跨项目复用；项目只保留自己的领域约束，Sol-Luna 不需要 Pi 配置、额外服务或复制 agent 角色。新项目用新的子代理，同一结果返修用原子代理。实际父模型须在客户端选择，Skill 不强制修改模型设置。
+## 0.6.5 聚焦 Codex-Pi
 
-Sol-Luna 的 [项目用法](skills/sol-luna/references/projects.md)、[设计与证据边界](docs/design/sol-luna-native.md) 和 [对照口径](skills/sol-luna/references/comparison.md) 分别按需读取。原生子代理默认共享检出，不能视作 Pi 的工作树守卫；计数和预算由主会话维护。没有承诺固定 token 节省比例或任意重启恢复。活跃 Pi 任务不迁移。
-
-## 0.6.3 双路线
-
-新增原生 `sol-luna` Skill 和离线 `scripts/compare_routes.py`。对照按项目、基线和验收分组；缺少真实用量、模型核验或完整接受结果时不输出节省比例。现有 Pi 调度、hooks、守卫和冻结任务策略保留。源码交付与正式安装、真实费用对照分别验证。
+Sol-Luna 已迁出为独立个人 Skill，使用 Codex 原生子代理，不需要此插件调度。插件只分发 `$collaborate` 和 Pi 运行时；对照工具及原生协作资料随独立 Skill 维护。现有 Pi 任务、hooks 和冻结 helper 行为保留。旧安装中的 Sol-Luna 入口需通过正常插件更新移除，不手改缓存。
 
 ## 0.6.4 终态恢复
 
@@ -69,7 +65,7 @@ Pi 的最后一条 assistant 若为 `error`、`aborted` 或未完整结束，即
 
 ## 安装与维护
 
-插件由独立 Git 仓库管理，通过仓库自带的 marketplace 分发。Pi 路线依赖 Python 3.10+、Git、Pi CLI 1.0.0 及以上；自动通知另需支持 `queue` 的 Codex CLI 和桌面应用。Sol-Luna 路线依赖具备显式模型选择、fresh context 和同一子代理 continuation 的原生 Codex 客户端；离线比较工具使用 Python 3.10+。认证沿用现有本地配置，插件不复制密钥。Pi 运行时适用于 macOS/Linux，Python 部分只用标准库、文件锁和进程组。
+插件由独立 Git 仓库管理，通过仓库自带的 marketplace 分发。Pi 路线依赖 Python 3.10+、Git、Pi CLI 1.0.0 及以上；自动通知另需支持 `queue` 的 Codex CLI 和桌面应用。认证沿用现有本地配置，插件不复制密钥。Pi 运行时适用于 macOS/Linux，Python 部分只用标准库、文件锁和进程组。
 
 其他 Codex 环境可以直接安装公开仓库自带的 marketplace：
 
