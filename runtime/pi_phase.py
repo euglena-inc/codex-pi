@@ -1223,6 +1223,9 @@ def build_phase_snapshot(task_dir: Path, task: dict, round_number: int, *, state
     contract = record.get("contract") or {}
     round_dir = task_dir / "rounds" / str(round_number)
     checks_dir = Path(checks.get("dir") or (round_dir / "round.checks"))
+    from pi_execution import effective_execution
+    effective,execution_evidence=effective_execution(state,round_dir/'round.jsonl')
+    state=dict(state,state=effective,executionEvidence=execution_evidence)
     raw_state = state.get("state")
     candidate_head = candidate.get("head") if candidate.get("status") == "known" else None
     items, coverage, gaps, budget = evaluate_acceptance_items(contract, candidate_head,

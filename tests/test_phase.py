@@ -1074,6 +1074,32 @@ class PhaseTest(unittest.TestCase):
                 "command": command, "review": review[0],
                 "contractSha256": frozen["contractSha256"]}
 
+    def test_exit_zero_provider_error_blocks_status_readiness_and_quality_even_with_all_receipts(self):
+        fixture=self.ready_accept_fixture('legacy-fault','LEGACY-FAULT')
+        repo=fixture['repo'];env=fixture['env'];task='legacy-fault'
+        stream=repo.task_dir(task)/'rounds/1/round.jsonl'
+        # Real old-style input: the immutable state still says completed/exit 0,
+        # but the final assistant reports a provider error after an earlier stop.
+        with stream.open('a') as output:
+            output.write(json.dumps({'type':'message_end','message':{'role':'assistant',
+                'provider':'deepseek','model':'deepseek-flash','stopReason':'error',
+                'errorMessage':'Connection error.','content':[]}})+'\n')
+        status=cli_json('status','--repo',str(repo.root),'--task',task,env=env)
+        readiness=cli_json('readiness','--repo',str(repo.root),'--task',task,env=env)
+        self.assertEqual(status['recordedState'],'completed');self.assertEqual(status['state'],'failed')
+        self.assertEqual(status['phase']['readiness']['execution']['status'],'failed')
+        self.assertEqual(readiness['snapshot']['readiness']['execution']['status'],'failed')
+        self.assertEqual(readiness['coverage']['covered'],1)
+        self.assertEqual(readiness['status'],'not_ready')
+        negative=run_board('decide','--repo',str(repo.root),'--task',task,
+            '--event-id',fixture['review']['id'],'--decision','changes_requested',env=env,expect=2)
+        self.assertNotEqual(negative.returncode,0)
+        self.assertIn('incomplete execution',negative.stderr)
+        self.refresh(repo,task,env)
+        self.assertEqual(self.pending(repo,task,'review_required'),[])
+        self.assertEqual(len(self.pending(repo,task,'execution_failed')),1)
+        self.assertEqual(pi_board.compact_card(self.card(repo,task))['reviewPolicy']['failedDeliveries'],0)
+
     def test_terminal_execution_facts_are_enforced_by_the_gate(self):
         # Known failure (nonzero exit, cancelled, timed out) is not_ready;
         # a missing exit code is unknown. None of them may pass the gate.

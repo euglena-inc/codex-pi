@@ -595,6 +595,9 @@ def cmd_continue(args) -> dict:
             else:
                 old_contract = phase_record.get("contract") or {}
                 if old_contract.get("phaseId") != contract_raw.get("phaseId"):
+                    if latest_state.get('state')!='completed' or latest_state.get('exitCode')!=0:
+                        raise ValueError('cannot dispatch the next phase from incomplete execution; '
+                                         'historical decisions are retained but not completion proof')
                     _info, gate_problem = _phase_acceptance_on_board(frozen, phase_record, latest_head)
                     if gate_problem:
                         raise ValueError(f"cannot dispatch the next phase: {gate_problem}; the main "

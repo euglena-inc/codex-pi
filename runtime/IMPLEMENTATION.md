@@ -1,6 +1,6 @@
 # Codex-Pi runtime implementation
 
-Version 0.6.1 (`runtime/VERSION`). It requires Pi >= 1.0.0. Historical task/round snapshots remain immutable; 0.5.x workers cannot adopt a new runtime.
+Version 0.6.2 (`runtime/VERSION`). It requires Pi >= 1.0.0. Historical task/round snapshots remain immutable; 0.5.x workers cannot adopt a new runtime.
 
 Cross-project persistent Pi worker lifecycle for the Codex main session: **Codex main -> shell -> Python lifecycle scripts -> Pi CLI with one worker extension**. There is no MCP server and no package manifest. Python owns admission, persistence, evidence, model policy and process control. A single dependency-free TypeScript file (`runtime/pi_worker.ts`) runs inside Pi and guards and supports the worker. Current commands and rules are in [runtime guidance](../skills/collaborate/references/runtime.md), [handoff guidance](../skills/collaborate/references/handoff.md) and [the Skill](../skills/collaborate/SKILL.md).
 

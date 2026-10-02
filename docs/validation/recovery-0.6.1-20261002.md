@@ -1,4 +1,4 @@
-# 0.6.1 board and execution recovery
+# 0.6.1 / 0.6.2 board and execution recovery
 
 Sanitized record: identities, repository paths, provider sessions, product ledgers and raw transcripts remain in a private recovery archive. Public tests use synthetic repositories and identities.
 
@@ -7,6 +7,8 @@ Sanitized record: identities, repository paths, provider sessions, product ledge
 A shared JSON board approached its 256 KiB limit with 26 historical cards. Adding a terminal event failed even after history pruning. Two real rounds ended with final assistant `stopReason=error`, `Connection error`, while the Pi process returned 0; no formal receipts or new candidate commit were delivered.
 
 The plugin now retains events, exact decisions, quota ledgers and claim history in its own transactional SQLite store. Task projections, record blobs, read windows and cursor pages are bounded; the aggregate history is not silently deleted and can grow on disk. Uncertain claims remain uncertain; replay of an old decision stays immutable and quality checkpoints survive projection changes. Legacy JSON is retained byte for byte during explicit writer-free conversion. Obsolete controls fail closed.
+
+0.6.2 also normalizes execution in the shared phase snapshot used by status, so complete receipts cannot mask a final provider error.
 
 One terminal-evidence implementation distinguishes process exit from assistant completion. Errors, aborted/incomplete activity and an unverifiable tail cannot reuse an earlier answer, satisfy readiness or be classified as a quality delivery. Timeout, ownership and resource facts remain visible. Registration reports projection errors instead of returning silent success. Queue delivery rechecks pause, owner and exact unhandled events after claiming and before spawn.
 
