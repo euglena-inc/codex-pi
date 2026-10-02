@@ -440,8 +440,19 @@ def register_task(repo, task, thread=None, transport=TRANSPORT_OFFLINE, codex_bi
     if transport == TRANSPORT_CLI_QUEUE:
         dispatch = dispatch_task(board_file, task_id, now=now)
     queue = queue_view(board_file, task_id)
+    paused = None
+    if transport == TRANSPORT_CLI_QUEUE:
+        paused, pause_problem = route_paused(owner_thread)
+        paused = True if pause_problem is not None else bool(paused)
+    warning = None
+    if paused:
+        warning = (f"owner thread {owner_thread} is paused (user interrupt or unreadable pause state); "
+                   "nothing is delivered until the user authorizes: python3 "
+                   f"{shlex.quote(str(Path(__file__).resolve()))} resume --repo {shlex.quote(str(root))} "
+                   f"--task {task_id} --thread {owner_thread}, then register again")
     return {
         "ok": True, "taskId": task_id, "ownerThread": owner_thread,
+        "routePaused": paused, "warning": warning,
         "mode": transport, "transport": transport, "codexBin": card.get("codexBin"),
         "boardPath": str(board_file), "queuePath": str(queue_paths(board_file)[0]),
         "routePath": str(route_paths(owner_thread)[0]) if route else None,

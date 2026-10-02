@@ -30,3 +30,5 @@ Install through the formal plugin mechanism; never edit managed caches, hook tru
 ## Real desktop validation
 
 Unit tests do not prove desktop delivery. Use one real tiny Pi task (write fixed bytes to one file, run a ten-second check, commit that file, exit; bound the round to three minutes) and observe completion, supervisor, the same desktop task and a visible reply. History: [CLI queue validation](../../../docs/validation/cli-queue-20260926.md).
+
+`register` reports `routePaused` with the exact `resume` command when the owner thread is paused. An interrupted, idle desktop task keeps a queued card until it is opened again ([0.6.0 desktop check](../../../docs/validation/desktop-0.6.0-20261002.md)).

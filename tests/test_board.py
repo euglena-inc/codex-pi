@@ -277,6 +277,22 @@ class BoardTest(unittest.TestCase):
     # ------------------------------------------------------------------
     # dispatch argv, batching, retries, uncertainty
     # ------------------------------------------------------------------
+    def test_register_on_paused_thread_warns_and_does_not_deliver(self):
+        repo, worktree = self.make()
+        env = self.h_env(self.tmp, PI_DOUBLE_MODE="ok")
+        double, marker = make_cli_double(self.tmp)
+        subprocess.run([sys.executable, "-c",
+                        "import sys; sys.path.insert(0, sys.argv[1]); import pi_store; "
+                        "pi_store.pause_route(sys.argv[2])", str(RUNTIME), THREAD_A],
+                       env=env, check=True)
+        repo.start("board-paused", worktree, env=env)
+        self.assertEqual(repo.wait_terminal("board-paused", env=env)["state"], "completed")
+        result = self.register(repo, "board-paused", env, thread=THREAD_A, codex_bin=double)
+        self.assertTrue(result["routePaused"])
+        self.assertIn("resume", result["warning"])
+        self.assertIn(THREAD_A, result["warning"])
+        self.assertEqual(self.marker_lines(marker), [], "a paused owner thread receives nothing")
+
     def test_register_dispatches_terminal_task_with_exact_argv(self):
         repo, worktree = self.make()
         env = self.h_env(self.tmp, PI_DOUBLE_MODE="ok")
