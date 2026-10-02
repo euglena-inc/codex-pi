@@ -459,47 +459,6 @@ class StatusTest(unittest.TestCase):
             self.assertEqual(repo.wait_terminal("overflow", env=env, timeout=25)["state"],
                              "cancelled")
 
-    def test_wait_is_bounded_and_returns_compact_status_without_cancelling(self):
-        repo, worktree = self.make()
-        env = base_env(PI_DOUBLE_MODE="hang")
-        repo.start("waiting", worktree, env=env)
-        state = repo.wait_round_state("waiting", "running")
-        started = time.monotonic()
-        data = cli_json("wait", "--repo", str(repo.root), "--task", "waiting",
-                        "--timeout-ms", "400", env=env)
-        self.assertLess(time.monotonic() - started, 10)
-        self.assertTrue(data["wait"]["timedOut"])
-        self.assertEqual(data["state"], "running")
-        self.assertEqual(data["acceptance"], "not_verified")
-        self.assertIn("never cancels", data["wait"]["note"])
-        self.assertIn("do not call wait again", data["wait"]["instruction"])
-        self.assertNotIn("repeat", data["wait"]["instruction"].lower())
-        self.assertIn("read result once", data["wait"]["instruction"])
-        self.assertIn("checks", data, "active wait must return the compact status snapshot")
-        self.assertTrue(pid_alive(state["piPid"]))
-        repo.cancel("waiting", env=env)
-        self.assertEqual(repo.wait_terminal("waiting", env=env, timeout=25)["state"], "cancelled")
-
-    def test_wait_terminal_exact_round_returns_full_result(self):
-        repo, worktree = self.make()
-        env = base_env(PI_DOUBLE_MODE="ok")
-        repo.start("exact", worktree, env=env)
-        self.assertEqual(repo.wait_terminal("exact", env=env)["state"], "completed")
-        env_hang = base_env(PI_DOUBLE_MODE="hang")
-        repo.continue_task("exact", env=env_hang)
-        repo.wait_round_state("exact", "running")
-        try:
-            data = cli_json("wait", "--repo", str(repo.root), "--task", "exact", "--round", "1",
-                            "--timeout-ms", "5000", env=env_hang)
-            self.assertEqual(data["round"], 1)
-            self.assertEqual(data["state"], "completed")
-            self.assertFalse(data["wait"]["timedOut"])
-            self.assertIsNotNone(data["summary"])
-            self.assertEqual(data["acceptance"], "not_verified")
-        finally:
-            repo.cancel("exact", env=env_hang)
-            self.assertEqual(repo.wait_terminal("exact", env=env_hang, timeout=25)["state"], "cancelled")
-
 
 if __name__ == "__main__":
     unittest.main()

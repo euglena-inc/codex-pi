@@ -41,7 +41,7 @@ Delegate a whole independently reviewable outcome in a separate Git worktree; co
 
 ## Wait without polling
 
-The supervisor refreshes the board locally; unchanged state and ordinary progress never call Codex. A review-ready, blocked or failed round, or an anomaly, enqueues one delivery card via `codex queue`. After dispatch, do independent work and end the turn; never loop on `status`, `show` or `wait`, create a heartbeat or hold a Stop hook open. Answer progress questions from one `status`; a PID, fresh log or growing file proves activity only. A user Interrupt pauses handoff, not Pi, until explicit resume ([events](references/handoff.md)).
+The supervisor refreshes the board locally; unchanged state and ordinary progress never call Codex. A review-ready, blocked or failed round, or an anomaly, enqueues one delivery card via `codex queue`. After dispatch, do independent work and end the turn; never loop on `status` or `show`, create a heartbeat or hold a Stop hook open. Answer progress questions from one `status`; a PID, fresh log or growing file proves activity only. A user Interrupt pauses handoff, not Pi, until explicit resume ([events](references/handoff.md)).
 
 ## Review and retain evidence
 

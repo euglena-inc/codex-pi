@@ -240,13 +240,6 @@ class CompactCliTest(unittest.TestCase):
                           env=self.env)
         self.assertFalse([note for note in status["notes"] if "exit 0" in note])
 
-    def test_wait_instruction_does_not_invite_repeated_waits(self):
-        data = cli_json("wait", "--repo", str(self.repo.root), "--task", "compact",
-                        "--timeout-ms", "100", env=self.env)
-        text = json.dumps(data["wait"])
-        self.assertNotIn("repeat", text)
-        self.assertIn("do not call wait again", text)
-
 
 if __name__ == "__main__":
     unittest.main()

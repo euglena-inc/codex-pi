@@ -1,17 +1,5 @@
 {
   "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/runtime/pi_handoff.py\" hook",
-            "timeout": 10,
-            "async": false
-          }
-        ]
-      }
-    ],
     "Interrupt": [
       {
         "hooks": [

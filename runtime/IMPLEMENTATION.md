@@ -15,7 +15,6 @@ python3 runtime/pi_task.py project  --repo <path-inside-project>
 python3 runtime/pi_task.py start    --repo <path> --task <id> --worktree <linked-checkout> --prompt-file <brief>
 python3 runtime/pi_task.py continue --repo <path> --task <id> --prompt-file <follow-up>
 python3 runtime/pi_task.py result   --repo <path> --task <id> [--round N] [--full]
-python3 runtime/pi_task.py wait     --repo <path> --task <id> [--round N] [--timeout-ms 60000]
 python3 runtime/pi_task.py cancel   --repo <path> --task <id>
 python3 runtime/pi_task.py --help
 ```
@@ -27,14 +26,14 @@ double or explicit path only). Helpers used by the Pi worker are
 
 | File | Role |
 | --- | --- |
-| `runtime/pi_task.py` | Admission, config, model policy, brief, detached worker, timeout, cancel, result/wait, CLI |
+| `runtime/pi_task.py` | Admission, config, model policy, brief, detached worker, timeout, cancel, result, CLI |
 | `runtime/pi_summary.py` | Bounded round summary, check-receipt aggregation, usage, reported-model check |
 | `runtime/pi_check.py` | One-check receipt: true exit/signal/timeout, log sha256, HEAD/dirty, counts |
-| `runtime/pi_handoff.py` | Short legacy handoff, board-route recovery and interruption |
+| `runtime/pi_handoff.py` | Hook entry: Interrupt route pause and cli-queue recovery evidence; reads legacy Stop-hook bindings only so `upgrade` can refuse them |
 | `runtime/pi_board.py` | Shared evidence board, event decisions, queue claims and deterministic CLI transport |
 | `runtime/pi_takeover.py` | Read-only failure-policy fold from exact review decisions; a new task pins two complete deliveries (historical pins 1/2 and legacy 3 stay frozen) and the second failure transfers implementation to the existing Codex task |
 | `runtime/pi_copy.py` / `pi_size.py` | Bounded evidence copying and byte scans without following symlinks |
-| `hooks/hooks.json` | Plugin-discovered synchronous Stop, Interrupt and recovery commands; requires host trust |
+| `hooks/hooks.json` | Plugin-discovered Interrupt, SessionStart and UserPromptSubmit commands (no Stop hook); requires host trust |
 | `runtime/VERSION` | Runtime version copied into every task state |
 
 `pi_summary.py` and `pi_check.py` are derived from the already-tested
@@ -96,7 +95,7 @@ exists only in the linked project checkout, and the primary is not the target.
 - `continue` requires the frozen `repo` identity to match the supplied
   checkout; a different checkout is rejected with guidance to pass `--repo`
   inside the frozen checkout. This closes `--repo` inversion attempts even when
-  the other checkout has no config. `result`, `wait` and `cancel` continue to
+  the other checkout has no config. `result` and `cancel` continue to
   read common-dir evidence from any checkout of the project.
 - The freeze records the checkout that started the task, so a task can never
   silently switch projects or configs on continuation.
@@ -157,9 +156,6 @@ error.
 - `result` — bounded state, all rounds (including every failed prior attempt),
   bounded summary and evidence pointers; no raw logs or command traces by
   default. `supervisorAlive` and `activeWorker` expose lock truth.
-- `wait` — internal bounded wait (default/max 60000 ms); timeout never cancels
-  Pi. This command itself cannot wake a finished main turn; registered board
-  delivery is the separate automatic continuation path. Do not spin repeat waits.
 - `cancel` — writes an explicit request for the live supervisor, which stops its
   Pi process group including descendants that ignore SIGTERM. If the supervisor
   is gone but an orphaned Pi still holds the task lock, it returns
@@ -259,8 +255,6 @@ double in `tests/doubles/`. Coverage includes:
 - An orphaned Pi or supervisor is never killed automatically. `result` reports
   `unknown` plus recorded PIDs, and the operator must inspect and clean the exact
   processes; the runtime does not signal unverified PIDs.
-- `wait` cannot deliver an automatic wake after a caller turn ends, and its
-  timeout gives no evidence that Pi stopped.
 - Config checks/constraints are text passed to Pi; the runtime never executes
   them. Real acceptance remains with the project's checks and Codex review.
 - Unreported provider usage stays `null`/unknown; no cost or capability claims.

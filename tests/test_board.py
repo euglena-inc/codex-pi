@@ -62,15 +62,6 @@ def run_hook(payload: dict, env: dict, timeout: float = 15,
                           capture_output=True, text=True, env=env, timeout=timeout)
 
 
-def run_handoff(*args, env: dict, expect: int | None = None, timeout: float = 60):
-    proc = subprocess.run([sys.executable, str(HOOK), *[str(arg) for arg in args]],
-                          capture_output=True, text=True, env=env, timeout=timeout)
-    if expect is not None and proc.returncode != expect:
-        raise AssertionError(f"pi_handoff {' '.join(str(arg) for arg in args)} exited "
-                             f"{proc.returncode}, expected {expect}\n{proc.stdout}\n{proc.stderr}")
-    return proc
-
-
 def make_cli_double(directory: Path, name: str = "codex-double", behavior: str = "ok",
                     seconds: float = 5.0, code: int = 2):
     """A queue-only Codex double. Forbidden capabilities exit 9."""
@@ -139,6 +130,23 @@ def captured_runner(calls, status="queued"):
     return run
 
 
+# The ``dispatch`` CLI entry was removed (the supervisor calls the function
+# internally). Tests drive the same function in a child process so environment
+# (fake codex, handoff root) and concurrency semantics stay real.
+DISPATCH_SNIPPET = (
+    "import json, sys; sys.path.insert(0, sys.argv[1]); import pi_board; "
+    "_r, _c, board_file = pi_board.board_file_for_repo(sys.argv[2]); "
+    "timeout = float(sys.argv[4]) if len(sys.argv) > 4 else None; "
+    "print(json.dumps(pi_board.dispatch_task(board_file, sys.argv[3], timeout=timeout)))")
+
+
+def dispatch_argv(repo_root, task: str, timeout=None) -> list:
+    argv = [sys.executable, "-c", DISPATCH_SNIPPET, str(RUNTIME), str(repo_root), task]
+    if timeout is not None:
+        argv.append(str(timeout))
+    return argv
+
+
 class BoardTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="codex-pi-board4-")
@@ -180,10 +188,10 @@ class BoardTest(unittest.TestCase):
         return board_json("refresh", "--repo", str(repo.root), "--task", task, env=env)
 
     def dispatch(self, repo, task: str, env: dict, **extra) -> dict:
-        args = ["dispatch", "--repo", str(repo.root), "--task", task]
-        for key, value in extra.items():
-            args += [f"--{key.replace('_', '-')}", str(value)]
-        return board_json(*args, env=env)
+        proc = subprocess.run(dispatch_argv(repo.root, task, extra.get("timeout")),
+                              capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
 
     def read_board(self, repo) -> dict:
         return json.loads((repo.state_dir / "board.json").read_text(encoding="utf-8"))
@@ -442,8 +450,7 @@ class BoardTest(unittest.TestCase):
         write_board(repo, board)
         queue_path = repo.state_dir / "board.queue.json"
         queue_path.write_text("{broken", encoding="utf-8")
-        failed = run_board("dispatch", "--repo", repo.root, "--task", "bad-queue", env=env)
-        failed_payload = json.loads(failed.stdout)
+        failed_payload = self.dispatch(repo, "bad-queue", env)
         self.assertFalse(failed_payload["dispatched"])
         self.assertIn("queue state is invalid", failed_payload["error"])
         self.assertFalse(marker.exists(), "a corrupt queue must not send anything")
@@ -804,28 +811,6 @@ class BoardTest(unittest.TestCase):
         self.assertIn("simulated status failure", record.get("error") or "")
 
     # ------------------------------------------------------------------
-    # legacy Stop overlap
-    # ------------------------------------------------------------------
-    def test_arm_and_stop_are_disabled_for_cli_queue_tasks(self):
-        repo, worktree = self.make()
-        env = self.h_env(self.tmp, PI_DOUBLE_MODE="ok")
-        double, _marker = make_cli_double(self.tmp)
-        repo.start("board-overlap", worktree, env=env)
-        self.assertEqual(repo.wait_terminal("board-overlap", env=env)["state"], "completed")
-        armed = run_handoff("arm", "--repo", repo.root, "--task", "board-overlap", "--round", "1",
-                            "--session-id", THREAD_A, env=env)
-        self.assertEqual(armed.returncode, 0)
-        self.register(repo, "board-overlap", env, thread=THREAD_A, codex_bin=double)
-        refused = run_handoff("arm", "--repo", repo.root, "--task", "board-overlap", "--round", "1",
-                              "--session-id", THREAD_B, env=env, expect=2)
-        self.assertIn("cli-queue", refused.stderr)
-        hook = json.loads(run_hook({"hook_event_name": "Stop", "session_id": THREAD_A,
-                                    "cwd": str(repo.root)}, env).stdout)
-        self.assertNotEqual(hook.get("decision"), "block",
-                            "the board queue owns the notification")
-        self.assertIn("cli-queue", json.dumps(hook))
-
-    # ------------------------------------------------------------------
     # helper upgrade
     # ------------------------------------------------------------------
     def test_cli_double_allows_only_queue_and_rejects_forbidden_capabilities(self):
@@ -850,8 +835,7 @@ class BoardTest(unittest.TestCase):
         pi_board.add_event(board["cards"]["race-task"], "review_required", 3, "completed:abc:0",
                            "terminal", {"round": 3, "head": "a" * 40}, {}, "review", 1)
         write_board(repo, board)
-        procs = [subprocess.Popen([sys.executable, str(BOARD), "dispatch", "--repo",
-                                   str(repo.root), "--task", "race-task"],
+        procs = [subprocess.Popen(dispatch_argv(repo.root, "race-task"),
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
                  for _ in range(3)]
         results = []

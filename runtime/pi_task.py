@@ -3323,327 +3323,6 @@ def _scan_checks(checks_dir: Path) -> dict:
     return result
 
 
-# ---------------------------------------------------------------------------
-# compact observer check (per-observer observation dedup, never acceptance)
-# ---------------------------------------------------------------------------
-
-OBSERVER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}\Z")
-OBSERVER_DIR = "observers"
-OBSERVER_CURSOR_MAX_BYTES = 65536
-OBSERVER_MAX_ALERTS = 200
-OBSERVER_MAX_LIST = 20
-OBSERVER_LOCK_TIMEOUT = 10.0
-
-
-def _observer_state_paths(task_dir: Path, observer: str):
-    """Cursor/lock paths below the task evidence dir, refusing symlink escapes."""
-    if not isinstance(observer, str) or not OBSERVER_RE.fullmatch(observer):
-        raise ValueError("observer must be a safe owner thread id (letters, digits, '_' or '-', "
-                         "max 100 chars)")
-    task_real = task_dir.resolve()
-    directory = task_dir / OBSERVER_DIR
-    if directory.is_symlink():
-        raise ValueError(f"observer directory must not be a symlink: {directory}")
-    if directory.exists() and not directory.is_dir():
-        raise ValueError(f"observer path is not a directory: {directory}")
-    directory.mkdir(mode=0o700, exist_ok=True)
-    if directory.is_symlink() or directory.resolve() != task_real / OBSERVER_DIR:
-        raise ValueError(f"observer directory escapes the task evidence dir: {directory}")
-    cursor = directory / f"{observer}.json"
-    lock = directory / f"{observer}.lock"
-    for path in (cursor, lock):
-        if path.is_symlink():
-            raise ValueError(f"observer state file must not be a symlink: {path}")
-        if path.exists() and path.resolve() != directory.resolve() / path.name:
-            raise ValueError(f"observer state file escapes the task evidence dir: {path}")
-    return cursor, lock
-
-
-def _read_observer_cursor(path: Path, observer: str, task: str):
-    """Read a bounded cursor; corrupt/oversized/foreign metadata is unknown, not success."""
-    if not path.exists():
-        return None, "absent"
-    data, problem = _read_bounded_json(path, OBSERVER_CURSOR_MAX_BYTES)
-    if problem is not None:
-        return None, problem
-    if (not isinstance(data, dict) or data.get("schemaVersion") != 1
-            or data.get("observer") != observer or data.get("task") != task
-            or not isinstance(data.get("signal"), dict)
-            or not isinstance(data.get("alerts"), dict)):
-        return None, "unrecognized"
-    alerts = {}
-    for key, meta in list(data["alerts"].items())[:OBSERVER_MAX_ALERTS]:
-        if not isinstance(key, str) or len(key) > 400 or not isinstance(meta, dict):
-            continue
-        first_seen = meta.get("firstSeenAt")
-        if isinstance(first_seen, bool) or not isinstance(first_seen, (int, float)):
-            first_seen = 0
-        alerts[key] = {"kind": _clip(meta.get("kind"), 60), "firstSeenAt": first_seen}
-    return {"signal": data["signal"], "alerts": alerts}, None
-
-
-def _observer_signal(status: dict) -> dict:
-    """Meaningful structure only: no mtimes, log sizes, timestamps or token churn."""
-    checks = status.get("checks") or {}
-    receipts = checks.get("receipts") or {}
-    running = checks.get("running")
-    latest = receipts.get("latest")
-    guard = checks.get("resourceGuard") or {}
-    resource_sources = sorted({
-        f"{entry.get('source')}:{entry.get('name')}" for entry in
-        (guard.get("breaches") or []) + (guard.get("unknownScans") or [])
-        if isinstance(entry, dict)})
-    return {
-        "round": status.get("round"),
-        "latestRound": status.get("latestRound"),
-        "state": status.get("state"),
-        "recordedState": status.get("recordedState"),
-        "activeWorker": bool((status.get("ownership") or {}).get("activeWorker")),
-        "supervisorAlive": bool((status.get("ownership") or {}).get("supervisorAlive")),
-        "running": None if not isinstance(running, dict) else {
-            "id": running.get("id"), "marker": running.get("marker")},
-        "latestReceipt": None if not isinstance(latest, dict) else {
-            "id": latest.get("id"), "receipt": latest.get("receipt"),
-            "exitCode": latest.get("exitCode"), "timedOut": bool(latest.get("timedOut")),
-            "failed": bool(latest.get("failed"))},
-        "failedAttempts": receipts.get("failedAttempts"),
-        "resource": {"breached": bool(guard.get("breached")),
-                     "unknown": bool(guard.get("unknown")),
-                     "sources": resource_sources[:20]},
-    }
-
-
-def _observer_alerts(status: dict) -> list:
-    """Current actionable facts. Each has a stable key for observation dedup."""
-    checks = status.get("checks") or {}
-    receipts = checks.get("receipts") or {}
-    directory = checks.get("dir")
-    round_number = status.get("round")
-    alerts = []
-
-    def add(key, kind, severity, message, evidence=None, review=False):
-        alerts.append({"key": key, "kind": kind, "severity": severity, "round": round_number,
-                       "message": _clip(message, 300), "evidence": evidence or {},
-                       "reviewRequired": bool(review)})
-
-    def receipt_evidence(name):
-        if isinstance(directory, str) and isinstance(name, str):
-            return str(Path(directory) / name)
-        return None
-
-    for item in receipts.get("failedRecent") or []:
-        stem = item.get("receipt")
-        if not isinstance(stem, str):
-            continue
-        evidence = {"checksDir": directory,
-                    "receipt": receipt_evidence(stem),
-                    "log": receipt_evidence(item.get("log"))}
-        if item.get("timedOut"):
-            add(f"check-timeout:{stem}", "check_timeout", "high",
-                f"check {item.get('id')!r} timed out; the wrapper stopped the owned process group",
-                evidence)
-        else:
-            add(f"check-failed:{stem}", "check_failed", "high",
-                f"check {item.get('id')!r} failed with exit {item.get('exitCode')}", evidence)
-    for item in receipts.get("unknownExitRecent") or []:
-        stem = item.get("receipt")
-        if not isinstance(stem, str):
-            continue
-        add(f"check-unknown:{stem}", "check_unknown", "medium",
-            f"check {item.get('id')!r} has an unknown exit code; the receipt is inconclusive",
-            {"checksDir": directory, "receipt": receipt_evidence(stem)})
-    guard = checks.get("resourceGuard") or {}
-    for breach in guard.get("breaches") or []:
-        name = breach.get("name") or breach.get("source")
-        add(f"resource-breach:{name}", "resource_breach", "high",
-            f"resource budget breached: observed {breach.get('observedBytes')} bytes exceed "
-            f"max {breach.get('maxBytes')} under {breach.get('path')} ({breach.get('reason')})",
-            {"checksDir": directory, "name": name})
-    state = status.get("state")
-    recorded = status.get("recordedState")
-    ownership = status.get("ownership") or {}
-    state_evidence = {"state": (status.get("evidence") or {}).get("state")}
-    if state == "unknown" and recorded in ACTIVE_STATES:
-        add(f"orphan:{round_number}", "orphan", "high",
-            "recorded active state without a live supervisor lease; ownership is unknown, "
-            "not progress", state_evidence)
-    if recorded in TERMINAL_STATES and ownership.get("activeWorker") \
-            and not ownership.get("supervisorAlive"):
-        add(f"lingering:{round_number}:{recorded}", "lingering_worker", "high",
-            "a worker lock is still held after a terminal record; inspect before reuse",
-            state_evidence)
-    if state in TERMINAL_STATES:
-        add(f"round-terminal:{round_number}:{state}", "round_terminal", "high",
-            f"round {round_number} reached terminal state {state}; main review is required and "
-            "this observation is not acceptance", state_evidence, review=True)
-    return alerts
-
-
-def _compact_checks(status: dict) -> dict:
-    """Changed-beat check projection without transcript or log tails."""
-    checks = status.get("checks") or {}
-    receipts = checks.get("receipts") or {}
-    running = checks.get("running")
-    return {
-        "dir": checks.get("dir"), "partial": bool(checks.get("partial")),
-        "running": None if not isinstance(running, dict) else {
-            "id": running.get("id"), "marker": running.get("marker"),
-            "pidAlive": running.get("pidAlive"), "startedAt": running.get("startedAt"),
-            "deadlineAt": running.get("deadlineAt"),
-            "resourceLimit": running.get("resourceLimit")},
-        "receipts": {"total": receipts.get("total"), "scanned": receipts.get("scanned"),
-                     "truncated": bool(receipts.get("truncated")),
-                     "failedAttempts": receipts.get("failedAttempts"),
-                     "latest": receipts.get("latest"),
-                     "latestFailed": receipts.get("latestFailed"),
-                     "latestSuccessful": receipts.get("latestSuccessful")},
-        "legacyCandidate": checks.get("legacyCandidate"),
-    }
-
-
-def build_observer_check(repo_arg: str, task_arg: str, observer_arg: str) -> dict:
-    """One compact dedup observation; writes only this observer's cursor."""
-    observer = observer_arg
-    if not isinstance(observer, str) or not OBSERVER_RE.fullmatch(observer):
-        raise ValueError("observer must be a safe owner thread id (letters, digits, '_' or '-', "
-                         "max 100 chars)")
-    task = require_task_arg(task_arg)
-    root = canonical_root(Path(repo_arg))
-    common = git_common_dir(root)
-    task_dir = task_dir_for(common, task)
-    if not task_dir.is_dir():
-        raise ValueError(f"unknown task {task!r} for repository {root}; no evidence at {task_dir}")
-    status = build_status(repo_arg, task)
-    cursor_path, lock_path = _observer_state_paths(task_dir, observer)
-    signal = _observer_signal(status)
-    current = _observer_alerts(status)
-    checks = status.get("checks") or {}
-    receipts = checks.get("receipts") or {}
-    scan_complete = not checks.get("partial") and not receipts.get("truncated")
-    unknown = []
-    if not scan_complete:
-        unknown.append("the check evidence scan was partial/truncated; missing evidence is "
-                       "unknown, not success")
-    if not checks.get("exists"):
-        unknown.append("no check evidence directory exists yet; absence is missing evidence")
-
-    fd = lock_fd(lock_path, blocking=True, timeout=OBSERVER_LOCK_TIMEOUT)
-    try:
-        cursor, problem = _read_observer_cursor(cursor_path, observer, task)
-        first = cursor is None
-        if problem not in (None, "absent"):
-            unknown.append(f"observer cursor was {problem}; dedup state was reset and nothing "
-                           "was acknowledged")
-        stored = cursor["alerts"] if cursor is not None else {}
-        stored_signal = cursor["signal"] if cursor is not None else None
-        changed = first or stored_signal != signal
-        current_keys = {alert["key"] for alert in current}
-        new_alerts = [alert for alert in current if alert["key"] not in stored]
-        unresolved = [dict(alert, new=False) for alert in current if alert["key"] in stored]
-        if not scan_complete:
-            # A bounded/partial scan cannot prove a previously seen fact is gone.
-            for key, meta in stored.items():
-                if key not in current_keys:
-                    unresolved.append({
-                        "key": key, "kind": meta.get("kind") or "retained", "severity": "medium",
-                        "round": status.get("round"),
-                        "message": "previously observed fact retained while the bounded scan is "
-                                   "incomplete", "evidence": {}, "reviewRequired": False, "new": False})
-        now = time.time()
-        record = {}
-        for alert in current:
-            previous = stored.get(alert["key"]) if isinstance(stored.get(alert["key"]), dict) else {}
-            record[alert["key"]] = {"kind": alert["kind"],
-                                    "firstSeenAt": previous.get("firstSeenAt") or now}
-        if not scan_complete:
-            for alert in unresolved:
-                previous = stored.get(alert["key"]) if isinstance(stored.get(alert["key"]), dict) else {}
-                record.setdefault(alert["key"], {"kind": alert.get("kind"),
-                                                 "firstSeenAt": previous.get("firstSeenAt") or now})
-        if len(record) > OBSERVER_MAX_ALERTS:
-            newest = sorted(record.items(), key=lambda item: item[1].get("firstSeenAt") or 0)
-            record = dict(newest[-OBSERVER_MAX_ALERTS:])
-        atomic(cursor_path, {"schemaVersion": 1, "observer": observer, "task": task,
-                             "updatedAt": now, "signal": signal, "alerts": record,
-                             "lastObservation": "changed" if changed else "unchanged"})
-    finally:
-        os.close(fd)
-
-    def compact(alert, is_new: bool) -> dict:
-        return {"key": alert.get("key"), "kind": alert.get("kind"),
-                "severity": alert.get("severity"), "round": alert.get("round"),
-                "new": is_new, "message": _clip(alert.get("message"), 300),
-                "reviewRequired": bool(alert.get("reviewRequired")),
-                "evidence": alert.get("evidence") or {}}
-
-    guard = checks.get("resourceGuard") or {}
-    review_required = status.get("state") in TERMINAL_STATES
-    result = {
-        "schemaVersion": 1, "command": "check", "observer": observer,
-        "task": status.get("task"), "repo": status.get("repo"),
-        "round": status.get("round"), "latestRound": status.get("latestRound"),
-        "state": status.get("state"), "recordedState": status.get("recordedState"),
-        "changed": changed, "firstObservation": first,
-        "observation": "changed" if changed else "unchanged",
-        "newAlertCount": len(new_alerts), "unresolvedAlertCount": len(unresolved),
-        "alerts": [compact(alert, alert["key"] not in stored) for alert in current[:OBSERVER_MAX_LIST]],
-        "newAlerts": [compact(alert, True) for alert in new_alerts[:OBSERVER_MAX_LIST]],
-        "unresolvedAlerts": [compact(alert, False) for alert in unresolved[:OBSERVER_MAX_LIST]],
-        "resources": {"breached": bool(guard.get("breached")), "unknown": bool(guard.get("unknown")),
-                      "breaches": guard.get("breaches") or [],
-                      "unknownScans": guard.get("unknownScans") or [],
-                      "running": guard.get("running"), "latestReceipt": guard.get("latestReceipt")},
-        "acceptance": "not_verified", "reviewRequired": review_required,
-        "unknown": unknown,
-        "dedup": "observation dedup for this observer only; it never acknowledges delivery, "
-                 "acceptance, handoff or task ownership",
-        "evidence": status.get("evidence"),
-        "cursor": {"path": str(cursor_path), "written": True},
-    }
-    if len(current) > OBSERVER_MAX_LIST:
-        result["alertsTruncated"] = len(current) - OBSERVER_MAX_LIST
-    if changed:
-        result["checks"] = _compact_checks(status)
-        result["instruction"] = ("changed evidence: review only the listed new alerts and their exact "
-                                 "evidence pointers; terminal observations stay unaccepted until main "
-                                 "review; quiet logs are not progress")
-    else:
-        result["instruction"] = ("unchanged since the previous observation for this observer: do not "
-                                 "reread logs and do not wait; nothing new was delivered")
-    if not scan_complete:
-        result["instruction"] += "; the bounded scan was partial, so absence is unknown, not success"
-    if review_required:
-        result["instruction"] += "; a terminal round requires main review and is never acceptance"
-    return result
-
-
-def cmd_check(args) -> dict:
-    return build_observer_check(args.repo, args.task, args.observer)
-
-
-def _wait_probe(repo_arg: str, task_arg: str, round_arg=None) -> str:
-    """Cheap active-state probe: one state read plus two lock checks, no scans."""
-    task = require_task_arg(task_arg)
-    root = canonical_root(Path(repo_arg))
-    common = git_common_dir(root)
-    task_dir = task_dir_for(common, task)
-    if not task_dir.is_dir():
-        raise ValueError(f"unknown task {task!r} for repository {root}; no evidence at {task_dir}")
-    rounds = list_rounds(task_dir)
-    if not rounds:
-        raise ValueError(f"task {task!r} has no rounds yet; start it before waiting")
-    latest_number = rounds[-1][0]
-    selected_number = latest_number if round_arg is None else int(round_arg)
-    if selected_number not in [number for number, _ in rounds]:
-        raise ValueError(f"round {selected_number} does not exist for task {task!r}")
-    selected_dir = task_dir / "rounds" / str(selected_number)
-    task_held = lock_is_held(task_dir / ".task.lock")
-    supervisor_alive = lock_is_held(task_dir / ".supervisor.lock")
-    state = read_json(selected_dir / "round.state.json", None)
-    state = state if isinstance(state, dict) else {}
-    return effective_state(state, task_held, supervisor_alive, selected_number == latest_number)
-
-
 def _head_probe(worktree: Path):
     """Bounded read-only current HEAD probe for an active round."""
     try:
@@ -4018,35 +3697,6 @@ def cmd_status(args) -> dict:
     return build_status(args.repo, args.task, args.round)
 
 
-def cmd_wait(args) -> dict:
-    timeout_ms = args.timeout_ms
-    if timeout_ms is None:
-        timeout_ms = 60000
-    timeout_ms = max(0, min(60000, int(timeout_ms)))
-    deadline = time.monotonic() + timeout_ms / 1000
-    timed_out = False
-    state = None
-    while True:
-        state = _wait_probe(args.repo, args.task, args.round)
-        if state not in ACTIVE_STATES:
-            break
-        if time.monotonic() >= deadline:
-            timed_out = True
-            break
-        time.sleep(min(0.3, max(0.05, deadline - time.monotonic())))
-    wait = {"timeoutMs": timeout_ms, "timedOut": timed_out,
-            "note": "waiting never cancels the worker; this command is a diagnostic only",
-            "instruction": ("do not call wait again: end the turn and let the supervisor's queue "
-                            "event deliver the result; read result once after that event")}
-    if state in TERMINAL_STATES:
-        result = build_result(args.repo, args.task, args.round)
-        result["wait"] = wait
-        return result
-    status = build_status(args.repo, args.task, args.round)
-    status["wait"] = wait
-    return status
-
-
 def cmd_upgrade(args) -> dict:
     """Safely replace a non-running task's frozen helper snapshot.
 
@@ -4083,6 +3733,21 @@ def cmd_upgrade(args) -> dict:
         frozen_repo = frozen.get("repo")
         if not isinstance(frozen_repo, str) or Path(frozen_repo).expanduser().resolve() != root:
             raise ValueError(f"task {task!r} belongs to checkout {frozen_repo!r}, not {root}")
+        legacy = []
+        try:
+            from pi_handoff import legacy_stop_bindings
+            legacy = legacy_stop_bindings(root, task)
+        except Exception:  # noqa: BLE001 - an unreadable binding store must not block upgrades
+            legacy = []
+        if legacy:
+            first = legacy[0]
+            raise ValueError(
+                f"task {task!r} is still bound to the legacy Stop-hook handoff route "
+                f"(event {first.get('eventKey')}, state {first.get('state')!r}); this runtime no "
+                "longer delivers through it and will not adopt the task. Finish it with its "
+                f"frozen helpers: python3 {task_dir / 'tools' / 'pi_task.py'} result --repo {root} "
+                f"--task {task}, review the exact candidate yourself, then retire the "
+                f"binding record {first.get('path')} (user action) and run upgrade again.")
         rounds = list_rounds(task_dir)
         if not rounds:
             raise ValueError(f"task {task!r} has no rounds yet")
@@ -4309,19 +3974,6 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_task(status)
     status.add_argument("--round", type=int)
     status.set_defaults(func=cmd_status)
-
-    check = sub.add_parser("check", help="compact per-observer dedup observation "
-                                          "(writes only its own cursor)")
-    add_repo_task(check)
-    check.add_argument("--observer", required=True,
-                       help="owner thread id whose private observation cursor is used")
-    check.set_defaults(func=cmd_check)
-
-    wait = sub.add_parser("wait", help="bounded internal wait for a terminal state (never cancels)")
-    add_repo_task(wait)
-    wait.add_argument("--round", type=int)
-    wait.add_argument("--timeout-ms", type=int, default=60000)
-    wait.set_defaults(func=cmd_wait)
 
     cancel = sub.add_parser("cancel", help="request cancellation of the owned worker's process group")
     add_repo_task(cancel)

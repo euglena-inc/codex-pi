@@ -2594,12 +2594,6 @@ def cmd_refresh(args) -> dict:
                                block=True, source="cli")
 
 
-def cmd_dispatch(args) -> dict:
-    _root, _common, board_file = board_file_for_repo(args.repo)
-    task_id = require_task_arg(args.task)
-    return dispatch_task(board_file, task_id, timeout=args.timeout)
-
-
 def cmd_show(args) -> dict:
     _root, _common, board_file = board_file_for_repo(args.repo)
     board, problem = read_board(board_file)
@@ -2619,38 +2613,6 @@ def cmd_show(args) -> dict:
     return {"ok": True, "revision": board.get("revision"), "count": len(cards),
             "cards": [compact_card(card) for card in cards],
             "monitor": _monitor_view(board_file, task_ids), "queue": queues}
-
-
-def cmd_packet(args) -> dict:
-    _root, _common, board_file = board_file_for_repo(args.repo)
-    task_id = require_task_arg(args.task)
-    board, problem = read_board(board_file)
-    if board is None:
-        raise ValueError(f"board state is {problem}: {board_file}")
-    card = board["cards"].get(task_id)
-    if not isinstance(card, dict):
-        raise ValueError(f"task {task_id!r} is not registered on this board")
-    events = pending_events(card)
-    if args.event_id:
-        events = [event for event in events if event.get("id") == args.event_id]
-    if not events:
-        return {"ok": True, "taskId": task_id, "pendingCount": 0,
-                "transport": card.get("transport"),
-                "monitor": _monitor_view(board_file, [task_id]).get(task_id),
-                "queue": queue_view(board_file, task_id),
-                "note": "no unhandled events for this task"}
-    text, included = build_packet(card, events)
-    return {"ok": True, "taskId": task_id, "revision": board.get("revision"),
-            "title": card.get("title"), "goal": card.get("goal"),
-            "transport": card.get("transport"), "ownerThread": card.get("ownerThread"),
-            "pendingCount": len(events), "overflow": card.get("overflow"),
-            "monitor": _monitor_view(board_file, [task_id]).get(task_id),
-            "queue": queue_view(board_file, task_id),
-            "includedEventIds": [event["id"] for event in included],
-            "packet": text,
-            "events": [compact_event(event) for event in events[:5]],
-            "limitations": [QUEUE_LIMITATION],
-            "note": "reading/delivering does not handle or accept; use decide"}
 
 
 def cmd_decide(args) -> dict:
@@ -2711,24 +2673,12 @@ def build_parser() -> argparse.ArgumentParser:
     refresh.add_argument("--task", required=True)
     refresh.set_defaults(func=cmd_refresh)
 
-    dispatch = sub.add_parser("dispatch", help="one bounded cli-queue dispatch of new events")
-    dispatch.add_argument("--repo", required=True)
-    dispatch.add_argument("--task", required=True)
-    dispatch.add_argument("--timeout", type=float)
-    dispatch.set_defaults(func=cmd_dispatch)
-
     show = sub.add_parser("show", help="bounded compact cards for one thread or task")
     show.add_argument("--repo", required=True)
     show.add_argument("--thread")
     show.add_argument("--task")
     show.add_argument("--all", action="store_true")
     show.set_defaults(func=cmd_show)
-
-    packet = sub.add_parser("packet", help="bounded runtime-handoff packet for one task")
-    packet.add_argument("--repo", required=True)
-    packet.add_argument("--task", required=True)
-    packet.add_argument("--event-id")
-    packet.set_defaults(func=cmd_packet)
 
     decide = sub.add_parser("decide", help="handle one exact event with an explicit decision")
     decide.add_argument("--repo", required=True)

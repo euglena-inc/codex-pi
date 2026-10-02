@@ -302,22 +302,6 @@ class LifecycleTest(unittest.TestCase):
         subdir = repo.start("x5", nested, env=env, expect=2)
         self.assertIn("checkout root", subdir.stderr)
 
-    def test_wait_timeout_does_not_cancel_and_result_remains_bounded(self):
-        repo, worktree = self.make()
-        env = base_env(PI_DOUBLE_MODE="hang")
-        repo.start("waiting", worktree, env=env)
-        data = cli_json("wait", "--repo", str(repo.root), "--task", "waiting",
-                        "--timeout-ms", "500", env=env)
-        self.assertTrue(data["wait"]["timedOut"])
-        self.assertEqual(data["state"], "running")
-        self.assertIn("never cancels", data["wait"]["note"])
-        self.assertEqual(data["acceptance"], "not_verified")
-        # Still alive after the wait timeout.
-        self.assertTrue(pid_alive(json.loads(
-            (repo.task_dir("waiting") / "rounds" / "1" / "round.state.json").read_text())["piPid"]))
-        repo.cancel("waiting", env=env)
-        repo.wait_terminal("waiting", env=env, timeout=20)
-
     def test_cancel_on_terminal_task_signals_nothing(self):
         repo, worktree = self.make()
         env = base_env(PI_DOUBLE_MODE="ok")
