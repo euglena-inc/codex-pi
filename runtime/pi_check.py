@@ -349,13 +349,36 @@ def main():
         # The immutable receipt replaces the terminal state; the marker is
         # removed in the final cleanup below even if receipt writing fails.
         atomic(receipt, data)
-        print(json.dumps({'receipt': str(receipt.resolve()), 'exit_code': code, 'timed_out': timed_out,
-                          'cancelled': caught['signal'] is not None,
-                          'resource_limit': data['resource_limit'],
-                          'test_counts': counts, 'acceptance': 'not_verified'}))
+        out = {'receipt': str(receipt.resolve()), 'exit_code': code, 'timed_out': timed_out,
+               'cancelled': caught['signal'] is not None,
+               'resource_limit': data['resource_limit'],
+               'test_counts': counts, 'acceptance': 'not_verified'}
+        if code != 0 or timed_out or caught['signal'] is not None:
+            # stdout only; the immutable receipt is unchanged.
+            out['log_tail'] = log_tail(raw)
+        print(json.dumps(out))
         return code
     finally:
         remove_running(marker)
+
+
+def log_tail(raw: bytes, max_lines: int = 20, max_bytes: int = 2000) -> str:
+    """Last lines of a failing check log for Pi: <=20 lines, <=2000 UTF-8 bytes.
+
+    The bytes are decoded with replacement; the result is re-measured after
+    decoding so a replacement character can never push it over the cap.
+    """
+    chunk = raw[-max_bytes:]
+    start = 0
+    while start < len(chunk) and 0x80 <= chunk[start] <= 0xBF and start < 4:
+        start += 1  # drop a leading partial multibyte sequence
+    lines = chunk[start:].decode('utf-8', errors='replace').splitlines()[-max_lines:]
+    text = '\n'.join(lines)
+    encoded = text.encode('utf-8')
+    while len(encoded) > max_bytes:
+        text = text[1:]
+        encoded = text.encode('utf-8')
+    return text
 
 
 if __name__ == '__main__':

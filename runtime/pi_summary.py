@@ -74,7 +74,8 @@ def summarize(log: Path, worktree: Path, run_dir: Path | None = None,
               expected_model: str | None = None, checks_dir: Path | None = None) -> dict:
     run_dir = (run_dir or log.parent).resolve()
     worktree = worktree.resolve()
-    allowed = [worktree, run_dir]
+    allowed = [worktree, run_dir, (run_dir.parent.parent / "tools")]
+    escape_writes, escape_reads = [], 0
     meta = read_meta(log.with_suffix(".meta"))
     expected_model = expected_model or meta.get("model")
     models, stop_reasons, counts, totals = Counter(), Counter(), Counter(), Counter()
@@ -105,6 +106,10 @@ def summarize(log: Path, worktree: Path, run_dir: Path | None = None,
                 path = Path(args["path"])
                 if not inside(path if path.is_absolute() else worktree / path, allowed):
                     flags.append(f"line {line_no}: {tool} outside allowed directories: {str(path)[:180]}")
+                    if tool == "read":
+                        escape_reads += 1
+                    else:
+                        escape_writes.append(f"line {line_no}: {tool} {str(path)[:160]}")
             elif tool == "bash":
                 for path in ABS_PATH.findall(text):
                     if not inside(Path(path), allowed):
@@ -159,6 +164,8 @@ def summarize(log: Path, worktree: Path, run_dir: Path | None = None,
             "reported_cost_usd": cost if cost_samples else None, "cost_samples": cost_samples,
             "stop_reasons": dict(stop_reasons), "tool_counts": dict(counts),
             "commands": commands, "guardrail_flags": list(dict.fromkeys(flags)),
+            "scope_escape": {"write_edit_count": len(escape_writes),
+                             "write_edit": escape_writes[:20], "read_count": escape_reads},
             "errors": errors, "malformed_lines": malformed, "final_text": final,
             "check_receipts": receipts(check_dir), "checks_dir": str(check_dir.resolve()),
             "process_exit": meta.get("exit"),
@@ -212,6 +219,7 @@ def bounded(data: dict, receipt_limit: int = 8) -> dict:
             "stop_reasons": data["stop_reasons"], "tool_counts": data["tool_counts"],
             "guardrail_flags": data["guardrail_flags"][:20],
             "guardrail_flag_count": len(data["guardrail_flags"]),
+            "scope_escape": data.get("scope_escape"),
             "errors": data["errors"][:20], "error_count": len(data["errors"]),
             "malformed_lines": data["malformed_lines"],
             "final_excerpt": data["final_text"][:1200],
@@ -229,6 +237,9 @@ def compact(data: dict) -> str:
         lines.append(f"{label}: count={len(items)}")
         lines.extend("  " + str(item)[:240] for item in items[:5])
     commands = data["commands"]
+    escape = data.get("scope_escape") or {}
+    lines.append(f'scope_escape: write_edit={escape.get("write_edit_count", 0)} (blocks readiness) '
+                 f'read={escape.get("read_count", 0)} (counted only)')
     lines.append(f'commands: total={len(commands)} unknown_exit={sum(c["exit_code"] is None for c in commands)} '
                  f'tool_errors={sum(c["tool_error"] is True for c in commands)}')
     checks = data["check_receipts"]

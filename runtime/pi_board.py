@@ -1779,6 +1779,8 @@ def _event_block(card: dict, event: dict) -> list:
     head = (event.get("candidate") or {}).get("head") or "unknown"
     lines = [f"{event.get('kind')} round={event.get('round')} event={event.get('id')} "
              f"head={head}"]
+    if event.get("phaseId"):
+        lines.append(f"phase={event.get('phaseId')} contract={event.get('contractHash')}")
     delivery = event.get("delivery") if isinstance(event.get("delivery"), dict) else {}
     for item in delivery.get("items") or []:
         if isinstance(item, dict):
@@ -2130,18 +2132,18 @@ def _monitor_view(board_file, task_ids) -> dict:
 
 
 def _decide_hint(repo, task_id, event: dict) -> str:
+    """Short decide command (target <= 200 bytes with ordinary paths).
+
+    The event id, candidate head and phase/contract hash are printed once above
+    it on the card; the hint points back at them instead of repeating them.
+    """
     head = (event.get("candidate") or {}).get("head")
-    phase = f" --phase {event.get('phaseId')} --contract-hash {event.get('contractHash')}" \
-        if event.get("phaseId") else ""
-    if event.get("kind") in REVIEW_KINDS and isinstance(head, str) and FULL_OID_RE.fullmatch(head):
-        decision = "accept|reject|changes_requested"
-        suffix = f" --reviewed-head {head}{phase}"
-    else:
-        decision = "resolve|reject|changes_requested"
-        suffix = phase
+    review = event.get("kind") in REVIEW_KINDS and isinstance(head, str) \
+        and bool(FULL_OID_RE.fullmatch(head))
+    options = "accept|reject|changes_requested" if review else "resolve|reject|changes_requested"
     return (f'python3 {shlex.quote(str(Path(__file__).resolve()))} decide '
             f'--repo {shlex.quote(str(repo))} --task {shlex.quote(str(task_id))} '
-            f'--event-id {event.get("id")} --decision {decision}{suffix}')
+            f'--event-id EVENT --decision {options} (EVENT/head/phase/contract above)')
 
 
 # ---------------------------------------------------------------------------

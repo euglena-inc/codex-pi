@@ -116,6 +116,30 @@ def git(cwd: Path, *args: str) -> str:
                                    stderr=subprocess.DEVNULL).strip()
 
 
+def forbidden_checkouts(worktree: Path, task_dir: Path, round_number: int) -> tuple:
+    """Return ``(forbidden roots, allowed roots)`` for the command guard.
+
+    Forbidden: the repository's primary checkout and every other registered
+    worktree of the same repository. Allowed (never forbidden, even when nested
+    under a forbidden root such as the main checkout's ``.git``): this round's
+    worktree, the task ``tools`` directory and the round ``checks`` directory.
+    """
+    roots = []
+    try:
+        listing = git(worktree, "worktree", "list", "--porcelain")
+    except (subprocess.CalledProcessError, OSError):
+        listing = ""
+    own = os.path.realpath(str(worktree))
+    for line in listing.splitlines():
+        if line.startswith("worktree "):
+            path = os.path.realpath(line[len("worktree "):].strip())
+            if path != own and path not in roots:
+                roots.append(path)
+    allowed = [own, str(task_dir / "tools"),
+               str(task_dir / "rounds" / str(round_number) / "round.checks")]
+    return roots, allowed
+
+
 def primary_root(checkout: Path) -> Path:
     """Resolve the repository's primary (main) worktree, if any.
 
@@ -1617,6 +1641,12 @@ def build_phase_snapshot(task_dir: Path, task: dict, round_number: int, *, state
     items, coverage, gaps, budget = evaluate_acceptance_items(contract, candidate_head,
                                                               checks, checks_dir)
     scope = _scope_check(task_dir, record, candidate_head)
+    summary_record = read_json(round_dir / "round.summary.json", None)
+    escape = (summary_record or {}).get("scope_escape") if isinstance(summary_record, dict) else None
+    escape_writes = escape.get("write_edit_count") if isinstance(escape, dict) else 0
+    escape_writes = escape_writes if isinstance(escape_writes, int) \
+        and not isinstance(escape_writes, bool) and escape_writes > 0 else 0
+    escape_reads = escape.get("read_count") if isinstance(escape, dict) else 0
     writer_free = (not lock_is_held(task_dir / ".task.lock")
                    and not lock_is_held(task_dir / ".supervisor.lock"))
     progress_record = read_progress(round_dir)
@@ -1640,6 +1670,10 @@ def build_phase_snapshot(task_dir: Path, task: dict, round_number: int, *, state
         reason = execution_reason
     elif scope.get("status") == "violation":
         status, reason = "not_ready", "files outside the declared phase scope"
+    elif escape_writes:
+        status = "not_ready"
+        reason = (f"SCOPE_ESCAPE: {escape_writes} write/edit tool call(s) outside the round "
+                  "worktree and allowed directories")
     elif any(item["status"] in ("failed", "skipped", "unknown", "missing") for item in items):
         status, reason = "not_ready", "required acceptance evidence is not fully covered"
     elif scope.get("status") == "unknown":
@@ -1661,6 +1695,14 @@ def build_phase_snapshot(task_dir: Path, task: dict, round_number: int, *, state
         gaps.append({"id": "scope", "checkId": None, "status": "violation",
                      "reason": "files outside the declared phase scope: "
                      + ", ".join(scope.get("outOfScope") or [])[:300], "receiptRef": None})
+    if escape_writes:
+        gaps.append({"id": "SCOPE_ESCAPE", "checkId": None, "status": "violation",
+                     "reason": f"{escape_writes} write/edit tool call(s) outside allowed "
+                               "directories (see round.summary.json scope_escape)",
+                     "receiptRef": None})
+    if isinstance(escape_reads, int) and not isinstance(escape_reads, bool) and escape_reads > 0:
+        notes.append(f"{escape_reads} read tool call(s) outside allowed directories were counted; "
+                     "reads do not block readiness")
     ready_for_review = status == "ready" and writer_free
     if status == "ready" and not writer_free:
         notes.append("coverage is complete but a writer lock is still held; the final supervisor "
@@ -1955,14 +1997,98 @@ def snapshot_helpers(source: Path, destination: Path) -> dict:
     return hashes
 
 
+FORBIDDEN_RULE_TEXT = ("Do not run commands that reference the repository's main checkout or another "
+                       "worktree of this repository: the supervisor terminates such an owned bash "
+                       "command (rule forbidden-path). Use only your round worktree.")
+MUST_ASK_LINE = ("If the brief leaves a must-ask item open (see task packet), choose the conservative "
+                 "reading and report it as a spec gap.")
+CONTRACT_MARK_RE = re.compile(r"^worker_contract=full contract_hash=(\S+)", re.M)
+
+
+def worker_contract_key(task_dir: Path) -> str:
+    """Hash that decides whether a round must carry the full worker contract."""
+    record, _problem = read_phase_record(task_dir)
+    if isinstance(record, dict) and record.get("contractSha256"):
+        return str(record["contractSha256"])
+    return "none"
+
+
+def last_full_contract(task_dir: Path, before_round: int):
+    """``(round, contract_hash)`` of the latest earlier round whose brief carried the full contract."""
+    for number in range(before_round - 1, 0, -1):
+        brief = task_dir / "rounds" / str(number) / "brief.md"
+        try:
+            match = CONTRACT_MARK_RE.search(brief.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if match:
+            return number, match.group(1)
+    return None
+
+
+def compose_short_contract(task: dict, round_number: int, prior: dict | None, key: str,
+                           carried_round: int) -> list:
+    """At most 15 lines: identity, frozen pi_check template, boundary, pointer to the full contract."""
+    task_dir = Path(task["taskDir"])
+    round_dir = task_dir / "rounds" / str(round_number)
+    helper = task_dir / "tools" / "pi_check.py"
+    checks_dir = round_dir / "round.checks"
+    phase_record, _problem = read_phase_record(task_dir)
+    timeout = task["timeoutSeconds"]
+    if isinstance(phase_record, dict):
+        value = (phase_record.get("contract") or {}).get("commandTimeoutSeconds")
+        if isinstance(value, (int, float)) and not isinstance(value, bool) \
+                and math.isfinite(float(value)) and float(value) > 0:
+            timeout = float(value)
+    lines = ["---", "## Appended Codex-Pi worker contract (short)",
+             f"worker_contract=short contract_hash={key} task={task['task']} round={round_number}",
+             f"Same worker contract as round {carried_round}; it still applies. "
+             f"Full text: {round_dir / 'contract.md'}",
+             f"Round-1 brief: {task_dir / 'rounds' / '1' / 'brief.md'}",
+             f'Check template: python3 "{helper}" --output-dir "{checks_dir}" --id <safe-id> '
+             f'--timeout-seconds {float(timeout):g} -- <real check command>',
+             f'Only "{task_dir / "tools"}" and "{checks_dir}" may be written outside the worktree.',
+             FORBIDDEN_RULE_TEXT]
+    if prior:
+        lines.append(f"Previous round {prior.get('round')}: outcome={prior.get('state')} "
+                     f"exit={prior.get('exitCode')} head={prior.get('endHead')}; execution "
+                     "evidence only.")
+    lines.append("End with a concise report; never claim acceptance PASS.")
+    return lines
+
+
+def compose_round_texts(task: dict, round_number: int, prompt: str, prior: dict | None) -> tuple:
+    """``(brief text, full contract text)``; the brief carries the contract once per session.
+
+    The full worker contract is written to ``rounds/N/contract.md`` every round
+    for audit. The brief carries it in round 1 and in any round whose phase
+    contract hash differs from the last round that carried it; every other
+    round gets the short header.
+    """
+    task_dir = Path(task["taskDir"])
+    key = worker_contract_key(task_dir)
+    contract = "\n".join(_full_contract_lines(task, round_number, prior, key)) + "\n"
+    carried = last_full_contract(task_dir, round_number)
+    if carried is not None and carried[1] == key:
+        body = "\n".join(compose_short_contract(task, round_number, prior, key, carried[0])) + "\n"
+    else:
+        body = "---\n" + contract
+    return prompt.rstrip() + "\n\n" + body, contract
+
+
 def compose_brief(task: dict, round_number: int, prompt: str, prior: dict | None) -> str:
+    return compose_round_texts(task, round_number, prompt, prior)[0]
+
+
+def _full_contract_lines(task: dict, round_number: int, prior: dict | None, key: str) -> list:
     read_only = bool(task["readOnly"])
     tools = READ_ONLY_TOOLS if read_only else WRITABLE_TOOLS
     task_dir = Path(task["taskDir"])
     round_dir = task_dir / "rounds" / str(round_number)
     helper = task_dir / "tools" / "pi_check.py"
     checks_dir = round_dir / "round.checks"
-    lines = [prompt.rstrip(), "", "---", "## Appended Codex-Pi worker contract", "",
+    lines = ["## Appended Codex-Pi worker contract",
+             f"worker_contract=full contract_hash={key} round={round_number}", "",
              "User directive: do not execute the Codex CLI (`codex`), do not launch any Codex",
              "agent, and do not call an OpenAI model through Codex. The Codex main session",
              "reviews outcomes; this Pi session implements and reports. Never run `codex`.",
@@ -2071,11 +2197,13 @@ def compose_brief(task: dict, round_number: int, prompt: str, prior: dict | None
         "existing evidence and never copies logs into the board):",
         f'  python3 "{task_dir / "tools" / "pi_board.py"}" refresh --repo REPO --task TASK',
         f'Only "{task_dir / "tools"}" and "{checks_dir}" may be written outside the worktree.',
+        FORBIDDEN_RULE_TEXT,
+        MUST_ASK_LINE,
         "",
         "End with a concise report of changes and evidence. Never claim acceptance PASS;",
         "a zero exit code only proves execution finished.",
     ]
-    return "\n".join(lines) + "\n"
+    return lines
 
 
 def write_brief(path: Path, text: str) -> str:
@@ -2394,8 +2522,10 @@ def run_worker(args) -> int:
                                          env=worker_env(), pass_fds=(args.lock_fd,))
             state["piPid"] = child.pid
             atomic(state_path, state)
+            forbidden_roots, allowed_roots = forbidden_checkouts(worktree, task_dir, round_number)
             command_guard = CommandGuard(round_dir, child.pid,
-                ceiling=float((phase_record or {}).get("contract", {}).get("commandTimeoutSeconds") or 3600))
+                ceiling=float((phase_record or {}).get("contract", {}).get("commandTimeoutSeconds") or 3600),
+                forbidden=forbidden_roots, allowed=allowed_roots, cwd=worktree)
             last_command_scan = 0.0
             deadline = time.monotonic() + timeout_seconds
             board_interval = board_refresh_seconds()
@@ -2519,7 +2649,9 @@ def ensure_round_inputs(task_dir: Path, round_number: int, prompt: str, task: di
     try:
         if (round_dir / "brief.md").exists():
             raise ValueError(f"round {round_number} already has a brief; never overwrite evidence")
-        digest = write_brief(round_dir / "brief.md", compose_brief(task, round_number, prompt, prior))
+        brief_text, contract_text = compose_round_texts(task, round_number, prompt, prior)
+        digest = write_brief(round_dir / "brief.md", brief_text)
+        write_brief(round_dir / "contract.md", contract_text)
     except FileExistsError:
         raise ValueError(f"round {round_number} already has a brief; never overwrite evidence") from None
     atomic(round_dir / "round.state.json",
