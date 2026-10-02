@@ -1,0 +1,6 @@
+interface:
+  display_name: "Sol + Luna"
+  short_description: "跨项目复用 Sol 6.1 Medium 设计验收、原生 Luna Max 实施机制"
+  default_prompt: "使用 $sol-luna，由当前 Sol 6.1 Medium 主会话设计验收，把已授权的完整结果交给原生 Luna Max 子代理实施。"
+policy:
+  allow_implicit_invocation: true
