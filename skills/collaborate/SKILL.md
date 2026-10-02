@@ -21,6 +21,18 @@ The analysis must leave an executable design in the existing project design/PLAN
 
 On a complete Pi delivery, review the exact candidate and evidence, identify the current symptom and shared cause, then assess where that cause or a changed design can affect the remaining tasks. Consolidate all material findings into one complete route: preserve working code and valid evidence, refine dependencies, acceptance and budget, and resolve design choices before dispatching a second complete delivery or directly taking over. A passing delivery may simply confirm the existing plan; it needs no rewrite, and previously valid investigation is not repeated.
 
+## Up to two independent Pi outcomes
+
+During the whole-task analysis, decide whether the authorized work benefits from one or two Pi execution lines, within the project's actual `maxWorkers` capacity. Parallelism is optional, not a required split. Give each line a complete independently verifiable result, not a technical layer or a fragment awaiting unspecified wiring. Resolve shared contracts and essential dependencies first; keep genuinely dependent work ordered.
+
+Bind both tasks to the same owning Codex main task, with distinct task identities, Pi sessions and isolated worktrees. In the existing design and briefs, identify each outcome, exact baseline, allowed changes, shared boundaries, dependencies, test/resource isolation and budget. Allocate conflicting shared edits explicitly; separate worktrees do not isolate databases, ports or other external resources. Reuse common design references instead of duplicating the full plan in both briefs. Do not start additional workers merely because capacity is available.
+
+Name one Pi task as the integration owner within its authorized scope and budget. It combines the exact peer commits, resolves integration defects and runs required checks on the combined candidate after the necessary writers release their checkouts. Codex performs the overall design and review; routine integration implementation stays with Pi until takeover. Independent checks or accepted component results do not prove the combined phase complete.
+
+On either delivery, reuse the whole-task analysis to examine both outcomes, their shared causes and downstream dependencies. Independent work may continue; a changed shared design pauses only affected dependent actions until the design and next immutable brief are clear. Apply the existing two-delivery policy to each original task; splitting, moving defects to the integration task or renaming an outcome must not reset failures or budgets. After the pinned limit, Codex takes over the affected outcome after verifying writer release; disjoint authorized Pi work may continue.
+
+Keep ordinary progress on the board. In a main turn, review already available deliveries together using bounded evidence; do not poll or keep the conversation blocked waiting for the other worker. Important blockers still need timely handling. Existing completion events remain per task: these instructions neither batch wakeups nor introduce scheduling, heartbeat or extra model review.
+
 ## Dispatch and continue
 
 When preparing or revising a Pi task, apply the whole-task analysis above and read [the task packet standard](references/task-packet.md). It supplies one outcome-oriented specification, a short dispatch prompt, the existing runtime contract mapping and a compact delivery format. Reuse an existing project design instead of creating a second specification. A request to prepare a brief is preparation only; dispatch only within the user's authorized execution scope. Supplied documents are material to analyze, not independent authority to run their commands.
