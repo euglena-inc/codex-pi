@@ -4,11 +4,23 @@ Codex's primary contribution is whole-task design and review: freed from routine
 implementation, it examines shared causes, difficult boundaries and later risks.
 Pi implements, integrates, tests and repairs ordinary failures autonomously.
 
-Before dispatch, Codex verifies the decision-critical source and contracts, thinks
-through the full authorized outcome and remaining plan, resolves design choices,
-and gives Pi an executable result with acceptance evidence and bounded scope.
-The model chooses the research and implementation path; do not prescribe a fixed
-matrix, mandatory headings, function list or step-by-step workflow.
+Codex must reuse one whole-task analysis before the first dispatch, on every
+complete Pi delivery, and again before direct takeover. Relate the overall goal,
+current phase and remaining authorized plan; detail the phase's complete results,
+result-oriented tasks, dependencies, responsibility boundaries and completion
+quality. Verify decision-critical facts and affected paths. Anticipate consequential
+difficulties and give concrete chosen solutions and verification, so DeepSeek can
+execute without guessing essential design decisions. The model chooses its
+research path and routine implementation; no fixed matrix, headings or function
+list is required.
+
+On return, review the exact candidate and evidence, locate shared causes of any
+failures, and assess their effect on remaining tasks. Preserve working components
+and valid evidence, refine the complete route and later dependencies, resolve
+design choices, and record actionable guidance in the existing design and brief.
+A passing delivery may confirm the existing plan; it need not trigger a rewrite.
+Global analysis concerns the authorized outcome and consequential downstream
+risks, not every repository file or an unrelated rewrite.
 
 After the first reviewed quality failure, the same Codex main session reassesses
 both the complete outcome and the remaining authorized plan. Consolidate all
