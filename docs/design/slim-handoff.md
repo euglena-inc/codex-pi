@@ -82,3 +82,12 @@ The runtime records those stdout byte counts in an append-only `codex-io.jsonl` 
 ## Release
 
 Version 0.6.0. README, plugin manifest and IMPLEMENTATION.md are updated to match. The full suite and `scripts/check_public_privacy.py` pass. No push, no install, no cache edits. Desktop queue delivery after these changes needs its own real validation (README "Fast acceptance") before it is installed.
+
+## Implementation amendments
+
+- Step 1 (accepted at `60e513c`):
+  - The only anomaly that enqueues a progress echo is a sustained unrepaired check failure. Resource, deadline and ownership faults keep their own event kinds. No stall detector was added.
+  - A multi-event card carries one decide hint, for the first event.
+  - `SKILL.md` came out at 8.6 KB and `task-packet.md` at 5.2 KB, both accepted as "about".
+- Step 2 additions:
+  - The decide hint must reference the candidate and contract printed above it instead of repeating them. The target is ≤ 200 bytes, leaving room for Pi's report.
