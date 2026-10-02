@@ -1,5 +1,13 @@
 # Complete-delivery allocation boundary
 
+> **Superseded historical design (2026-09-27).** This document records the former
+> one-delivery allocation and is kept only as historical evidence. The current
+> rule is the reusable whole-task analysis and two complete Pi deliveries defined
+> in [skills/collaborate/SKILL.md](../skills/collaborate/SKILL.md) and
+> [docs/design/two-delivery-global-replan.md](design/two-delivery-global-replan.md).
+> Do not follow this file's default limit (1) or takeover wording; use the Skill
+> and the current design instead.
+
 ## Outcome
 
 For newly started tasks, Pi gets one substantial opportunity to implement and verify a complete, independently reviewable outcome before the Codex main task reviews it. Pi may run and repair tests within that opportunity. If the reviewed delivery has a substantive quality defect, the existing Codex main task takes implementation ownership of that outcome, reassesses the whole result, and implements the coherent repair itself. This is an ownership change, not acceptance of the Pi candidate.

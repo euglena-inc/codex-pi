@@ -12,7 +12,7 @@ python3 /absolute/plugin/runtime/pi_board.py decide --repo /absolute/repo --task
 
 Use `changes_requested` with concrete findings when repairs are needed; `reject` rejects the candidate and `resolve` handles a non-review incident. Acceptance requires the full real immutable candidate commit and project evidence. Decisions on old rounds never accept the current round. If a packet reports overflow, read remaining pending board events and handle them in this same main turn; a terminal supervisor will not supply another periodic tick. A repeated delivered event is a receipt to deduplicate, not a reason to rerun Pi or checks.
 
-Group material findings and continue the same Pi session. Productive red tests and routine repairs remain with Pi. Investigate the first relevant error before repeating an unchanged failure. A resource breach or deadline should produce a bounded question and evidence, not an infinite retry or automatic acceptance.
+Before continuing or taking over, consult [the collaborate Skill](../SKILL.md) and apply its whole-task analysis: review the exact candidate and evidence, identify the current symptom and shared cause, and assess the effect on the remaining authorized plan and dependencies. Only then continue the same Pi session with one consolidated brief or, at the pinned limit, verify writer release and implement directly. Productive red tests and routine repairs remain with Pi. Investigate the first relevant error before repeating an unchanged failure. A resource breach or deadline should produce a bounded question and evidence, not an infinite retry or automatic acceptance.
 
 ## Pause and uncertain delivery
 
