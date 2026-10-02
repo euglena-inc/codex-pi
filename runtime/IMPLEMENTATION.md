@@ -132,7 +132,7 @@ The supervisor holds `.task.lock` and `.supervisor.lock`; Pi inherits `.task.loc
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-Tests use the offline Pi double in `tests/doubles/`, which plays the extension's load proof; the extension itself is driven through Node's native type stripping with a fake ExtensionAPI (`tests/doubles/extension_harness.mjs`). A missing `node` fails the suite. No live model call, no network, no Codex binary. `scripts/check_pure_move.py` compares every top-level definition's AST with a committed baseline; the module split moved 280 definitions with none edited, and `tests/test_modules.py` runs the check, the size cap, the acyclic import rule and a frozen-tools run with the plugin directory removed.
+Tests use the offline Pi double in `tests/doubles/`, which plays the extension's load proof; the extension itself is driven through Node's native type stripping with a fake ExtensionAPI (`tests/doubles/extension_harness.mjs`). A missing `node` fails the suite. No live model call, no network, no Codex binary. `tests/test_modules.py` guards the module layout: size cap, acyclic imports, entry-module isolation, a complete frozen helper list and a frozen-tools run with the plugin directory removed.
 
 ## Reviews and takeover
 

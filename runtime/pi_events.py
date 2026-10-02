@@ -13,6 +13,7 @@ from pathlib import Path
 from pi_core import ACTIVE_STATES, TERMINAL_STATES
 from pi_evidence import normalize_candidate
 from pi_store import (
+    BOARD_CLI,
     FULL_OID_RE,
     MAX_HANDLED_EVENTS,
     MAX_HANDLED_IDS,
@@ -23,10 +24,6 @@ from pi_store import (
     _text,
     route_paused,
 )
-
-
-# Commands printed in hints name the CLI entry module, not this library module.
-__file__ = str(Path(__file__).with_name("pi_board.py"))
 
 
 MAX_PROGRESS_NOTIFICATIONS = 2
@@ -907,6 +904,6 @@ def _decide_hint(repo, task_id, event: dict) -> str:
     review = event.get("kind") in REVIEW_KINDS and isinstance(head, str) \
         and bool(FULL_OID_RE.fullmatch(head))
     options = "accept|reject|changes_requested" if review else "resolve|reject|changes_requested"
-    return (f'python3 {shlex.quote(str(Path(__file__).resolve()))} decide '
+    return (f'python3 {shlex.quote(str(BOARD_CLI))} decide '
             f'--repo {shlex.quote(str(repo))} --task {shlex.quote(str(task_id))} '
             f'--event-id EVENT --decision {options} (EVENT/head/phase/contract above)')

@@ -74,7 +74,7 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(result["state"], "completed")
         self.assertTrue((task_dir / "rounds" / "1" / "worker.ready").is_file())
         finished = json.loads((task_dir / "rounds" / "1" / "round.state.json").read_text())
-        self.assertEqual(Path(finished["workerScript"]).resolve().parent, (task_dir / "tools").resolve())
+        self.assertEqual(Path(finished["workerScript"]).resolve(), (task_dir / "tools" / "pi_task.py").resolve())
         self.assertEqual(result["exitCode"], 0)
         self.assertEqual(result["execution"], "completed_execution")
         self.assertEqual(result["acceptance"], "not_verified")

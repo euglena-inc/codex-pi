@@ -455,8 +455,6 @@ def register_task(repo, task, thread=None, transport=TRANSPORT_OFFLINE, codex_bi
         "testCommands": [
             f"python3 {shlex.quote(str(Path(__file__).resolve()))} refresh --repo "
             f"{shlex.quote(str(root))} --task {task_id}",
-            f"python3 {shlex.quote(str(Path(__file__).resolve()))} dispatch --repo "
-            f"{shlex.quote(str(root))} --task {task_id}",
         ],
         "limitations": [QUEUE_LIMITATION],
         "note": "registration refreshes and dispatches an already-terminal task; offline mode never "

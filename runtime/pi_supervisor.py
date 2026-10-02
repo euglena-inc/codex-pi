@@ -13,6 +13,7 @@ from pathlib import Path
 
 from pi_brief import WORKER_CONFIG_FILE, WORKER_READY_FILE
 from pi_core import (
+    TASK_CLI,
     LockHeld,
     READ_ONLY_TOOLS,
     WRITABLE_TOOLS,
@@ -37,10 +38,6 @@ from pi_phase import (
     write_phase_state,
 )
 from pi_summary import compact, summarize
-
-
-# The recorded worker script is the CLI entry that spawned this supervisor.
-__file__ = str(Path(__file__).with_name("pi_task.py"))
 
 
 def worker_env() -> dict:
@@ -205,7 +202,7 @@ def run_worker(args) -> int:
         start_head = None
     state.update(state="running", supervisorPid=os.getpid(), startedAt=time.time(),
                  startHead=start_head, timedOut=False, cancelled=False, exitCode=None,
-                 workerScript=str(Path(__file__).resolve()), runtimeVersion=runtime_version())
+                 workerScript=str(TASK_CLI), runtimeVersion=runtime_version())
     atomic(state_path, state)
 
     if cancel_requested(task_dir, round_number):

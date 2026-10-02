@@ -15,6 +15,8 @@ from pi_core import LockHeld, TASK_RE, atomic, canonical_root, git_common_dir, l
 
 
 SCHEMA_VERSION = 1
+# The CLI entry that printed command hints name.
+BOARD_CLI = Path(__file__).with_name("pi_board.py").resolve()
 BOARD_DIR = "codex-pi"
 BOARD_FILE = "board.json"
 BOARD_LOCK = "board.lock"

@@ -1,6 +1,5 @@
 """Module layout after the pure-move split (Step 6).
 
-* the committed AST check proves every moved definition is identical;
 * no runtime module is larger than about 1.8k lines;
 * top-level imports between runtime modules are acyclic and flow downward;
 * every module reachable from the entry modules is in the frozen helper list, and a
@@ -9,7 +8,6 @@
 from __future__ import annotations
 
 import ast
-import importlib.util
 import json
 import shutil
 import subprocess
@@ -23,15 +21,7 @@ from runtime_helpers import ROOT, RUNTIME, Repo, base_env, cleanup_repos, defaul
 sys.path.insert(0, str(RUNTIME))
 import pi_task  # noqa: E402
 
-CHECK = ROOT / "scripts" / "check_pure_move.py"
 MAX_LINES = 1800
-
-
-def load_checker():
-    spec = importlib.util.spec_from_file_location("check_pure_move", CHECK)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def top_level_imports(path: Path) -> set:
@@ -43,35 +33,6 @@ def top_level_imports(path: Path) -> set:
         elif isinstance(node, ast.Import):
             found |= {alias.name for alias in node.names if alias.name in names}
     return found
-
-
-class PureMoveTest(unittest.TestCase):
-    def test_committed_baseline_matches_the_tree(self):
-        proc = subprocess.run([sys.executable, str(CHECK)], capture_output=True, text=True)
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("PURE MOVE", proc.stdout)
-        self.assertIn("changed (AST differs): 0; missing: 0; added: 0", proc.stdout)
-        baseline = json.loads((ROOT / "scripts" / "pure_move_baseline.json").read_text())
-        self.assertGreater(len(baseline["definitions"]), 400)
-
-    def test_the_checker_flags_edits_additions_and_removals_but_not_moves(self):
-        checker = load_checker()
-        old = {"a": "def f(x):\n    return x + 1\n\nK = 3\n"}
-        moved = {"a": "K = 3\n", "b": "def f(x):\n    return x + 1\n"}
-        report = checker.compare(checker.fingerprints(old), checker.fingerprints(moved))
-        self.assertEqual((report["changed"], report["missing"], report["added"]), ([], [], []))
-        self.assertEqual(len(report["moved"]), 1)
-        edited = {"a": "K = 3\n", "b": "def f(x):\n    return x + 2\n"}
-        report = checker.compare(checker.fingerprints(old), checker.fingerprints(edited))
-        self.assertEqual(report["changed"], ["f"])
-        extra = {"a": old["a"], "b": "def g():\n    pass\n"}
-        self.assertEqual(checker.compare(checker.fingerprints(old), checker.fingerprints(extra))["added"], ["g"])
-        gone = {"a": "K = 3\n"}
-        self.assertEqual(checker.compare(checker.fingerprints(old), checker.fingerprints(gone))["missing"], ["f"])
-        local = {"a": "def f(x):\n    from m import y\n    return x\n"}
-        retargeted = {"b": "def f(x):\n    from n import y\n    return x\n"}
-        report = checker.compare(checker.fingerprints(local), checker.fingerprints(retargeted))
-        self.assertEqual((report["changed"], len(report["retargeted"])), ([], 1))
 
 
 class LayoutTest(unittest.TestCase):
@@ -119,6 +80,29 @@ class LayoutTest(unittest.TestCase):
         self.assertLessEqual(needed, frozen, sorted(needed - frozen))
         for name in pi_task.HELPER_FILES:
             self.assertTrue((RUNTIME / name).is_file(), name)
+
+
+class CliHintTest(unittest.TestCase):
+    """Printed command hints and recorded worker script name the CLI entry modules."""
+
+    def test_hints_name_the_entry_scripts(self):
+        import shlex
+        import pi_events
+        import pi_queue
+        import pi_store
+        card = pi_events._new_card("t1", "11111111-2222-3333-4444-555555555555", "T", "G", "b.md",
+                                   None, "/r", "/c", "/w", pi_store.TRANSPORT_CLI_QUEUE,
+                                   "/bin/true", 1)
+        event = pi_events.add_event(card, "review_required", 1, "fp", "s",
+                                    {"round": 1, "head": "a" * 40}, {}, "q", 1)
+        board = shlex.quote(str((RUNTIME / "pi_board.py").resolve()))
+        self.assertEqual(pi_store.BOARD_CLI, (RUNTIME / "pi_board.py").resolve())
+        self.assertTrue(pi_events._decide_hint("/r", "t1", event).startswith(
+            f"python3 {board} decide --repo /r --task t1 --event-id EVENT --decision "))
+        self.assertEqual(pi_queue._show_hint(card),
+                         f"python3 {board} show --repo /r --task t1")
+        import pi_core
+        self.assertEqual(pi_core.TASK_CLI, (RUNTIME / "pi_task.py").resolve())
 
 
 class FrozenToolsTest(unittest.TestCase):

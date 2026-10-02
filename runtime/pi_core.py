@@ -20,6 +20,8 @@ from pi_takeover import review_policy
 
 
 SCHEMA_VERSION = 1
+# The CLI entry that task-side messages and records name.
+TASK_CLI = Path(__file__).with_name("pi_task.py").resolve()
 DEFAULT_MODEL = "deepseek/deepseek-flash"
 ALLOWED_MODELS = (DEFAULT_MODEL, "newapi/glm-5.3")
 DEFAULT_THINKING = "max"

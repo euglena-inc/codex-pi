@@ -18,6 +18,7 @@ from pi_core import LockHeld, atomic, lock_fd, record_codex_io, terminate
 from pi_events import PROGRESS_EVENT_KIND, _decide_hint, _phase_event_stale, pending_events
 from pi_evidence import acceptance_line
 from pi_store import (
+    BOARD_CLI,
     BOARD_DIR,
     BOARD_FILE,
     REVIEW_KINDS,
@@ -30,10 +31,6 @@ from pi_store import (
     route_paused,
 )
 from pi_takeover import review_policy
-
-
-# Commands printed in hints name the CLI entry module, not this library module.
-__file__ = str(Path(__file__).with_name("pi_board.py"))
 
 
 QUEUE_FILE = "board.queue.json"
@@ -404,7 +401,7 @@ def _resolve_codex_bin(value) -> str:
 
 
 def _show_hint(card: dict) -> str:
-    return (f'python3 {shlex.quote(str(Path(__file__).resolve()))} show --repo '
+    return (f'python3 {shlex.quote(str(BOARD_CLI))} show --repo '
             f'{shlex.quote(str(card.get("repo")))} --task {shlex.quote(str(card.get("taskId")))}')
 
 
