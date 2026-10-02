@@ -137,9 +137,12 @@ class FrozenToolsTest(unittest.TestCase):
                                   text=True, env=clean, cwd=str(self.tmp), timeout=60)
             self.assertEqual(proc.returncode, 0, f"{script} {args[0]}: {proc.stderr}")
             json.loads(proc.stdout.splitlines()[0])
+        self.assertFalse(list(tools.glob("__pycache__")), "CLI wrote bytecode into the frozen tools")
         probe = subprocess.run(
             [sys.executable, "-c",
-             "import sys, json; sys.path.insert(0, sys.argv[1]); import pi_task, pi_board; "
+             # Import compiles the entry module before its body can disable bytecode.
+             "import sys, json; sys.dont_write_bytecode = True; "
+             "sys.path.insert(0, sys.argv[1]); import pi_task, pi_board; "
              "print(json.dumps(sorted({m.__file__ for n, m in sys.modules.items() "
              "if n.startswith('pi_') and getattr(m, '__file__', None)})))", str(tools)],
             capture_output=True, text=True, env=clean, cwd=str(self.tmp), timeout=60)
