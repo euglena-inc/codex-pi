@@ -162,3 +162,30 @@ Version 0.6.0. README, plugin manifest and IMPLEMENTATION.md are updated to matc
     - Pi cost US$0.10–0.46 per task, every usage record complete;
     - 2 takeovers;
     - Codex bytes not tracked before 0.6.0.
+- Step 5 (accepted at `ddef69c`). The user widened the scope on 2026-10-02: lean code, native mechanisms, and compatibility code deleted.
+  - Removed: `pi_command_guard.py`, summary scope-escape flags, the first-round contract logic, the supervisor auto-continue, old pins, `upgrade`, `result --full`, and legacy naming.
+  - Pi 1.0 bash `timeout` kills the whole process group (`dist/core/tools/bash.js` 84–89, `dist/utils/shell.js` 157–176). `setsid` descendants escape, as before.
+  - Real validation with Pi 1.0.0 and `deepseek/deepseek-flash` in a synthetic repository, three rounds:
+    1. `worker.ready` was written before the first tool call. The contract reached the model through the system prompt; the model declined the forbidden read on its own. `check ok` passed and `check bad` returned `isError` with `log_tail`. The commit landed only in the worktree.
+    2. A `continue` round forced the reads: `bash cat` and `read` of a main-checkout file were both blocked with the `forbidden-path` reason as an error tool result and logged to `worker-blocks.jsonl`. The brief was 15 lines.
+    3. A phase task with two items, where the brief asked only for A1: `agent_before_settle` continued once in the same process, Pi added A2, the claim file was written, and the run settled.
+
+## Step 6 · Split the two large modules (pure move)
+
+`pi_task.py` (3.3k lines) and `pi_board.py` (2.7k lines) mix unrelated concerns. Split them by moving code only; behaviour does not change.
+
+- **From `pi_task.py`:**
+  - phase contract, readiness, evidence snapshot and settle view → `pi_phase.py` (merged with the existing module);
+  - brief, contract text and `worker.json` composition → `pi_brief.py`;
+  - supervisor loop and round finish → `pi_supervisor.py`;
+  - `pi_task.py` keeps the filesystem/process helpers, config, layout and admission, and thin CLI commands.
+- **From `pi_board.py`:**
+  - queue delivery state and dispatch → `pi_queue.py`;
+  - card and event model → `pi_events.py`;
+  - `pi_board.py` keeps the store, lease, routes and pause, compact views and the CLI.
+- **Rules:**
+  - Every moved top-level function or class keeps an identical AST. A check script in `scripts/` compares the AST dumps of the moved definitions between the base and the candidate. It is committed, and both the suite and the review run it.
+  - Only imports and module-level wiring may change. No re-export shims are kept for the old locations.
+  - Callers and tests import from the new module. The frozen helper snapshot list includes every new module, and a test proves the frozen `tools/` runs with no import from the plugin directory.
+  - Circular imports are resolved by dependency direction, not by function-local imports, unless such an import already existed.
+  - No file larger than about 1.8k lines.
