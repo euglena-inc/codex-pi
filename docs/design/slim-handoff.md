@@ -184,8 +184,13 @@ Version 0.6.0. README, plugin manifest and IMPLEMENTATION.md are updated to matc
   - card and event model → `pi_events.py`;
   - `pi_board.py` keeps the store, lease, routes and pause, compact views and the CLI.
 - **Rules:**
-  - Every moved top-level function or class keeps an identical AST. A check script in `scripts/` compares the AST dumps of the moved definitions between the base and the candidate. It is committed, and both the suite and the review run it.
+  - Every moved top-level function or class keeps an identical AST. This was a one-time migration check and is not kept in the tree; see the step 6 amendment.
   - Only imports and module-level wiring may change. No re-export shims are kept for the old locations.
   - Callers and tests import from the new module. The frozen helper snapshot list includes every new module, and a test proves the frozen `tools/` runs with no import from the plugin directory.
   - Circular imports are resolved by dependency direction, not by function-local imports, unless such an import already existed.
   - No file larger than about 1.8k lines.
+- Step 6 (pure move accepted at `d06c180`; independent AST check against `e63ca2f`: 280 definitions moved, 0 changed). Cleanup at `27bcca5`:
+  - Three low-level modules were added because the dependency direction requires them: `pi_core`, `pi_store` and `pi_evidence`.
+  - The `__file__` overrides were replaced with `BOARD_CLI`/`TASK_CLI` constants, and the printed hints are unchanged.
+  - The one-time AST checker and its baseline were removed. `tests/test_modules.py` keeps these layout guards: no cycles, no upward imports, a complete frozen list, frozen tools that run without the plugin directory, and ≤ 1.8k lines per file.
+  - A real Pi 1.0.0 smoke ran on the split runtime with all 16 helpers frozen: the worker loaded, `check` wrote a receipt, the commit landed only in the worktree, and frozen `pi_task.py result` ran from `/tmp` with a minimal environment and no `__pycache__`.
