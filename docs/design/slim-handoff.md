@@ -91,3 +91,8 @@ Version 0.6.0. README, plugin manifest and IMPLEMENTATION.md are updated to matc
   - `SKILL.md` came out at 8.6 KB and `task-packet.md` at 5.2 KB, both accepted as "about".
 - Step 2 additions:
   - The decide hint must reference the candidate and contract printed above it instead of repeating them. The target is ≤ 200 bytes, leaving room for Pi's report.
+- Step 2 (accepted at `af3d1d1`):
+  - Pi sees a forbidden-path command only as a signal termination. The rule name lives in the brief, in `contract.md` and in the guard records. Injecting text into Pi's tool result would need a different Pi invocation and is out of scope.
+  - The decide hint is ≤ 200 bytes for typical paths. Very long install or repo paths can reach about 260 bytes. `decide` binding semantics are unchanged.
+  - `SCOPE_ESCAPE` applies once `round.summary.json` carries `scope_escape`. Older rounds are not reinterpreted.
+  - The forbidden-path check is a textual heuristic, not a sandbox.
