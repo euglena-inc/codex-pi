@@ -226,6 +226,10 @@ class StatusTest(unittest.TestCase):
             before = snapshot_files(repo.task_dir("stale"))
             data = self.status(repo, "stale", env=env_hang)
             after = snapshot_files(repo.task_dir("stale"))
+            # Only the size-only Codex-facing accounting line may be appended.
+            before.pop("codex-io.jsonl", None)
+            self.assertIn("codex-io.jsonl", after)
+            after.pop("codex-io.jsonl")
             self.assertEqual(before, after, "status must not mutate task evidence")
             self.assertEqual(data["round"], 2)
             self.assertEqual(data["recordedState"], "running")

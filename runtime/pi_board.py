@@ -55,7 +55,9 @@ from pi_task import (ACTIVE_STATES, TERMINAL_STATES, TASK_RE, LockHeld, atomic, 
                      acceptance_line, normalize_candidate, probe_worktree_head, read_json,
                      require_allowed_model, require_task_arg, task_dir_for, terminate)
 
-from pi_takeover import FAILURE_KINDS, normalize_review_limit, review_policy
+from pi_task import record_codex_io  # noqa: E402
+from pi_takeover import (FAILURE_KINDS, _records as decision_records,  # noqa: E402
+                         normalize_review_limit, review_policy)
 
 SCHEMA_VERSION = 1
 BOARD_DIR = "codex-pi"
@@ -1947,6 +1949,10 @@ def dispatch_task(board_file, task_id: str, now=None, timeout=None, cli_runner=N
     except ValueError as exc:
         return {"ok": False, "dispatched": False, "status": "invalid-binary", "error": str(exc)}
     result = (cli_runner or _run_queue_cli)(argv, timeout)
+    if result.get("status") in ("queued", "uncertain"):
+        # Size only: the card may have reached the owner (uncertain included).
+        record_codex_io(Path(board_file).parent / "tasks" / task_id, "queue",
+                        _packet_bytes(text), kind="packet")
     _finish_queue(board_file, task_id, [event["id"] for event in included], result, now, packet_id)
     status = result.get("status", "failed")
     return {"ok": status == "queued", "dispatched": True, "taskId": task_id,
@@ -2680,6 +2686,12 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("--all", action="store_true")
     show.set_defaults(func=cmd_show)
 
+    metrics = sub.add_parser("metrics", help="one compact JSON line per task: rounds, usage/cost, "
+                                             "review decisions, takeover, Codex-facing bytes")
+    metrics.add_argument("--repo", required=True)
+    metrics.add_argument("--task")
+    metrics.set_defaults(func=cmd_metrics)
+
     decide = sub.add_parser("decide", help="handle one exact event with an explicit decision")
     decide.add_argument("--repo", required=True)
     decide.add_argument("--task", required=True)
@@ -2716,6 +2728,120 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _record_show_bytes(args, result, total: int) -> None:
+    """Attribute a ``show`` stdout to the tasks it covered.
+
+    One output may cover several tasks; its bytes are split evenly (remainder to
+    the first) so the per-task sums equal what was printed, never double counted.
+    Each line also carries ``shared`` (number of tasks) and ``total``.
+    """
+    try:
+        _root, _common, board_file = board_file_for_repo(args.repo)
+        ids = [card.get("taskId") for card in result.get("cards") or []
+               if isinstance(card, dict) and isinstance(card.get("taskId"), str)]
+        for index, task_id in enumerate(ids):
+            share = total // len(ids) + (total % len(ids) if index == 0 else 0)
+            record_codex_io(board_file.parent / "tasks" / task_id, "show", share,
+                            shared=len(ids), total=total)
+    except Exception:  # noqa: BLE001 - never affects the command
+        pass
+
+
+def _sum_known(total: dict, usage) -> None:
+    if not isinstance(usage, dict):
+        return
+    for key, value in usage.items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            total[key] = total.get(key, 0) + value
+
+
+def task_metrics(board_file: Path, card, task_id: str) -> dict:
+    """One compact metrics record; unknown stays unknown, never a partial sum as complete."""
+    task_dir = Path(board_file).parent / "tasks" / task_id
+    rounds = []
+    if (task_dir / "rounds").is_dir():
+        rounds = sorted(int(entry.name) for entry in (task_dir / "rounds").iterdir()
+                        if entry.name.isdigit() and entry.is_dir())
+    usage, cost = {}, 0.0
+    missing, incomplete, cost_unknown = [], [], []
+    for number in rounds:
+        summary, problem = _read_bounded_json(task_dir / "rounds" / str(number)
+                                              / "round.summary.json", 4_000_000)
+        if not isinstance(summary, dict) or "usage" not in summary:
+            missing.append(number)
+            cost_unknown.append(number)
+            continue
+        _sum_known(usage, summary.get("usage"))
+        if not summary.get("usage_complete"):
+            incomplete.append(number)
+        value = summary.get("reported_cost_usd")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            cost += value
+        else:
+            cost_unknown.append(number)
+    record = {"task": task_id, "rounds": len(rounds),
+              "usage": {"known": usage, "complete": bool(rounds) and not missing and not incomplete,
+                        "roundsMissing": missing, "roundsIncomplete": incomplete},
+              "costUsd": {"known": cost, "complete": bool(rounds) and not cost_unknown,
+                          "roundsUnknown": cost_unknown}}
+    if isinstance(card, dict):
+        by_kind, failure_kinds = {}, {}
+        for row in decision_records(card).values():
+            decision = row.get("decision")
+            if not decision:
+                continue
+            kind = row.get("eventKind") or row.get("kind") or "unknown"
+            by_kind.setdefault(kind, {})
+            by_kind[kind][decision] = by_kind[kind].get(decision, 0) + 1
+            if decision in ("rejected", "changes_requested"):
+                failure = row.get("failureKind", "quality")
+                failure_kinds[failure] = failure_kinds.get(failure, 0) + 1
+        record.update(registered=True, decisions=by_kind, failureKinds=failure_kinds,
+                      takeover=bool(review_policy(card).get("takeoverRequired")))
+    else:
+        record.update(registered=False, decisions=None, failureKinds=None, takeover=None)
+    by_command, packet, total, bad = {}, 0, 0, 0
+    path = task_dir / "codex-io.jsonl"
+    tracked = path.is_file()
+    if tracked:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            try:
+                row = json.loads(line)
+                size = row["bytes"]
+                command = str(row["command"])
+                if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+                    raise ValueError("bad size")
+            except (ValueError, KeyError, TypeError):
+                bad += 1
+                continue
+            total += size
+            if row.get("kind") == "packet":
+                packet += size
+            else:
+                by_command[command] = by_command.get(command, 0) + size
+    record["codexBytes"] = {"tracked": tracked, "packet": packet, "commands": by_command,
+                            "total": total, "badLines": bad}
+    return record
+
+
+def cmd_metrics(args) -> list:
+    _root, _common, board_file = board_file_for_repo(args.repo)
+    board, _problem = read_board(board_file)
+    cards = (board or {}).get("cards") or {}
+    if args.task:
+        ids = [require_task_arg(args.task)]
+    else:
+        directory = Path(board_file).parent / "tasks"
+        found = {entry.name for entry in directory.iterdir()
+                 if entry.is_dir() and (entry / "task.json").is_file()} if directory.is_dir() else set()
+        ids = sorted(found | set(cards))
+    return [task_metrics(board_file, cards.get(task_id), task_id) for task_id in ids]
+
+
 def main() -> int:
     args = build_parser().parse_args()
     try:
@@ -2723,7 +2849,14 @@ def main() -> int:
     except (ValueError, LockHeld, OSError) as exc:
         print(f"pi_board: {exc}", file=sys.stderr)
         return 2
-    print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    if isinstance(result, list):  # metrics: one compact JSON line per task
+        for item in result:
+            print(json.dumps(item, ensure_ascii=False, separators=(",", ":")))
+        return 0
+    text = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    print(text)
+    if args.command == "show":
+        _record_show_bytes(args, result, len(text.encode("utf-8")) + 1)
     return 0
 
 

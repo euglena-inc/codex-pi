@@ -39,6 +39,14 @@
 - supervisor 自身被杀死时不能自行上报；下次正常交互可检查恢复证据。不能承诺任意故障都在两三分钟内发现。
 - 每次真正唤醒仍会输入主会话上下文。节省来自取消空轮询和缩小证据读取；不承诺未经对照测量的固定降幅。
 
+## 0.6.0 变化摘要与升级注意
+
+- 交付卡不超过 1200 字节；CLI 输出单行紧凑 JSON；`result` 默认紧凑，`--full` 给出旧结构；普通进度里程碑只留在看板。
+- 第 1 轮（及合同 hash 变化的轮次）给 Pi 完整合同，其余轮次给短头；失败的检查在 stdout 带 `log_tail`；命令守卫终止引用主检出或其他 worktree 的命令；写越界使交付判定为不就绪（`SCOPE_ESCAPE`）。
+- 删除旧 Stop-hook 投递（`pi_handoff.py` 的 arm/ack/status/release）、`pi_task.py check`、`pi_task.py wait`、`pi_board.py packet` 与 `dispatch` 入口；hooks 只保留 Interrupt 暂停与 cli-queue 恢复。
+- 新增 `pi_board.py metrics --repo R [--task T]`：每任务一行紧凑 JSON（轮数、Pi 用量与费用合计、评审决定、是否接手、面向 Codex 的字节数）；字节数来自任务目录下只记大小的 `codex-io.jsonl`。未取得的用量或费用保持未知，不以部分和冒充完整。
+- **升级注意**：本机若有任务仍绑定旧 Stop 路由（绑定记录处于 armed、suspended 等待处理状态），`pi_task.py upgrade` 会拒绝。先用该任务冻结的 `tools/pi_task.py result` 收尾并自行审查，再由用户退役该绑定文件，然后升级。桌面队列投递在安装前需单独做真实验证（见 [交接恢复](skills/collaborate/references/handoff.md) 的 Real desktop validation）。
+
 ## 安装与维护
 
 插件由独立 Git 仓库管理，通过仓库自带的 marketplace 分发。依赖 Python 3.10+、Git、已有 Pi CLI；自动通知另需支持 `queue` 的 Codex CLI 和桌面应用。认证沿用现有本地配置，插件不复制密钥。运行时适用于 macOS/Linux，使用标准库、文件锁和进程组。

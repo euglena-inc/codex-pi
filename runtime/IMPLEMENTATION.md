@@ -1,5 +1,7 @@
 # Codex-Pi runtime implementation
 
+Version 0.6.0 (`runtime/VERSION`). Changes against 0.5.3: 1200-byte delivery card, compact single-line CLI output (`result --full` for the old shape), board-only progress milestones, worker contract once per session with `log_tail` and forbidden-checkout protection, removal of the Stop-hook delivery path, `check`, `wait`, `packet` and `dispatch`, and size-only Codex-facing accounting (`codex-io.jsonl`, `pi_board.py metrics`).
+
 Cross-project persistent Pi worker lifecycle for the Codex main session. Final
 architecture: **Codex main → shell → shared Python lifecycle scripts → Pi CLI**.
 There is no MCP server, no Node dependency and no package manifest in this
@@ -30,7 +32,7 @@ double or explicit path only). Helpers used by the Pi worker are
 | `runtime/pi_summary.py` | Bounded round summary, check-receipt aggregation, usage, reported-model check |
 | `runtime/pi_check.py` | One-check receipt: true exit/signal/timeout, log sha256, HEAD/dirty, counts |
 | `runtime/pi_handoff.py` | Hook entry: Interrupt route pause and cli-queue recovery evidence; reads legacy Stop-hook bindings only so `upgrade` can refuse them |
-| `runtime/pi_board.py` | Shared evidence board, event decisions, queue claims and deterministic CLI transport |
+| `runtime/pi_board.py` | Shared evidence board, event decisions, queue claims, deterministic CLI transport and `metrics` |
 | `runtime/pi_takeover.py` | Read-only failure-policy fold from exact review decisions; a new task pins two complete deliveries (historical pins 1/2 and legacy 3 stay frozen) and the second failure transfers implementation to the existing Codex task |
 | `runtime/pi_copy.py` / `pi_size.py` | Bounded evidence copying and byte scans without following symlinks |
 | `hooks/hooks.json` | Plugin-discovered Interrupt, SessionStart and UserPromptSubmit commands (no Stop hook); requires host trust |

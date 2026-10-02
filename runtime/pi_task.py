@@ -389,6 +389,33 @@ def task_dir_for(common: Path, task: str) -> Path:
     return state_root(common) / "tasks" / task
 
 
+CODEX_IO_FILE = "codex-io.jsonl"
+
+
+def record_codex_io(task_dir, command: str, nbytes: int, **extra) -> bool:
+    """Append one size-only line (time, command, bytes) to the task's ``codex-io.jsonl``.
+
+    Content is never recorded. The file is append-only, an existing task
+    directory is required, and every failure is swallowed: accounting must never
+    change a command's output or exit code.
+    """
+    try:
+        directory = Path(task_dir)
+        if not directory.is_dir():
+            return False
+        line = json.dumps({"at": time.time(), "command": str(command), "bytes": int(nbytes),
+                           **extra}, separators=(",", ":")) + "\n"
+        fd = os.open(str(directory / CODEX_IO_FILE),
+                     os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o644)
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
+        return True
+    except Exception:  # noqa: BLE001 - accounting is best effort
+        return False
+
+
 def require_task_arg(task: str) -> str:
     if not TASK_RE.fullmatch(task):
         raise ValueError("task must match [A-Za-z0-9][A-Za-z0-9_-]{0,99}")
@@ -4034,7 +4061,15 @@ def main() -> int:
             except OSError:
                 pass
     result = args.func(args)
-    print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    text = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    print(text)
+    if args.command in ("status", "result"):
+        try:
+            root = canonical_root(Path(args.repo))
+            record_codex_io(task_dir_for(git_common_dir(root), args.task), args.command,
+                            len(text.encode("utf-8")) + 1)
+        except Exception:  # noqa: BLE001 - never affects the command
+            pass
     return 0
 
 

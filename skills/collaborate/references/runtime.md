@@ -18,7 +18,7 @@ python3 .../pi_task.py result --repo REPO --task TASK [--round N] [--full]
 python3 .../pi_board.py show --repo REPO --task TASK               # board card, pending events, queue
 ```
 
-`result` is compact by default: state, execution, candidate head, usage totals, check lines (`ID exit=N run=.. pass=.. fail=.. skip=..`, or `ID missing`/`ID unknown`), Pi's final text (at most 1200 characters) and notes. `--full` returns the previous complete shape (per-round evidence paths, `summary`, `summaryText`). Collect `result` once per terminal round; raw logs, receipts and the native session stay under the Git common directory `codex-pi/tasks/`. `show` gives the absolute evidence paths a delivery card leaves out.
+`result` is compact by default: state, execution, candidate head, usage totals, check lines (`ID exit=N run=.. pass=.. fail=.. skip=..`, or `ID missing`/`ID unknown`), Pi's final text (at most 1200 characters) and notes. `--full` returns the previous complete shape (per-round evidence paths, `summary`, `summaryText`). Collect `result` once per terminal round (`pi_board.py metrics --repo REPO [--task TASK]`: per-task usage, decisions, Codex-facing bytes); raw logs, receipts and the native session stay under the Git common directory `codex-pi/tasks/`. `show` gives the absolute evidence paths a delivery card leaves out.
 
 ## Worker contract and boundaries
 
@@ -57,7 +57,7 @@ python3 /abs/task/tools/pi_check.py --output-dir ... --id evidence --timeout-sec
 python3 /abs/task/tools/pi_copy.py /abs/source /abs/new-destination --max-bytes 104857600
 ```
 
-A failing, timed-out or cancelled check also prints `log_tail` (last 20 lines, at most 2000 bytes) on stdout; the receipt is unchanged. Receipts bind command, revision, exit and log hash; failed, skipped, interrupted, unknown or zero-test attempts are never a pass. A phase command timeout must not exceed the contract's `commandTimeoutSeconds`. Declared `resourceLimits` and `--watch-path` guards stop only the owned process group on a known breach; an incomplete measurement stays unknown. Owned temporary bash probes have a 600-second ceiling. `pi_copy` keeps symlinks and refuses existing destinations. Details and history: [validation notes](../../../docs/validation/command-protection-20261001.md).
+A failing, timed-out or cancelled check also prints `log_tail` (last 20 lines, at most 2000 bytes) on stdout; the receipt is unchanged. Receipts bind command, revision, exit and log hash; failed, skipped, interrupted, unknown or zero-test attempts are never a pass. A phase command timeout must not exceed the contract's `commandTimeoutSeconds`. Declared `resourceLimits` and `--watch-path` guards stop only the owned process group on a known breach; an incomplete measurement stays unknown. History: [validation notes](../../../docs/validation/command-protection-20261001.md).
 
 ## Decisions
 
