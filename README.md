@@ -58,7 +58,30 @@ Sol-Luna 已迁出为独立个人 Skill，使用 Codex 原生子代理，不需�
 
 `checks` 是验收指引，插件不会把它当作通过证明。`maxWorkers` 是容量上限；项目的依赖和并行资格仍由项目约束决定。整轮超时和单个命令的时限分别设置。Pi 退出码 0 仅表示执行结束。
 
-`model` 必须取自 `pi_task.py project` 列出的允许模型；选择、按任务冻结和不回退的规则见 Skill。若选用 NewAPI 路由，本机 Pi 需已配置对应 provider 和凭证。
+`model` 必须取自 `pi_task.py project` 列出的允许模型（当前含 `deepseek/deepseek-flash`、`newapi/glm-5.3`、`newapi/deepseek-flash`）；选择、按任务冻结和不回退的规则见 Skill。若选用 NewAPI 路由，本机 Pi 需已配置对应 provider 和凭证。
+
+### 网络代理与传输诊断（连接支持）
+
+`.agents/codex-pi.json` 可选 `network`，只允许两个键：
+
+```json
+{
+  "schemaVersion": 1,
+  "model": "newapi/deepseek-flash",
+  "thinking": "max",
+  "constraints": ["AGENTS.md"],
+  "checks": ["该任务的真实验收命令与项目复核要求"],
+  "maxWorkers": 1,
+  "timeoutSeconds": 14400,
+  "network": {"proxyUrl": "http://proxy.invalid:3128", "diagnostics": true}
+}
+```
+
+`proxyUrl` 只接受无凭据的 `http`/`https` 代理地址：必须显式主机与端口、根路径、无查询/片段；校验在任何任务副作用前完成，拒绝时不回显原值（示例地址为合成地址）。新任务在 `task.json` 冻结策略，`continue` 只使用冻结策略，后续项目配置修改只影响新任务；没有 `network` 键的旧任务保持原有继承行为。显式路由只应用到 Pi 子进程（覆盖大小写与 `ALL_PROXY` 等冲突形式），子工具进程继承同一策略，`NO_PROXY`/`no_proxy` 排除规则保留；supervisor 与 Codex 队列传输不被改道。未配置显式地址时继续使用环境里已有的代理变量：插件不做自动发现、不自动重试、不切换模型或路由。
+
+`diagnostics: true` 时，运行时把候选的 `pi_network_diagnostics.mjs` 以进程级 `NODE_OPTIONS` 预加载（保留原有选项、路径按 URL 编码）并设置进程级 sidecar 变量。观察器只用 `node:diagnostics_channel` 订阅 undici 请求事件：不替换 fetch/dispatcher、不改请求、不把普通流清理 `AbortError` 记为连接失败，写入失败也不影响模型调用。只有 supervisor 直接派生的 Pi 主进程会写 sidecar（继承的工具子进程只继承代理策略、不写诊断），同一轮真正只有一个 writer，总量硬上限 64 KiB；错误分类按有界 cause 链优先采信明确的代理/网络证据，缺失或超长消息不能指向代理，`AbortError` 名称才是正常清理，`UND_ERR_ABORTED`/`DESTROYED`/`CLOSED` 不能单独证明清理。记录写入 `rounds/N/round.network.jsonl`，字段有界且只含相对时间/耗时、阶段、安全分类、白名单错误码、CONNECT 数字状态与进程标识；不写 URL、host、headers、body、原始错误文本、凭据或会话内容，超限时写截断标记而不冒充完整覆盖。读取端只读有界前缀并校验 phase/class/code/status 的类型与长度，缺失/超限/非法 UTF-8/截断/伪造记录一律按 unreadable 处理且不回显伪造值。`status`/`result` 的 `network` 块只给紧凑的代理策略/来源与诊断文件引用和计数；诊断文件缺失或不可信是 unknown，不是健康。分类只是观察，不是验收结论。
+
+恢复建议：TLS 前 ECONNRESET/重置更指向传输；CONNECT 503 表示代理隧道失败。应校验或显式切换用户自己配置的代理路由，不承诺永久修复；路由失败时保留会话，恢复后显式 `continue`。原生 Pi 重试配置与本插件无关，不被修改。机制验证与真实边界见 [连接支持验证](docs/validation/connection-support-20261003.md)。
 
 ## 故障与费用边界
 

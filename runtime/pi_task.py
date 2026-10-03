@@ -43,6 +43,7 @@ from pi_core import (
     CONFIG_KEYS,
     FULL_OID_RE,
     LockHeld,
+    NETWORK_FILE,
     READ_ONLY_TOOLS,
     SCHEMA_VERSION,
     TERMINAL_STATES,
@@ -56,8 +57,11 @@ from pi_core import (
     load_config,
     lock_fd,
     lock_is_held,
+    network_policy_for_task,
+    normalize_proxy_url,
     primary_root,
     read_json,
+    read_network_sidecar,
     record_codex_io,
     require_allowed_model,
     require_task_arg,
@@ -108,7 +112,8 @@ from pi_takeover import REVIEW_LIMIT
 HELPER_FILES = ("pi_task.py", "pi_core.py", "pi_evidence.py", "pi_phase.py", "pi_brief.py",
                 "pi_supervisor.py", "pi_summary.py", "pi_check.py", "pi_copy.py", "pi_size.py",
                 "pi_board.py", "pi_store.py", "pi_events.py", "pi_queue.py", "pi_takeover.py",
-                "pi_execution.py", "pi_archive.py", "pi_recovery.py", "pi_worker.ts", "VERSION")
+                "pi_execution.py", "pi_archive.py", "pi_recovery.py", "pi_worker.ts",
+                "pi_network_diagnostics.mjs", "VERSION")
 
 
 def active_tasks(state: Path) -> list:
@@ -454,6 +459,8 @@ def cmd_start(args) -> dict:
             "model": config["model"], "thinking": config["thinking"],
             "constraints": config["constraints"], "checks": config["checks"],
             "maxWorkers": config["maxWorkers"], "timeoutSeconds": config["timeoutSeconds"],
+            "network": {"proxyUrl": config["network"]["proxyUrl"],
+                        "diagnostics": config["network"]["diagnostics"]},
             "createdAt": created_at, "startHead": start_head,
             "runtimeVersion": runtime_version(), "helperHashes": hashes,
             "piVersion": installed_pi,
@@ -684,8 +691,75 @@ def evidence_paths(task_dir: Path, round_number: int | None) -> dict:
                    "meta": str(round_dir / "round.meta"), "state": str(round_dir / "round.state.json"),
                    "summaryJson": str(round_dir / "round.summary.json"),
                    "summaryText": str(round_dir / "round.summary.txt"),
+                   "networkJsonl": str(round_dir / NETWORK_FILE),
                    "checksDir": str(round_dir / "round.checks")})
     return result
+
+
+def network_evidence(task: dict, task_dir: Path, round_number: int, state: dict | None) -> dict:
+    """Compact redacted proxy policy plus the bounded sidecar projection.
+
+    Recorded state and the sidecar are treated as untrusted observational data:
+    the proxy origin is revalidated (or replaced by the frozen policy), and only
+    the round's canonical sidecar path is read. Forged mode/source/origin/file
+    values are replaced instead of echoed, and an unreadable sidecar yields no
+    classification counts.
+    """
+    try:
+        policy = network_policy_for_task(task)
+    except ValueError:
+        policy = {"proxyUrl": None, "diagnostics": False, "source": "invalid"}
+    fallback_proxy = {"mode": "explicit" if policy["proxyUrl"] else "inherited",
+                      "source": policy.get("source", "legacy"), "origin": policy["proxyUrl"],
+                      "envProxyPresent": None}
+    recorded = state.get("network") if isinstance(state, dict) else None
+    proxy = None
+    diagnostics = None
+    if isinstance(recorded, dict):
+        raw_proxy = recorded.get("proxy")
+        if isinstance(raw_proxy, dict):
+            mode = raw_proxy.get("mode") \
+                if raw_proxy.get("mode") in ("explicit", "inherited") else None
+            source = raw_proxy.get("source") \
+                if raw_proxy.get("source") in ("frozen", "legacy", "invalid") else None
+            origin = raw_proxy.get("origin")
+            if origin is not None:
+                try:
+                    origin = normalize_proxy_url(origin)
+                except ValueError:
+                    mode = source = origin = None
+            present = raw_proxy.get("envProxyPresent")
+            if mode and source and (present is None or isinstance(present, bool)):
+                proxy = {"mode": mode, "source": source, "origin": origin,
+                         "envProxyPresent": present}
+        if isinstance(recorded.get("diagnostics"), dict):
+            diagnostics = recorded["diagnostics"]
+    if not isinstance(proxy, dict):
+        proxy = fallback_proxy
+    # Diagnostics activation is a frozen policy decision; recorded state can only
+    # point at the canonical sidecar, never enable diagnostics on its own.
+    enabled = bool(policy["diagnostics"])
+    default_file = task_dir / "rounds" / str(round_number) / NETWORK_FILE
+    file = default_file
+    recorded_file = diagnostics.get("file") if isinstance(diagnostics, dict) else None
+    if isinstance(recorded_file, str):
+        try:
+            candidate = Path(recorded_file)
+            if candidate.resolve() == default_file.resolve():
+                file = candidate
+        except OSError:
+            file = default_file
+    if not enabled:
+        return {"proxy": proxy,
+                "diagnostics": {"enabled": False, "file": None, "status": "disabled",
+                                "records": 0, "failures": 0, "truncated": False,
+                                "oversized": False}}
+    summary = read_network_sidecar(file)
+    return {"proxy": proxy,
+            "diagnostics": {"enabled": True, "file": str(file), "status": summary["status"],
+                            "records": summary["records"], "failures": summary["failures"],
+                            "truncated": summary["truncated"], "oversized": summary["oversized"],
+                            "classes": summary["classes"]}}
 
 
 def effective_state(state: dict | None, task_held: bool, supervisor_alive: bool,
@@ -900,6 +974,12 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
     elif checks["receipts"]["truncated"]:
         notes.append("receipt parsing was bounded to the newest entries; failed counts and latest "
                      "receipts may be incomplete")
+    network = network_evidence(frozen, task_dir, selected_number, state)
+    if network["diagnostics"]["enabled"] \
+            and network["diagnostics"]["status"] in ("missing", "unreadable"):
+        notes.append("transport diagnostics were enabled but the round sidecar is "
+                     f"{network['diagnostics']['status']}; transport classification is unknown, "
+                     "not healthy")
 
     # Phase contract projection. Read-only: readiness is recomputed in memory for
     # terminal rounds and never written by status.
@@ -963,6 +1043,7 @@ def build_status(repo_arg: str, task_arg: str, round_arg=None) -> dict:
         "ownership": {"activeWorker": task_held, "supervisorAlive": supervisor_alive},
         "processes": processes, "executionActivity": execution_activity,
         "checks": _redact_receipt_metadata(checks), "evidence": evidence_paths(task_dir, selected_number),
+        "network": network,
         "phase": phase_info, "phaseProblem": phase_problem, "progress": progress,
         "acceptance": "not_verified", "notes": notes,
     }
@@ -1043,6 +1124,8 @@ def build_result(repo_arg: str, task_arg: str, round_arg=None) -> dict:
         "auxiliaryUsage": (summary or {}).get("auxiliary_usage"),
         "totalUsageComplete": bool(summary and summary.get("total_usage_complete")),
         "checks": checks,
+        "network": network_evidence(frozen, task_dir, selected_number,
+                                     read_json(selected_dir / "round.state.json", {}) or {}),
         "final": ((summary or {}).get("final_excerpt") or "")[:COMPACT_FINAL_CHARS]
         if selected_state["state"] == "completed" else "",
         "evidence": {"roundDir": evidence.get("roundDir"),
@@ -1151,6 +1234,10 @@ def cmd_project(args) -> dict:
             },
             "limits": {"maxWorkers": config["maxWorkers"], "timeoutSeconds": config["timeoutSeconds"],
                        "model": config["model"], "thinking": config["thinking"],
+                       "network": config["network"],
+                       "networkPolicy": "optional explicit credential-free http(s) proxy plus opt-in "
+                                        "transport diagnostics; every new task freezes the project "
+                                        "policy and old tasks keep inherited behavior",
                        "allowedModels": list(ALLOWED_MODELS),
                        "modelPolicy": "each new task pins one explicitly allowed project-configured model; "
                                       "existing task snapshots never change and unavailable models are "

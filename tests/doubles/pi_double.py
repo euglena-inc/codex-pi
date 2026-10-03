@@ -32,6 +32,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 GRANDCHILD = HERE / "grandchild.py"
 
+ENV_PRESENCE_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY",
+                     "all_proxy", "NO_PROXY", "no_proxy", "NODE_OPTIONS",
+                     "CODEX_PI_NETWORK_DIAG_FILE", "CODEX_PI_NETWORK_DIAG_SCOPE",
+                     "CODEX_PI_NETWORK_DIAG_SUPERVISOR")
+
 
 def arg_value(flag: str):
     argv = sys.argv[1:]
@@ -87,6 +92,13 @@ def record_trace() -> None:
         "noContextFiles": "--no-context-files" in sys.argv,
         "atFile": next((item[1:] for item in sys.argv[1:] if item.startswith("@")), None),
     }
+    # Presence-only by default; verbatim values only for the explicit allowlist
+    # requested by a test, so an inherited credential is never recorded.
+    entry["envPresent"] = [key for key in ENV_PRESENCE_KEYS if os.environ.get(key) is not None]
+    requested = [key.strip() for key in (os.environ.get("PI_DOUBLE_ENV_TRACE_KEYS") or "").split(",")
+                 if key.strip()]
+    if requested:
+        entry["envValues"] = {key: os.environ.get(key) for key in requested}
     with Path(trace).open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(entry) + "\n")
 
