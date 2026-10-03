@@ -2602,7 +2602,7 @@ def cmd_verify(args) -> int:
 
 def cmd_negative_verify(args) -> int:
     """Assert the verifier rejects in-memory mutations of a real manifest."""
-    out = Path(args.verify_evidence)
+    out = Path(args.negative_verify)
     base_manifest = load_manifest(out)
     baseline = read_json(out / "baseline.json")
     if not isinstance(base_manifest, dict) or not isinstance(baseline, dict):
