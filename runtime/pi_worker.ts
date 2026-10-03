@@ -822,7 +822,8 @@ export default async function (pi: ExtensionAPI) {
 						return refuseCheck(checkId,
 							`timeout_below_estimate: the requested or contract window ` +
 							`${roundSeconds(requested)}s is below the required ${roundSeconds(requiredSeconds)}s; ` +
-							"raise timeoutSeconds only if the estimate is wrong", patch);
+							"adjust timeoutSeconds only within the authorized cap to cover a trusted estimate, " +
+							"or correct the estimate only when evidence supports it", patch);
 					}
 					if (available < requiredSeconds) {
 						return refuseCheck(checkId,

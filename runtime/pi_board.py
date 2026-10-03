@@ -36,6 +36,7 @@ private IPC/database integration.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import os
 import shlex
@@ -991,6 +992,17 @@ def _sum_known(total: dict, usage) -> None:
             total[key] = total.get(key, 0) + value
 
 
+def _metric_value(section, key):
+    """Leaf value from a summary metrics section; None (unknown) is preserved."""
+    if not isinstance(section, dict):
+        return None
+    leaf = section.get(key)
+    if not isinstance(leaf, dict):
+        return None
+    value = leaf.get("value")
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
 def task_metrics(board_file: Path, card, task_id: str) -> dict:
     """One compact metrics record; unknown stays unknown, never a partial sum as complete."""
     task_dir = Path(board_file).parent / "tasks" / task_id
@@ -1000,12 +1012,22 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
                         if entry.name.isdigit() and entry.is_dir())
     usage, cost = {}, 0.0
     missing, incomplete, cost_unknown = [], [], []
+    metrics_missing = []
+    derived_usage, derived_usage_rounds = {}, {}
+    context_peak, context_rounds = None, []
+    timing_rounds = {key: 0 for key in ("windowSeconds", "modelResponseSeconds",
+                                        "toolSeconds", "unattributedSeconds")}
+    timing_known = dict.fromkeys(timing_rounds, 0.0)
+    timing_unknown = {key: [] for key in timing_rounds}
+    checks_total = Counter()
+    checks_elapsed, checks_elapsed_rounds, checks_elapsed_unknown = 0.0, 0, []
     for number in rounds:
         summary, problem = _read_bounded_json(task_dir / "rounds" / str(number)
                                               / "round.summary.json", 4_000_000)
         if not isinstance(summary, dict) or "usage" not in summary:
             missing.append(number)
             cost_unknown.append(number)
+            metrics_missing.append(number)
             continue
         _sum_known(usage, summary.get("usage"))
         if not summary.get("usage_complete"):
@@ -1015,11 +1037,77 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
             cost += value
         else:
             cost_unknown.append(number)
+        metrics = summary.get("metrics")
+        if not isinstance(metrics, dict):
+            metrics_missing.append(number)
+            for key in timing_unknown:
+                if key != "windowSeconds":
+                    timing_unknown[key].append(number)
+            checks_elapsed_unknown.append(number)
+            continue
+        usage_metrics = metrics.get("usage")
+        for key in ("uncachedInput", "cacheRead", "cacheWrite", "output", "reasoning",
+                    "totalTokens"):
+            value = _metric_value(usage_metrics, key)
+            if value is not None:
+                derived_usage[key] = derived_usage.get(key, 0) + value
+                derived_usage_rounds[key] = derived_usage_rounds.get(key, 0) + 1
+        value = _metric_value(metrics.get("context"), "peak")
+        if value is not None:
+            context_peak = value if context_peak is None else max(context_peak, value)
+            context_rounds.append(number)
+        timing = metrics.get("timing")
+        for key in timing_rounds:
+            value = _metric_value(timing, key)
+            if value is not None:
+                timing_known[key] += value
+                timing_rounds[key] += 1
+            elif key != "windowSeconds":
+                timing_unknown[key].append(number)
+        checks_metrics = metrics.get("checks")
+        if isinstance(checks_metrics, dict):
+            for key in ("attempts", "completed", "passed", "failed", "interrupted",
+                        "unknown", "unverifiedLogs"):
+                value = checks_metrics.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    checks_total[key] += value
+            value = _metric_value(checks_metrics, "elapsedSeconds")
+            if value is not None:
+                checks_elapsed += value
+                checks_elapsed_rounds += 1
+            else:
+                checks_elapsed_unknown.append(number)
     record = {"task": task_id, "rounds": len(rounds),
               "usage": {"known": usage, "complete": bool(rounds) and not missing and not incomplete,
                         "roundsMissing": missing, "roundsIncomplete": incomplete},
               "costUsd": {"known": cost, "complete": bool(rounds) and not cost_unknown,
-                          "roundsUnknown": cost_unknown}}
+                          "roundsUnknown": cost_unknown},
+              "derivedMetrics": {
+                  "roundsWithoutMetrics": metrics_missing,
+                  "usage": {key: {"known": derived_usage.get(key) if derived_usage_rounds.get(key) else None,
+                                  "roundsKnown": derived_usage_rounds.get(key, 0),
+                                  "roundsMissingCount": len(rounds) - derived_usage_rounds.get(key, 0),
+                                  "complete": bool(rounds) and derived_usage_rounds.get(key, 0) == len(rounds)}
+                              for key in ("uncachedInput", "cacheRead", "cacheWrite", "output",
+                                          "reasoning", "totalTokens")},
+                  "contextPeak": {"known": context_peak,
+                                  "roundsKnown": context_rounds,
+                                  "complete": bool(rounds) and len(context_rounds) == len(rounds)},
+                  "timing": {key: {"known": timing_known[key] if timing_rounds[key] else None,
+                                   "roundsKnown": timing_rounds[key],
+                                   "roundsUnknown": timing_unknown[key],
+                                   "complete": bool(rounds) and timing_rounds[key] == len(rounds)}
+                             for key in timing_rounds},
+                  "checks": {key: checks_total[key] for key in ("attempts", "completed", "passed",
+                                                                "failed", "interrupted", "unknown",
+                                                                "unverifiedLogs")}
+                            | {"elapsedSeconds": {
+                                "known": checks_elapsed if checks_elapsed_rounds else None,
+                                "roundsKnown": checks_elapsed_rounds,
+                                "roundsUnknown": checks_elapsed_unknown,
+                                "complete": bool(rounds) and checks_elapsed_rounds == len(rounds)}},
+                  "note": "aggregated from stored round summaries only; no session scan during "
+                          "board refresh, and missing rounds stay unknown"}}
     if isinstance(card, dict):
         by_kind, failure_kinds = {}, {}
         for row in decision_records(card).values():

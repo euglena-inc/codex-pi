@@ -119,7 +119,10 @@ def finish_round(task_dir: Path, round_number: int, round_dir: Path, task: dict,
     atomic(round_dir / "round.state.json", state)
     try:
         data = summarize(round_dir / "round.jsonl", worktree, round_dir,
-                         task.get("model"), checks_dir=round_dir / "round.checks")
+                         task.get("model"), checks_dir=round_dir / "round.checks",
+                         session_dir=Path(task["sessionDir"]) if task.get("sessionDir") else None,
+                         session_id=task.get("sessionId"),
+                         window=(state.get("startedAt"), state.get("endedAt")))
         atomic(round_dir / "round.summary.json", data)
         (round_dir / "round.summary.txt").write_text(compact(data), encoding="utf-8")
     except Exception as exc:  # summary failure must not hide the raw evidence

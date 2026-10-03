@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from datetime import datetime
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import sys
@@ -30,6 +32,313 @@ RISKY = [
     (r"\bdocs/plan/", "frozen docs/plan"),
 ]
 USAGE_KEYS = ("input", "cacheRead", "cacheWrite", "output", "totalTokens")
+
+# Session-derived timing is an estimate from persisted write timestamps, never
+# an acceptance signal. The caller passes the explicit session source and the
+# round window; nothing here guesses a directory or scans another task.
+SESSION_ENTRY_SLACK_SECONDS = 1.0
+MAX_SESSION_LINE_BYTES = 8 * 1024 * 1024
+SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\Z")
+CACHE_RATIO_FORMULA = "cacheRead / (cacheRead + uncachedInput)"
+
+
+def _finite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
+def _epoch(value):
+    """ISO-8601 session entry timestamp to unix seconds; None when unusable."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text[-1:] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    try:
+        return parsed.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _leaf(value, label, **extra):
+    """One labelled metric: exact, estimated or unknown; null is never zero."""
+    result = {"value": value, "label": label}
+    result.update(extra)
+    return result
+
+
+def union_seconds(intervals):
+    """Union length of [start, end] intervals; overlap is counted once."""
+    ordered = sorted((float(start), float(end)) for start, end in intervals
+                     if float(end) >= float(start))
+    if not ordered:
+        return 0.0
+    total = 0.0
+    current_start, current_end = ordered[0]
+    for start, end in ordered[1:]:
+        if start <= current_end:
+            current_end = max(current_end, end)
+        else:
+            total += current_end - current_start
+            current_start, current_end = start, end
+    return total + current_end - current_start
+
+
+def resolve_session_file(session_dir, session_id):
+    """Exact session file for the caller's session dir/id; never a guessed root."""
+    if not session_dir or not isinstance(session_id, str) or not SESSION_ID_RE.fullmatch(session_id):
+        return None, 0, "no_session_source"
+    try:
+        base = Path(session_dir)
+        if not base.is_dir():
+            return None, 0, "session_dir_missing"
+        suffix = f"_{session_id}.jsonl"
+        candidates = [entry for entry in base.iterdir()
+                      if entry.is_file() and entry.name.endswith(suffix)]
+    except OSError:
+        return None, 0, "session_dir_unreadable"
+    if not candidates:
+        return None, 0, "session_file_missing"
+    candidates.sort(key=lambda path: path.name)
+    return candidates[-1], len(candidates), None
+
+
+def _iter_session_lines(path, limit=MAX_SESSION_LINE_BYTES):
+    """Bounded session lines: oversized single records stay explicit unknown."""
+    with Path(path).open("rb") as stream:
+        while True:
+            raw = stream.readline(limit)
+            if not raw:
+                return
+            if len(raw) >= limit and not raw.endswith(b"\n"):
+                while raw and not raw.endswith(b"\n"):
+                    raw = stream.readline(limit)
+                yield "overlong", None
+                continue
+            yield "line", raw
+
+
+def derive_timing(session_dir, session_id, window):
+    """Model/tool interval estimates for one round window.
+
+    Model intervals use the persisted session entry's outer write time and the
+    assistant message's internal start timestamp. Tool intervals use the
+    assistant persistence boundary and the matching tool-result message time;
+    parent/child or concurrent intervals are unioned, never added. Missing or
+    unreliable sources return null with an explicit reason instead of zero.
+    """
+    coverage = {"sessionFile": None, "sessionCandidates": 0, "entriesInWindow": 0,
+                "malformedLines": 0, "overlongLines": 0, "duplicateEntries": 0,
+                "invalidTimestamps": 0, "outOfWindowEntries": 0,
+                "duplicateToolCalls": 0, "toolResultsWithoutCall": 0,
+                "openToolIntervals": 0}
+    timing = {"status": "unknown", "label": "unknown",
+              "windowSeconds": _leaf(None, "unknown", source=None),
+              "modelResponseSeconds": _leaf(None, "unknown", samples=0, reason=None),
+              "toolSeconds": _leaf(None, "unknown", samples=0, openIntervals=0, reason=None),
+              "coveredSeconds": _leaf(None, "unknown", samples=0),
+              "unattributedSeconds": _leaf(None, "unknown", reason=None),
+              "coverage": coverage, "reason": None}
+    start = _finite(window[0]) if window else None
+    end = _finite(window[1]) if window else None
+    if start is None or end is None or end < start:
+        timing["reason"] = "round_window_missing"
+        return timing
+    wall = end - start
+    timing["windowSeconds"] = _leaf(wall, "exact", source="round state startedAt/endedAt")
+    session_file, candidates, problem = resolve_session_file(session_dir, session_id)
+    coverage["sessionCandidates"] = candidates
+    if session_file is None:
+        timing["reason"] = problem
+        return timing
+    coverage["sessionFile"] = str(session_file)
+    model_intervals, tool_intervals, open_tools = [], [], []
+    pending, used_calls, seen_entries = {}, set(), set()
+    for kind, raw in _iter_session_lines(session_file):
+        if kind == "overlong":
+            coverage["overlongLines"] += 1
+            continue
+        try:
+            entry = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            coverage["malformedLines"] += 1
+            continue
+        if not isinstance(entry, dict):
+            coverage["malformedLines"] += 1
+            continue
+        if entry.get("type") == "session":
+            continue
+        outer = _epoch(entry.get("timestamp"))
+        if outer is None:
+            coverage["invalidTimestamps"] += 1
+            continue
+        if outer < start - SESSION_ENTRY_SLACK_SECONDS or outer > end + SESSION_ENTRY_SLACK_SECONDS:
+            coverage["outOfWindowEntries"] += 1
+            continue
+        entry_id = entry.get("id")
+        if isinstance(entry_id, str):
+            if entry_id in seen_entries:
+                coverage["duplicateEntries"] += 1
+                continue
+            seen_entries.add(entry_id)
+        coverage["entriesInWindow"] += 1
+        if entry.get("type") != "message":
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        role, inner = message.get("role"), _finite(message.get("timestamp"))
+        if role == "assistant":
+            if inner is None or inner <= 0:
+                coverage["invalidTimestamps"] += 1
+                continue
+            model_start, model_end = inner / 1000.0, outer
+            if model_end < model_start:
+                coverage["invalidTimestamps"] += 1
+                continue
+            model_start, model_end = max(model_start, start), min(model_end, end)
+            if model_end < model_start:
+                coverage["invalidTimestamps"] += 1
+                continue
+            model_intervals.append((model_start, model_end))
+            for part in message.get("content") or []:
+                if not isinstance(part, dict) or part.get("type") != "toolCall":
+                    continue
+                call_id = part.get("id")
+                if not isinstance(call_id, str) or not call_id:
+                    continue
+                if call_id in used_calls:
+                    coverage["duplicateToolCalls"] += 1
+                    continue
+                used_calls.add(call_id)
+                pending[call_id] = model_end
+        elif role == "toolResult":
+            call_id = message.get("toolCallId")
+            if not isinstance(call_id, str) or inner is None or inner <= 0:
+                coverage["invalidTimestamps"] += 1
+                continue
+            tool_start = pending.pop(call_id, None)
+            if tool_start is None:
+                coverage["toolResultsWithoutCall"] += 1
+                continue
+            tool_end = inner / 1000.0
+            tool_start, tool_end = max(tool_start, start), min(tool_end, end)
+            if tool_end < tool_start:
+                coverage["invalidTimestamps"] += 1
+                continue
+            tool_intervals.append((tool_start, tool_end))
+    open_tools = [max(value, start) for value in pending.values()]
+    coverage["openToolIntervals"] = len(open_tools)
+    if not coverage["entriesInWindow"]:
+        timing["reason"] = "no_entries_in_window"
+        return timing
+    parse_clean = not (coverage["malformedLines"] or coverage["overlongLines"]
+                       or coverage["invalidTimestamps"])
+    model_union = union_seconds(model_intervals)
+    tool_union = union_seconds(tool_intervals)
+    model_known = bool(model_intervals)
+    tool_known = parse_clean and not open_tools
+    covered = union_seconds(model_intervals + tool_intervals)
+    coverage["parseClean"] = parse_clean
+    coverage["openToolSeconds"] = sum(max(0.0, end - value) for value in open_tools)
+    timing["modelResponseSeconds"] = _leaf(
+        model_union if model_known else None, "estimated" if model_known else "unknown",
+        samples=len(model_intervals),
+        reason=None if model_known else ("no_assistant_intervals_in_window"
+                                         if parse_clean else "session_parse_incomplete"))
+    tool_reason = None
+    if not tool_known:
+        tool_reason = "session_parse_incomplete" if not parse_clean else "open_tool_intervals_excluded"
+    timing["toolSeconds"] = _leaf(
+        tool_union if tool_known else None, "estimated" if tool_known else "unknown",
+        samples=len(tool_intervals), openIntervals=len(open_tools), reason=tool_reason)
+    if model_known and tool_known:
+        timing["coveredSeconds"] = _leaf(covered, "estimated", samples=len(model_intervals) + len(tool_intervals))
+        timing["unattributedSeconds"] = _leaf(
+            max(0.0, wall - covered), "estimated",
+            reason="round wall minus the union of measured model and tool intervals; "
+                   "open or unmeasured work stays here")
+        timing["status"] = "ok" if parse_clean and not open_tools else "partial"
+    elif model_known or tool_known:
+        timing["status"] = "partial"
+    else:
+        timing["status"] = "unknown"
+    timing["label"] = "estimated" if timing["status"] == "ok" else timing["status"]
+    return timing
+
+
+def usage_metrics(totals, samples, unique_messages, duplicates, reasoning_total, reasoning_samples):
+    def metric(key, source=None, note=None):
+        count = samples.get(key, 0) if source is None else source
+        value = totals.get(key) if source is None else reasoning_total
+        extra = {"samples": count}
+        if note:
+            extra["note"] = note
+        return _leaf(value if count else None, "exact" if count else "unknown", **extra)
+
+    ratio_samples = min(samples.get("input", 0), samples.get("cacheRead", 0))
+    denominator = (totals.get("input") or 0) + (totals.get("cacheRead") or 0)
+    if ratio_samples and denominator > 0:
+        complete = (samples.get("input") == unique_messages
+                    and samples.get("cacheRead") == unique_messages)
+        ratio = _leaf(totals["cacheRead"] / denominator, "exact" if complete else "estimated",
+                      samples=ratio_samples, formula=CACHE_RATIO_FORMULA)
+    else:
+        ratio = _leaf(None, "unknown", samples=ratio_samples, formula=CACHE_RATIO_FORMULA)
+    return {"uncachedInput": metric("input"), "cacheRead": metric("cacheRead"),
+            "cacheWrite": metric("cacheWrite"), "output": metric("output"),
+            "reasoning": metric("reasoning", reasoning_samples,
+                                "already included in output; never added again"),
+            "totalTokens": metric("totalTokens"), "cacheRatio": ratio,
+            "messages": unique_messages, "duplicateMessages": duplicates}
+
+
+def context_metrics(samples):
+    if not samples:
+        return {"first": _leaf(None, "unknown", samples=0), "last": _leaf(None, "unknown", samples=0),
+                "peak": _leaf(None, "unknown", samples=0), "samples": 0}
+    return {"first": _leaf(samples[0], "exact", samples=len(samples)),
+            "last": _leaf(samples[-1], "exact", samples=len(samples)),
+            "peak": _leaf(max(samples), "exact", samples=len(samples)),
+            "samples": len(samples), "unit": "tokens: input + cacheRead + cacheWrite"}
+
+
+def check_metrics(receipt_list):
+    counts = Counter()
+    elapsed, elapsed_samples, missing_time = 0.0, 0, 0
+    for check in receipt_list:
+        if check.get("timed_out") or check.get("cancelled"):
+            counts["interrupted"] += 1
+            continue
+        code = check.get("exit_code")
+        if code is None:
+            counts["unknown"] += 1
+            continue
+        counts["completed"] += 1
+        counts["passed" if code == 0 else "failed"] += 1
+        start, end = _finite(check.get("started_at")), _finite(check.get("ended_at"))
+        if start is not None and end is not None and end >= start:
+            elapsed += end - start
+            elapsed_samples += 1
+        else:
+            missing_time += 1
+    return {"attempts": len(receipt_list), "completed": counts["completed"],
+            "passed": counts["passed"], "failed": counts["failed"],
+            "interrupted": counts["interrupted"], "unknown": counts["unknown"],
+            "unverifiedLogs": sum(1 for check in receipt_list if not check.get("log_verified")),
+            "elapsedSeconds": _leaf(round(elapsed, 6) if elapsed_samples else None,
+                                    "exact" if elapsed_samples else "unknown",
+                                    samples=elapsed_samples, missingTime=missing_time,
+                                    note="sum over checks with a known exit code; interrupted and "
+                                         "unknown attempts never fabricate completed time")}
 
 
 def inside(path: Path, roots: list[Path]) -> bool:
@@ -61,7 +370,8 @@ def receipts(directory: Path) -> list[dict]:
             valid = (inside(log, [path.parent.resolve()]) and log.is_file()
                      and hashlib.sha256(log.read_bytes()).hexdigest() == data["log_sha256"])
             result.append({key: data.get(key) for key in (
-                "id", "argv", "head", "dirty", "exit_code", "timed_out", "test_counts", "log")}
+                "id", "argv", "head", "dirty", "exit_code", "timed_out", "cancelled",
+                "started_at", "ended_at", "test_counts", "log")}
                 | {"receipt": str(path), "log_verified": valid,
                    "resource_limit": sanitize_snapshot(data.get("resource_limit")
                                                        or data.get("resourceLimit"))})
@@ -71,7 +381,9 @@ def receipts(directory: Path) -> list[dict]:
 
 
 def summarize(log: Path, worktree: Path, run_dir: Path | None = None,
-              expected_model: str | None = None, checks_dir: Path | None = None) -> dict:
+              expected_model: str | None = None, checks_dir: Path | None = None,
+              session_dir: Path | None = None, session_id: str | None = None,
+              window: tuple | None = None) -> dict:
     run_dir = (run_dir or log.parent).resolve()
     worktree = worktree.resolve()
     meta = read_meta(log.with_suffix(".meta"))
@@ -80,7 +392,10 @@ def summarize(log: Path, worktree: Path, run_dir: Path | None = None,
     usage_samples = Counter()
     flags, errors, commands = [], [], []
     started = {}
-    malformed = turns = assistant_messages = 0
+    malformed = turns = assistant_messages = duplicate_usage = 0
+    reasoning_total, reasoning_samples = 0.0, 0
+    context_samples: list[float] = []
+    seen_usage: set = set()
     final, cost, cost_samples = "", 0.0, 0
     for line_no, raw in enumerate(log.open() if log.exists() else (), 1):
         try:
@@ -124,15 +439,37 @@ def summarize(log: Path, worktree: Path, run_dir: Path | None = None,
             if message.get("errorMessage"):
                 errors.append(str(message["errorMessage"])[:300])
             usage = message.get("usage") or {}
-            for key in USAGE_KEYS:
-                value = usage.get(key)
+            # Only unique assistant final usage counts; repeated agent_end or
+            # duplicated message_end delivery never accumulates twice.
+            stamp = message.get("timestamp")
+            identity = None
+            if isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+                identity = (stamp, message.get("provider"), message.get("model"),
+                            usage.get("input"), usage.get("cacheRead"), usage.get("cacheWrite"),
+                            usage.get("output"), message.get("stopReason"))
+            duplicate = identity is not None and identity in seen_usage
+            if duplicate:
+                duplicate_usage += 1
+            else:
+                if identity is not None:
+                    seen_usage.add(identity)
+                for key in USAGE_KEYS:
+                    value = usage.get(key)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        totals[key] += value
+                        usage_samples[key] += 1
+                reasoning = usage.get("reasoning")
+                if isinstance(reasoning, (int, float)) and not isinstance(reasoning, bool):
+                    reasoning_total += reasoning
+                    reasoning_samples += 1
+                context_parts = [usage.get(key) for key in ("input", "cacheRead", "cacheWrite")]
+                if all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                       for value in context_parts):
+                    context_samples.append(float(sum(context_parts)))
+                value = (usage.get("cost") or {}).get("total")
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
-                    totals[key] += value
-                    usage_samples[key] += 1
-            value = (usage.get("cost") or {}).get("total")
-            if isinstance(value, (int, float)):
-                cost += value
-                cost_samples += 1
+                    cost += value
+                    cost_samples += 1
             texts = [part["text"] for part in message.get("content", [])
                      if part.get("type") == "text" and part.get("text")]
             if texts:
@@ -144,8 +481,19 @@ def summarize(log: Path, worktree: Path, run_dir: Path | None = None,
     full_usage = bool(assistant_messages) and all(usage_samples[k] == assistant_messages
                                                 for k in USAGE_KEYS[:-1])
     check_dir = checks_dir or (run_dir / (log.stem.replace("round-", "checks-") if log.stem.startswith("round-") else "checks"))
+    check_receipts = receipts(check_dir)
     terminal = terminal_evidence(log)
     final = terminal.get("finalText") or ""
+    metrics = {"schema": 1,
+               "usage": usage_metrics(totals, usage_samples,
+                                      len(seen_usage) if seen_usage else assistant_messages,
+                                      duplicate_usage, reasoning_total, reasoning_samples),
+               "context": context_metrics(context_samples),
+               "checks": check_metrics(check_receipts),
+               "timing": derive_timing(session_dir, session_id, window),
+               "labels": "usage/context/check counters come from recorded final messages and "
+                          "receipts; timing is estimated from session write timestamps; "
+                          "unknown stays null and is never a fabricated zero"}
     return {"schema_version": 1, "execution_evidence": terminal, "source": str(log.resolve()), "source_bytes": log.stat().st_size if log.exists() else 0,
             "turns": turns, "assistant_messages": assistant_messages, "models": dict(models),
             "expected_model": expected_model, "model_check": model_check,
@@ -154,7 +502,8 @@ def summarize(log: Path, worktree: Path, run_dir: Path | None = None,
             "stop_reasons": dict(stop_reasons), "tool_counts": dict(counts),
             "commands": commands, "guardrail_flags": list(dict.fromkeys(flags)),
             "errors": errors, "malformed_lines": malformed, "final_text": final,
-            "check_receipts": receipts(check_dir), "checks_dir": str(check_dir.resolve()),
+            "metrics": metrics,
+            "check_receipts": check_receipts, "checks_dir": str(check_dir.resolve()),
             "process_exit": meta.get("exit"),
             "acceptance": "not_verified"}
 
@@ -210,6 +559,7 @@ def bounded(data: dict, receipt_limit: int = 8) -> dict:
             "malformed_lines": data["malformed_lines"],
             "final_excerpt": data["final_text"][:1200],
             "process_exit": data["process_exit"], "checks": check_overview(data, receipt_limit),
+            "metrics": data.get("metrics"),
             "acceptance": "not_verified"}
 
 
@@ -219,6 +569,31 @@ def compact(data: dict) -> str:
              f'usage={data["usage"]} complete={data["usage_complete"]} reported_cost_usd={data["reported_cost_usd"]}',
              f'tools={data["tool_counts"]} malformed_lines={data["malformed_lines"]}',
              'acceptance=not_verified (requires PLAN checks and independent review)']
+    metrics = data.get("metrics") or {}
+
+    def leaf(section, key):
+        item = (metrics.get(section) or {}).get(key) or {}
+        value = item.get("value")
+        return f"{value if value is not None else 'unknown'}({item.get('label', 'unknown')})"
+
+    usage_metrics, check_metrics_data, timing = (metrics.get("usage") or {},
+                                                 metrics.get("checks") or {},
+                                                 metrics.get("timing") or {})
+    lines.append(
+        "metrics usage: " + " ".join(f"{key}={leaf('usage', key)}" for key in (
+            "uncachedInput", "cacheRead", "cacheWrite", "output", "reasoning", "totalTokens", "cacheRatio")))
+    lines.append("metrics context: " + " ".join(
+        f"{key}={leaf('context', key)}" for key in ("first", "last", "peak")))
+    lines.append(
+        f"metrics checks: attempts={check_metrics_data.get('attempts')} "
+        f"completed={check_metrics_data.get('completed')} failed={check_metrics_data.get('failed')} "
+        f"interrupted={check_metrics_data.get('interrupted')} unknown={check_metrics_data.get('unknown')} "
+        f"elapsed={leaf('checks', 'elapsedSeconds')}")
+    lines.append(
+        f"metrics timing: window={leaf('timing', 'windowSeconds')} "
+        f"model={leaf('timing', 'modelResponseSeconds')} tool={leaf('timing', 'toolSeconds')} "
+        f"unattributed={leaf('timing', 'unattributedSeconds')} status={timing.get('status')} "
+        f"reason={timing.get('reason')}")
     for label, items in (("errors", data["errors"]), ("guardrail_flags", data["guardrail_flags"])):
         lines.append(f"{label}: count={len(items)}")
         lines.extend("  " + str(item)[:240] for item in items[:5])
@@ -249,10 +624,18 @@ def main() -> int:
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--checks-dir", type=Path)
     parser.add_argument("--expected-model")
+    parser.add_argument("--session-dir", type=Path,
+                        help="explicit session directory owned by the caller's task")
+    parser.add_argument("--session-id", help="explicit session id inside --session-dir")
+    parser.add_argument("--round-started-at", type=float, help="round window start (unix seconds)")
+    parser.add_argument("--round-ended-at", type=float, help="round window end (unix seconds)")
     parser.add_argument("--json", action="store_true", help="Full structured evidence, preferably redirect to disk")
     parser.add_argument("--commands", action="store_true", help="Explicitly expand command evidence")
     args = parser.parse_args()
-    data = summarize(args.jsonl, args.worktree, args.run_dir, args.expected_model, args.checks_dir)
+    window = (args.round_started_at, args.round_ended_at) \
+        if args.round_started_at is not None and args.round_ended_at is not None else None
+    data = summarize(args.jsonl, args.worktree, args.run_dir, args.expected_model, args.checks_dir,
+                     session_dir=args.session_dir, session_id=args.session_id, window=window)
     if args.json:
         print(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
     elif args.commands:

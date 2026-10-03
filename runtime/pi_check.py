@@ -25,6 +25,7 @@ at child exit also prevents a pass. Timed out, cancelled and guard-stopped
 attempts keep distinct fields. Without both options the helper is unguarded.
 """
 import argparse
+import codecs
 import hashlib
 import json
 import math
@@ -51,9 +52,26 @@ MAX_HEALTH_INTERVAL = 3600.0
 UNITTEST_RAN_RE = re.compile(r'^Ran (?P<run>\d+) tests? in [\d.]+s\s*$')
 UNITTEST_RESULT_RE = re.compile(r'^(?P<result>OK|FAILED)(?:\s*\((?P<detail>[^)]*)\))?\s*$')
 
+# One bounded pass over a check log: fixed-size byte chunks, incremental UTF-8,
+# a hard per-line cap and a small tail buffer. The full log still exists on disk.
+# Chunks stay small so a string containing non-BMP characters (4 bytes per char)
+# cannot expand one chunk into a large temporary decode buffer.
+STREAM_CHUNK_BYTES = 1 << 16
+MAX_LINE_CHARS = 1 << 18
+TAIL_KEEP_BYTES = 4096
+GO_PREFIX_CHARS = 64
+# The line boundaries used by ``str.splitlines`` for the unittest summary; Go
+# verbose markers follow ``re.M`` and start only after a real ``\n``.
+LINE_BREAK_RE = re.compile(r'\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]')
+GO_RUN_RE = re.compile(r'^=== RUN\s')
+GO_PASS_RE = re.compile(r'^--- PASS:')
+GO_FAIL_RE = re.compile(r'^--- FAIL:')
+GO_SKIP_RE = re.compile(r'^--- SKIP:')
+_UNSET = object()
 
-def unittest_counts(text: str):
-    """Counts from the unambiguous final unittest summary; None otherwise.
+
+def unittest_summary_counts(ran, result_line):
+    """Validate one candidate unittest summary pair; None when not decidable.
 
     The last ``Ran N tests ...`` line is the final candidate summary. It must be
     followed by a recognizable ``OK``/``FAILED`` line; every detail field must be
@@ -62,16 +80,7 @@ def unittest_counts(text: str):
     incomplete evidence returns ``None``, so declared ``minRun``/``forbidSkip``
     rules stay unknown instead of passing on a contradictory zero-exit log.
     """
-    lines = text.splitlines()
-    last_ran = None
-    for index, line in enumerate(lines):
-        match = UNITTEST_RAN_RE.match(line.strip())
-        if match:
-            last_ran = (index, int(match.group('run')))
-    if last_ran is None:
-        return None
-    result_line = next((line.strip() for line in lines[last_ran[0] + 1:] if line.strip()), None)
-    if result_line is None:
+    if ran is None or result_line is None:
         return None
     result = UNITTEST_RESULT_RE.match(result_line)
     if result is None:
@@ -93,16 +102,183 @@ def unittest_counts(text: str):
                 skipped = int(value)
             # other well-formed integer fields (for example expected failures)
             # are forward-compatible and do not change the fixed counters
-    run = last_ran[1]
     fail = failures + errors
     if result.group('result') == 'FAILED' and fail <= 0:
         return None
     if result.group('result') == 'OK' and fail > 0:
         return None
-    if fail + skipped > run:
+    if fail + skipped > ran:
         return None
-    return {'run': run, 'pass': max(0, run - fail - skipped), 'fail': fail,
+    return {'run': ran, 'pass': max(0, ran - fail - skipped), 'fail': fail,
             'skip': skipped, 'format': 'python_unittest_summary'}
+
+
+class LogAnalyzer:
+    """Single-pass SHA-256, test counts and bounded tail for one check log.
+
+    Go verbose counters follow the exact line anchors of the previous regex
+    scan. The unittest state keeps the last ``Ran N tests`` candidate and the
+    first non-empty line after it. A line longer than the hard cap leaves the
+    whole count unknown: its prefix is dropped, so the remainder is never
+    re-anchored and cannot mis-match later markers.
+    """
+
+    def __init__(self):
+        self.digest = hashlib.sha256()
+        self.bytes = 0
+        self.tail = bytearray()
+        self.go = {'run': 0, 'pass': 0, 'fail': 0, 'skip': 0}
+        self.overlong = False
+        self._decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        self._go_prefix: list[str] = []
+        self._go_len = 0
+        self._ut_buf: list[str] = []
+        self._ut_len = 0
+        self._ut_discarded = False
+        self._ran = None
+        self._result = _UNSET
+
+    def feed_bytes(self, chunk: bytes) -> None:
+        self.digest.update(chunk)
+        self.bytes += len(chunk)
+        if len(chunk) >= TAIL_KEEP_BYTES:
+            self.tail[:] = chunk[-TAIL_KEEP_BYTES:]
+        else:
+            self.tail.extend(chunk)
+            if len(self.tail) > TAIL_KEEP_BYTES:
+                del self.tail[:len(self.tail) - TAIL_KEEP_BYTES]
+        self.feed(self._decoder.decode(chunk))
+
+    def feed(self, text: str) -> None:
+        pos = 0
+        for match in LINE_BREAK_RE.finditer(text):
+            segment, terminator = text[pos:match.start()], match.group()
+            self._feed_go(segment)
+            self._feed_ut(segment)
+            if terminator in ('\n', '\r\n'):
+                self._end_go_line(terminated=True)
+            else:
+                self._feed_go(terminator)
+            self._end_ut_line()
+            pos = match.end()
+        self._feed_go(text[pos:])
+        self._feed_ut(text[pos:])
+
+    def flush(self) -> None:
+        self.feed(self._decoder.decode(b'', True))
+
+    def close(self) -> None:
+        self._end_go_line(terminated=False)
+        self._end_ut_line()
+
+    def _feed_go(self, piece: str) -> None:
+        if not piece:
+            return
+        if self._go_len + len(piece) > MAX_LINE_CHARS:
+            self.overlong = True
+            self._go_prefix = []
+            self._go_len = MAX_LINE_CHARS + 1
+            return
+        self._go_len += len(piece)
+        if len(self._go_prefix) < GO_PREFIX_CHARS:
+            need = GO_PREFIX_CHARS - len(self._go_prefix)
+            self._go_prefix.append(piece[:need])
+
+    def _end_go_line(self, terminated: bool) -> None:
+        prefix = ''.join(self._go_prefix)
+        # ``^=== RUN\s`` may consume the line terminator itself; only a real
+        # trailing newline can satisfy it, never end-of-file.
+        candidate = prefix + ('\n' if terminated else '')
+        if GO_RUN_RE.match(candidate):
+            self.go['run'] += 1
+        elif GO_PASS_RE.match(prefix):
+            self.go['pass'] += 1
+        elif GO_FAIL_RE.match(prefix):
+            self.go['fail'] += 1
+        elif GO_SKIP_RE.match(prefix):
+            self.go['skip'] += 1
+        self._go_prefix = []
+        self._go_len = 0
+
+    def _feed_ut(self, piece: str) -> None:
+        if not piece or self._ut_discarded:
+            return
+        if self._ut_len + len(piece) > MAX_LINE_CHARS:
+            self.overlong = True
+            self._ut_discarded = True
+            self._ut_buf = []
+            self._ut_len = 0
+            return
+        self._ut_buf.append(piece)
+        self._ut_len += len(piece)
+
+    def _end_ut_line(self) -> None:
+        if not self._ut_discarded:
+            self._process_unittest_line(''.join(self._ut_buf))
+        self._ut_buf = []
+        self._ut_len = 0
+        self._ut_discarded = False
+
+    def _process_unittest_line(self, line: str) -> None:
+        stripped = line.strip()
+        match = UNITTEST_RAN_RE.match(stripped)
+        if match:
+            self._ran = int(match.group('run'))
+            self._result = _UNSET
+            return
+        if self._ran is None or self._result is not _UNSET:
+            return
+        if stripped:
+            self._result = stripped
+
+    def analysis_counts(self):
+        if self.overlong:
+            return None
+        if any(self.go.values()):
+            return dict(self.go, format='go_verbose_top_level')
+        return unittest_summary_counts(
+            self._ran, None if self._result is _UNSET else self._result)
+
+
+def unittest_counts(text: str):
+    """Backward-compatible unittest-only counts over text; None when unknown.
+
+    Delegates to the same single streaming parser used by :func:`analyze_log`,
+    so there is exactly one counting implementation. Over-long lines leave the
+    count unknown, matching the streaming entry point.
+    """
+    analyzer = LogAnalyzer()
+    analyzer.feed(text)
+    analyzer.close()
+    if analyzer.overlong:
+        return None
+    return unittest_summary_counts(
+        analyzer._ran, None if analyzer._result is _UNSET else analyzer._result)
+
+
+def analyze_log(path, chunk_size: int = STREAM_CHUNK_BYTES) -> dict:
+    """One streaming read produces the full hash, conservative counts and tail.
+
+    The digest and the summary come from the same pass, so no second full-file
+    decode is needed for the tail. A missing or empty log keeps the historical
+    empty-bytes behavior (SHA-256 of empty input, unknown counts, empty tail).
+    """
+    analyzer = LogAnalyzer()
+    try:
+        with Path(path).open('rb') as stream:
+            while True:
+                chunk = stream.read(chunk_size)
+                if not chunk:
+                    break
+                analyzer.feed_bytes(chunk)
+            analyzer.flush()
+    except OSError:
+        return {'sha256': hashlib.sha256(b'').hexdigest(), 'bytes': 0,
+                'test_counts': None, 'tail': '', 'overlong': False}
+    analyzer.close()
+    return {'sha256': analyzer.digest.hexdigest(), 'bytes': analyzer.bytes,
+            'test_counts': analyzer.analysis_counts(),
+            'tail': log_tail(bytes(analyzer.tail)), 'overlong': analyzer.overlong}
 
 
 class Guard:
@@ -315,16 +491,8 @@ def main():
                     guard.stopped_child = guard.stopped_child or child is not None
                     if not timed_out and caught['signal'] is None and error is None:
                         code = GUARD_EXIT_CODE
-        raw = log.read_bytes() if log.exists() else b''
-        text = raw.decode(errors='replace')
-        counters = {'run': len(re.findall(r'^=== RUN\s', text, re.M)),
-                    'pass': len(re.findall(r'^--- PASS:', text, re.M)),
-                    'fail': len(re.findall(r'^--- FAIL:', text, re.M)),
-                    'skip': len(re.findall(r'^--- SKIP:', text, re.M))}
-        if any(counters.values()):
-            counts = dict(counters, format='go_verbose_top_level')
-        else:
-            counts = unittest_counts(text)
+        analysis = analyze_log(log)
+        counts = analysis['test_counts']
         try:
             head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True,
                                            stderr=subprocess.DEVNULL).strip()
@@ -341,7 +509,7 @@ def main():
                 'cancelled': caught['signal'] is not None,
                 'signal': caught['signal'],
                 'error': error, 'test_counts': counts, 'log': log.name,
-                'log_sha256': hashlib.sha256(raw).hexdigest(),
+                'log_sha256': analysis['sha256'],
                 'running_marker': marker.name,
                 'resource_limit': resource_limit,
                 'resourceLimit': resource_limit,
@@ -355,7 +523,7 @@ def main():
                'test_counts': counts, 'acceptance': 'not_verified'}
         if code != 0 or timed_out or caught['signal'] is not None:
             # stdout only; the immutable receipt is unchanged.
-            out['log_tail'] = log_tail(raw)
+            out['log_tail'] = analysis['tail']
         print(json.dumps(out))
         return code
     finally:

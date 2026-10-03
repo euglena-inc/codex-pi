@@ -2,11 +2,17 @@
 
 当前 Codex 主任务负责设计、派工与验收；Pi 的模型由项目配置选择（模型政策只在 [协作 Skill](skills/collaborate/SKILL.md) 中陈述）。项目只需 `.agents/codex-pi.json` 和自己的领域约束，公共插件维护进程、同会话返修、看板和原始证据。
 
-## 0.7.1 检查预算与局部修复
+## 0.7.1 检查预算、流式日志与指标
 
-`check` 在创建子进程前重读本轮真实 `deadlineAt`，固定预留 60 秒收尾。预计耗时与 timeout 分离：调用与合同的有限正数估计取较大值，均无估计时以有效的请求/合同上限作保守需求，不把阶段剩余缩小当作预计耗时。先算最终有效执行窗口（请求/合同上限、remaining−60、codemode 外层−清理余量），需求超过该窗口时返回结构化 `ok:false`（含 reason、requiredSeconds、allowedSeconds、remainingSeconds、reserveSeconds、`receipt:null`），不 spawn、不写回执、不产生零测试假回执；期限读取/身份校验失败同样拒绝。实际传入 helper 的 timeout 就是该窗口本身，保留小数、不向下取整。codemode 脚本内的嵌套检查同时计入该脚本自身的外层期限；扩展无法验证外层期限时拒绝并提示直接调用 `check`，已准入的检查不会被外层期限提前杀死。真实执行的返回带实际 `elapsedSeconds`、`allowedSeconds` 与采用的 `estimateSource`，估计不被写成实际耗时。
+`check` 在创建子进程前重读本轮真实 `deadlineAt`，固定预留 60 秒收尾。预计耗时与 timeout 分离：调用与合同的有限正数估计取较大值，均无估计时以有效的请求/合同上限作保守需求，不把阶段剩余缩小当作预计耗时。先算最终有效执行窗口（请求/合同上限、remaining−60、codemode 外层−清理余量），需求超过该窗口时返回结构化 `ok:false`（含 reason、requiredSeconds、allowedSeconds、remainingSeconds、reserveSeconds、`receipt:null`），不 spawn、不写回执、不产生零测试假回执；期限读取/身份校验失败同样拒绝。实际传入 helper 的 timeout 就是该窗口本身，保留小数、不向下取整。codemode 脚本内的嵌套检查同时计入该脚本自身的外层期限；扩展无法验证外层期限时拒绝并提示直接调用 `check`，已准入的检查不会被外层期限提前杀死。真实执行的返回带实际 `elapsedSeconds`、`allowedSeconds` 与采用的 `estimateSource`，估计不被写成实际耗时。拒绝提示只能在授权上限内调整 timeout 以覆盖可信估计，或在有证据时修正估计，不鼓励编低估计或扩预算。
 
 合同验收项可选 `targetedCommand`（仅局部调试建议，永不替代正式 command）与 `estimatedSeconds`；同一规范化 argv 的元数据矛盾在合同验证时拒绝。与带 `targetedCommand` 的全量命令 argv 相同的 `check` 默认拒绝并返回该建议，只有显式 `final:true` 且工作树干净才运行；匹配按 argv 而非 id，定向检查不能覆盖正式验收。不自动缓存 PASS、不制造复用回执、不限制全量只跑一次：定向通过、固定最终提交后全量仍须真实执行。没有新服务、状态库或通用调度器；旧冻结 worker 与缺少可选字段的旧合同保持原行为。
+
+检查日志改为单次流式分析：固定字节块同时产出完整 SHA-256、保守的 Go/unittest 计数和有限 `log_tail`，不为尾部再解码整个文件。多字节跨块、重复/矛盾摘要、空/缺失与非法 UTF-8 保持原有保守语义；超过硬上限的单行保持 unknown，不丢前缀后误匹配。原始日志仍完整落盘，回执的 exit/timeout/cancel/resource、head/dirty 和 hash/原子发布语义不变。
+
+`round.summary.json` 新增 `metrics` 紧凑分解：未缓存输入/缓存读取/输出/缓存比例、请求上下文首末峰值、真实 check 次数与已完成耗时（中断/未知不计入）、模型响应区间、工具区间并集及未归因余量，并标注 exact/estimated/unknown。usage 只累计唯一 assistant 最终消息，reasoning 是 output 子项不重复相加，重复投递的 `agent_end`/`turn_end` 不累计。时间指标由调用方显式传入 session 目录/id 与本轮时间窗口，从原生持久 session 的写入时间和消息内部时间派生；没有可靠来源返回 null 和 reason，不输出假 0。summary 只在轮次终态汇总或显式查询路径计算，看板周期刷新只读既有状态/回执/摘要，不做全量会话读取；旧 summary 的新指标保持未知，不原地改写。`pi_board.py metrics` 原有字段保留，新增 `derivedMetrics` 聚合，缺失轮次显式未知。
+
+新增 `scripts/benchmark_runtime.py --baseline-ref REF`：用 `git archive` 从基线只读物化旧 helper 到临时目录，旧新实现分别在独立子进程分析相同合成 10MiB/200MiB 日志，比较 hash/计数/尾部并测 wall 与 peak RSS（区分 macOS/Linux 单位、顺序运行不叠加）。候选 200MiB 峰值相对 10MiB 的增长有界，并须显著低于同输入旧实现；超出则非零退出并保留证据。脚本同时用已知总量的合成计时 fixture 校验指标分解，原始测量只留私有目录，公开只给无业务内容的紧凑结论。合成对照与未知边界见 [验证记录](docs/validation/runtime-efficiency-0.7.1-20261003.md)。
 
 ## 0.7.0 原生 codemode
 

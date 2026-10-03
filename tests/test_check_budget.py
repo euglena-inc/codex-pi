@@ -221,6 +221,12 @@ class AdmissionTest(BudgetCase):
         self.assertEqual(structured["allowedSeconds"], 1)
         self.assertEqual(structured["reserveSeconds"], 60)
         self.assertGreaterEqual(structured["remainingSeconds"], 299)
+        # The hint must not invert the semantics: the timeout may be raised only
+        # inside the authorized cap to cover a trusted estimate, never by
+        # inventing a lower estimate or expanding the budget.
+        self.assertIn("adjust timeoutSeconds only within the authorized cap", structured["reason"])
+        self.assertIn("correct the estimate only when evidence supports it", structured["reason"])
+        self.assertNotIn("estimate is wrong", structured["reason"])
 
     def test_contract_cap_below_the_estimate_is_refused(self):
         self.write_state(remaining=300)

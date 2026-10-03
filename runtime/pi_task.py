@@ -734,9 +734,13 @@ def load_round_summary(task_dir: Path, task: dict, round_dir: Path, number: int)
     log = round_dir / "round.jsonl"
     if not log.is_file():
         return None
+    state = read_json(round_dir / "round.state.json", {}) or {}
     try:
         data = summarize(log, Path(task["worktree"]), round_dir, task.get("model"),
-                         checks_dir=round_dir / "round.checks")
+                         checks_dir=round_dir / "round.checks",
+                         session_dir=Path(task["sessionDir"]) if task.get("sessionDir") else None,
+                         session_id=task.get("sessionId"),
+                         window=(state.get("startedAt"), state.get("endedAt")))
         atomic(summary_path, data)
         (round_dir / "round.summary.txt").write_text(compact(data), encoding="utf-8")
         return data
