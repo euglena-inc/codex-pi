@@ -1135,18 +1135,20 @@ export default async function (pi: ExtensionAPI) {
 			"Use this tool for every acceptance check. The receipt binds the actual command, exit code, log hash, " +
 			"candidate HEAD and dirty state. The tool returns the exit code, test counts and, on failure, the log " +
 			"tail. Failed checks keep their receipts; admission refusals return structured ok:false with " +
-			"receipt:null and never spawn or write evidence. The required " +
-			"duration is the larger of your call estimate and the estimate declared on the matching acceptance " +
-			"item(s), or the requested/contract cap when neither estimate exists. Before spawning, the effective " +
-			"window is limited " +
-			"by the requested/contract cap, the real round deadline minus a 60s wrap-up reserve, and a verifiable " +
-			"enclosing codemode deadline minus cleanup grace. A check is refused when the requirement exceeds that " +
-			"window; the refusal reports requiredSeconds and allowedSeconds, and the admitted helper timeout is " +
-			"that window itself with fractional seconds kept. A command that " +
-			"matches a contract item with targetedCommand is a full acceptance check and requires final:true on a " +
-			"clean worktree; targetedCommand is optional. A nested check needs a verifiable codemode deadline; " +
-			"without one, run the check directly. Never invent a smaller estimate and never expand authorization " +
-			"to fit the window.",
+			"receipt:null and never spawn or write evidence. The required duration is your call estimate when only " +
+			"it exists, the matching acceptance item's estimate when only it exists, or the larger of the two " +
+			"when both exist. When neither estimate exists, the required duration is the requested/contract cap. " +
+			"Before spawning, the effective window is the smallest applicable bound: the requested/contract cap, " +
+			"the remaining time until the real round deadline minus a 60s wrap-up reserve, and, for a nested " +
+			"check, the remaining time until the verifiable enclosing codemode deadline minus cleanup grace. A " +
+			"direct check has no codemode bound. A check is refused when the requirement exceeds that window; the " +
+			"refusal reports requiredSeconds and allowedSeconds, and the admitted helper timeout is that window " +
+			"itself with fractional seconds kept. A command that matches a contract item with targetedCommand is " +
+			"a full acceptance check and requires final:true on a clean worktree; targetedCommand is optional. A " +
+			"nested check needs a verifiable codemode deadline; without one, run the check directly. Never " +
+			"fabricate an estimate or lower one without evidence to fit the window, and never expand " +
+			"authorization to fit it. Correct the estimate only when evidence supports it, or adjust " +
+			"timeoutSeconds only within the authorized cap to cover a trusted estimate.",
 		promptSnippet: "Run a recorded check (receipt-bound)",
 		parameters: {
 			type: "object",
@@ -1154,7 +1156,7 @@ export default async function (pi: ExtensionAPI) {
 				id: { type: "string", description: "Stable check id, letters, digits, '_' or '-'" },
 				command: { type: "string", description: "Command line, split like a POSIX shell without running a shell" },
 				timeoutSeconds: { type: "number", description: "Wrapper deadline in seconds (clamped to the task cap)" },
-				estimatedSeconds: { type: "number", description: "Finite positive planning estimate, not a completion guarantee; the larger of this and a matching contract item estimate must fit the effective window" },
+				estimatedSeconds: { type: "number", description: "Finite positive planning estimate, not a completion guarantee; when a matching contract item declares its own estimate, the required duration is the larger of the two" },
 				final: { type: "boolean", description: "Set true only for a full acceptance command with targetedCommand on a clean worktree; other contract commands do not need it" },
 				watchPath: { type: "string", description: "Directory whose byte budget is guarded" },
 				maxBytes: { type: "number", description: "Byte budget for watchPath (required with it)" },
