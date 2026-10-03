@@ -44,11 +44,14 @@ const report = {
 	allTools: [],
 	toolsWithOutputSchema: [],
 	idleResponses: 0,
+	providerRequests: [],
+	sessionCompactionEvents: [],
 	cases: {},
 	blocks: [],
 };
 const toolEvents = [];
 let firstToolStart = false;
+let currentCase = null;
 
 const scripted = [];
 function nextScripted() {
@@ -61,20 +64,56 @@ const usage = () => ({ input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalT
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } });
 let callCounter = 0;
 
+function toolResultBytesOf(context) {
+	let bytes = 0;
+	for (const message of context?.messages ?? []) {
+		if (message?.role !== "toolResult") continue;
+		bytes += Buffer.byteLength(JSON.stringify(message), "utf8");
+	}
+	return bytes;
+}
+
+function contractInContext(context) {
+	if (typeof context?.systemPrompt === "string"
+		&& context.systemPrompt.includes(workerConfig.contract)) return true;
+	for (const message of context?.messages ?? []) {
+		if (message?.role !== "system") continue;
+		if (JSON.stringify(message).includes(workerConfig.contract)) return true;
+	}
+	return false;
+}
+
+function onProviderRequest(model, context) {
+	report.providerRequests.push({
+		case: currentCase,
+		model: `${model?.provider ?? "?"}/${model?.id ?? "?"}`,
+		toolResultBytes: toolResultBytesOf(context),
+		messageCount: Array.isArray(context?.messages) ? context.messages.length : 0,
+		contractInjected: contractInContext(context),
+	});
+}
+
 function buildStream(model, response) {
 	const stream = createAssistantMessageEventStream();
-	const isCall = typeof response.code === "string";
-	const content = isCall
+	const direct = response.toolCall;
+	const isCall = typeof response.code === "string" || (direct && typeof direct.name === "string");
+	const failed = response.error !== undefined;
+	const content = typeof response.code === "string"
 		? [{ type: "toolCall", id: `probe-${++callCounter}`, name: "codemode", arguments: { code: response.code } }]
-		: [{ type: "text", text: response.text ?? "probe: text" }];
-	const stopReason = isCall ? "toolUse" : "stop";
+		: isCall
+			? [{ type: "toolCall", id: `probe-${++callCounter}`, name: direct.name, arguments: direct.arguments ?? {} }]
+			: [{ type: "text", text: response.text ?? "probe: text" }];
+	const stopReason = failed ? "error" : isCall ? "toolUse" : "stop";
 	const message = { role: "assistant", content, api: model.api, provider: model.provider,
-		model: model.id, usage: usage(), stopReason, timestamp: Date.now() };
-	queueMicrotask(() => {
+		model: model.id, usage: usage(), stopReason, timestamp: Date.now(),
+		...(failed ? { errorMessage: String(response.error) } : {}) };
+	const emit = () => {
 		stream.push({ type: "start", partial: { ...message, content: [], stopReason: "pending" } });
 		stream.push({ type: "done", reason: stopReason, message });
 		stream.end(message);
-	});
+	};
+	if (response.gate instanceof Promise) response.gate.then(emit);
+	else queueMicrotask(emit);
 	return stream;
 }
 
@@ -87,7 +126,10 @@ function probeProvider(api) {
 		models: [{ id: "scripted", name: "Scripted", api: "probe-api", input: ["text"],
 			reasoning: false, contextWindow: 200000, maxTokens: 4096,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
-		streamSimple: (model) => buildStream(model, nextScripted()),
+		streamSimple: (model, context) => {
+			onProviderRequest(model, context);
+			return buildStream(model, nextScripted());
+		},
 	});
 }
 
@@ -120,17 +162,22 @@ async function createSession(sessionManager) {
 }
 
 function attach(session) {
+	const argsByCall = new Map();
 	return session.subscribe((event) => {
 		if (event.type === "tool_execution_start") {
 			if (!firstToolStart) {
 				firstToolStart = true;
 				report.readyBeforeFirstTool = fs.existsSync(readyPath);
 			}
+			argsByCall.set(event.toolCallId, event.args ?? null);
 			toolEvents.push({ phase: "start", tool: event.toolName,
-				parent: event.parentToolCallId ?? null });
+				parent: event.parentToolCallId ?? null,
+				args: event.args ?? null });
 		} else if (event.type === "tool_execution_end") {
 			toolEvents.push({ phase: "end", tool: event.toolName, parent: event.parentToolCallId ?? null,
-				isError: Boolean(event.isError), text: textOf(event.result) });
+				isError: Boolean(event.isError), text: textOf(event.result),
+				args: argsByCall.get(event.toolCallId) ?? null,
+				toolCallId: event.toolCallId ?? null });
 		}
 	});
 }
@@ -143,6 +190,8 @@ async function runCase(session, name, responses, runner) {
 	scripted.length = 0;
 	scripted.push(...responses);
 	const startIndex = toolEvents.length;
+	const requestStart = report.providerRequests.length;
+	currentCase = name;
 	const started = Date.now();
 	let error = null;
 	try {
@@ -155,10 +204,13 @@ async function runCase(session, name, responses, runner) {
 		error,
 		elapsedMs: Date.now() - started,
 		leftover: scripted.length,
+		providerRequests: report.providerRequests.slice(requestStart),
 		codemode: events.filter((entry) => entry.phase === "end" && entry.tool === "codemode"),
 		nestedStarts: events.filter((entry) => entry.phase === "start" && entry.parent !== null),
 		nestedEnds: events.filter((entry) => entry.phase === "end" && entry.parent !== null),
+		topEnds: events.filter((entry) => entry.phase === "end" && entry.parent === null),
 	};
+	currentCase = null;
 }
 
 function sleep(ms) {
@@ -294,7 +346,11 @@ async function main() {
 }
 
 try {
-	if (process.env.PI_PROBE_CONCURRENCY === "1") {
+	if (process.env.PI_PROBE_CONTEXT_WORKFLOW === "1") {
+		const { runContextWorkflow } = await import('./context_workflow_probe.mjs');
+		await runContextWorkflow({ createSession, attach, runCase, report, workerConfig, workdir,
+			paths, sleep, waitFor, processAlive, scripted, SessionManager });
+	} else if (process.env.PI_PROBE_CONCURRENCY === "1") {
         const {runConcurrency} = await import('./concurrency_probe.mjs');
         await runConcurrency({createSession,attach,runCase,report,workerConfig,workdir,paths});
     } else await main();

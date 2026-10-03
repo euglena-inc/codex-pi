@@ -1012,6 +1012,9 @@ def build_result(repo_arg: str, task_arg: str, round_arg=None) -> dict:
         notes.append(summary_data["error"])
     if summary is not None and not summary.get("usage_complete"):
         notes.append("model usage was not fully reported; missing values are unknown, not zero")
+    if summary is not None and not (summary.get("auxiliary_usage") or {}).get("complete"):
+        notes.append("auxiliary usage (compaction/branch_summary/usage entries) was not fully "
+                     "established; missing values are unknown, not zero")
     if supervisor_alive:
         notes.append("the supervisor is alive and holds the task lock")
     checks = []
@@ -1037,6 +1040,8 @@ def build_result(repo_arg: str, task_arg: str, round_arg=None) -> dict:
         "usage": (summary or {}).get("usage"),
         "usageComplete": bool(summary and summary.get("usage_complete")),
         "costUsd": (summary or {}).get("reported_cost_usd"),
+        "auxiliaryUsage": (summary or {}).get("auxiliary_usage"),
+        "totalUsageComplete": bool(summary and summary.get("total_usage_complete")),
         "checks": checks,
         "final": ((summary or {}).get("final_excerpt") or "")[:COMPACT_FINAL_CHARS]
         if selected_state["state"] == "completed" else "",

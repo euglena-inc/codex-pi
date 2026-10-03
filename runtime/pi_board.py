@@ -1055,6 +1055,14 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
     checks_total = Counter()
     checks_elapsed = 0.0
     checks_rounds = {"known": [], "incomplete": [], "unknown": []}
+    # Auxiliary usage is aggregated only from stored summaries; this function never
+    # resolves or scans a session file, so an old summary without it stays unknown.
+    auxiliary_metric_keys = usage_metric_keys + ("reportedCostUsd",)
+    derived_auxiliary = {}
+    auxiliary_rounds = {key: {"known": [], "incomplete": [], "unknown": []}
+                        for key in auxiliary_metric_keys}
+    auxiliary_complete, auxiliary_incomplete, auxiliary_unknown = [], [], []
+    auxiliary_counts = Counter()
     for number in rounds:
         summary, problem = _read_bounded_json(task_dir / "rounds" / str(number)
                                               / "round.summary.json", 4_000_000)
@@ -1068,6 +1076,9 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
             for key in timing_keys:
                 timing_rounds[key]["unknown"].append(number)
             checks_rounds["unknown"].append(number)
+            for key in auxiliary_metric_keys:
+                auxiliary_rounds[key]["unknown"].append(number)
+            auxiliary_unknown.append(number)
             continue
         _sum_known(usage, summary.get("usage"))
         if not summary.get("usage_complete"):
@@ -1086,6 +1097,9 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
             for key in timing_keys:
                 timing_rounds[key]["unknown"].append(number)
             checks_rounds["unknown"].append(number)
+            for key in auxiliary_metric_keys:
+                auxiliary_rounds[key]["unknown"].append(number)
+            auxiliary_unknown.append(number)
             continue
         usage_section = metrics.get("usage")
         for key in usage_metric_keys:
@@ -1098,6 +1112,39 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
         value = _metric_value(context_section, "peak")
         if value is not None:
             context_peak = value if context_peak is None else max(context_peak, value)
+        auxiliary = metrics.get("auxiliary")
+        if isinstance(auxiliary, dict):
+            for key in auxiliary_metric_keys:
+                _record_round_metric(auxiliary_rounds[key], auxiliary, key, number)
+                value = _metric_value(auxiliary, key)
+                if value is not None:
+                    derived_auxiliary[key] = derived_auxiliary.get(key, 0) + value
+            if auxiliary.get("complete") is True:
+                auxiliary_complete.append(number)
+            else:
+                auxiliary_incomplete.append(number)
+            for key in ("entries", "duplicateEntries", "identityMissingEntries",
+                        "usageMissingEntries", "costMissingEntries",
+                        "successfulCompactionEntries", "reportedCompactionsWithoutEntry"):
+                value = auxiliary.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    auxiliary_counts[key] += value
+            kinds = auxiliary.get("kinds")
+            if isinstance(kinds, dict):
+                for kind in ("compaction", "branch_summary", "usage"):
+                    value = kinds.get(kind)
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        auxiliary_counts[f"kind_{kind}"] += value
+            signals = auxiliary.get("failureSignals")
+            if isinstance(signals, dict):
+                for key in ("compactionFailed", "compactionAborted", "compactionUnfinished"):
+                    value = signals.get(key)
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        auxiliary_counts[f"signal_{key}"] += value
+        else:
+            for key in auxiliary_metric_keys:
+                auxiliary_rounds[key]["unknown"].append(number)
+            auxiliary_unknown.append(number)
         timing = metrics.get("timing")
         for key in timing_keys:
             _record_round_metric(timing_rounds[key], timing, key, number)
@@ -1122,6 +1169,13 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
                         "roundsMissing": missing, "roundsIncomplete": incomplete},
               "costUsd": {"known": cost, "complete": bool(rounds) and not cost_unknown,
                           "roundsUnknown": cost_unknown},
+              "auxiliaryUsage": {
+                  "known": {key: derived_auxiliary.get(key) for key in auxiliary_metric_keys},
+                  "counts": {key: auxiliary_counts[key] for key in sorted(auxiliary_counts)},
+                  "complete": bool(rounds) and not auxiliary_incomplete and not auxiliary_unknown,
+                  "roundsComplete": auxiliary_complete,
+                  "roundsIncomplete": auxiliary_incomplete,
+                  "roundsUnknown": auxiliary_unknown},
               "derivedMetrics": {
                   "roundsWithoutMetrics": metrics_missing,
                   "usage": {key: _aggregate_metric(derived_usage.get(key), usage_rounds[key], rounds)
@@ -1134,6 +1188,11 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
                                                                 "unverifiedLogs")}
                             | {"elapsedSeconds": _aggregate_metric(checks_elapsed, checks_rounds,
                                                                   rounds)},
+                  "auxiliary": {key: _aggregate_metric(derived_auxiliary.get(key), auxiliary_rounds[key],
+                                                       rounds)
+                                for key in auxiliary_metric_keys},
+                  "totalComplete": bool(rounds) and not missing and not incomplete
+                                   and not auxiliary_incomplete and not auxiliary_unknown,
                   "note": "aggregated from stored round summaries only; every round is partitioned "
                           "into known/incomplete/unknown per metric, completeness requires all "
                           "rounds, and no session is scanned during board refresh"}}

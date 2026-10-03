@@ -12,6 +12,13 @@ nested budget refusal that leaves no receipt, nested forbidden writes blocked by
 the same guard, bounded/omitted/invalid script deadlines with real cancellation,
 and `store`/`load` commit/resume semantics.
 
+With `--context-workflow` the same real pipeline additionally verifies a cheap
+precondition that blocks a dependent command, direct reads versus one codemode
+batch with real request/byte observations, and idle native `session.compact`
+safety with failure/cancel/no-model negatives and an active-state control. The
+scripted provider's fixed usage is an observation, never evidence of real token
+savings or cost benefit.
+
 Missing Node or a Pi older than 1.0.0 fails nonzero; it never skips and reports
 success. A zero exit only proves execution finished, not acceptance.
 """
@@ -307,14 +314,230 @@ class CodemodeIntegrationTest(unittest.TestCase):
             self.assertNotIn('"bad":7', self.case_text(self.case(name)))
 
 
+class ContextWorkflowIntegrationTest(unittest.TestCase):
+    """Synthetic precondition, batch-read and idle native-compaction observations.
+
+    A zero exit only proves execution finished. Every assertion here compares the
+    recorded candidate-bound facts with independently computed expectations; the
+    fixed scripted usage is never read as real token or cost savings.
+    """
+    maxDiff = None
+    report = None
+    layout = None
+
+    @classmethod
+    def setUpClass(cls):
+        if cls.report is None or cls.layout is None:
+            raise ProbeUnavailable("the context-workflow probe was not prepared; run this script directly")
+
+    def case(self, name: str) -> dict:
+        cases = self.report["cases"]
+        self.assertIn(name, cases, f"the probe did not record case {name}")
+        return cases[name]
+
+    def case_text(self, case: dict) -> str:
+        return "\n".join(entry["text"] for entry in case["codemode"])
+
+    def script_payload(self, name: str) -> dict:
+        text = self.case_text(self.case(name))
+        for line in reversed(text.splitlines()):
+            stripped = line.strip()
+            if not stripped.startswith("{"):
+                continue
+            try:
+                value = json.loads(stripped)
+            except ValueError:
+                continue
+            if isinstance(value, dict):
+                return value
+        self.fail(f"case {name} did not return a JSON object: {text[-400:]}")
+
+    def test_worker_loads_without_exposing_a_compact_tool(self):
+        marker = self.report["readyMarker"]
+        self.assertIsInstance(marker, dict, "the worker extension never wrote worker.ready")
+        self.assertIs(marker.get("codemode"), True)
+        self.assertEqual(self.report["piVersion"], self.report["piVersionExpected"])
+        self.assertIn("codemode", self.report["activeTools"])
+        self.assertNotIn("compact", self.report["allTools"],
+                         "a production compact tool must never be exposed")
+        self.assertNotIn("compact", self.report["activeTools"])
+        self.assertIs(self.report["compactToolExposed"], False)
+        self.assertEqual(self.report["model"], "probe/scripted")
+        self.assertIn("check", self.report["toolsWithOutputSchema"])
+
+    def test_missing_input_precondition_blocks_the_dependent_command(self):
+        missing = self.report["precondition"]["missing"]
+        self.assertIsNone(missing["caseError"])
+        text = self.case_text(self.case("precondition-missing"))
+        self.assertIn('"ok":false', text)
+        self.assertIn('"exit":1', text)
+        self.assertIn('"dependentSkipped":true', text)
+        self.assertFalse(missing["dependentMarkerExists"])
+        self.assertEqual(missing["dependentReceipts"], [])
+        failed = [row for row in missing["preconditionReceipts"] if row["exitCode"] != 0]
+        self.assertEqual(len(failed), 1, "the failed precondition must leave exactly one receipt")
+        self.assertTrue(failed[0]["head"], "the failed receipt must bind the candidate head")
+        self.assertEqual(failed[0]["exitCode"], 1)
+
+        ready = self.report["precondition"]["ready"]
+        self.assertIsNone(ready["caseError"])
+        ready_text = self.case_text(self.case("precondition-ready"))
+        self.assertIn('"ok":true', ready_text)
+        self.assertIn('"dependent"', ready_text)
+        self.assertIsNotNone(ready["dependentMarker"])
+        self.assertEqual(len(ready["dependentReceipts"]), 1)
+        self.assertEqual(ready["dependentReceipts"][0]["exitCode"], 0)
+        passes = [row for row in ready["preconditionReceipts"] if row["exitCode"] == 0]
+        self.assertEqual(len(passes), 1)
+        failed_after_fix = [row for row in ready["preconditionReceipts"] if row["exitCode"] != 0]
+        self.assertEqual(len(failed_after_fix), 1)
+        self.assertEqual(failed_after_fix[0]["sha256"], failed[0]["sha256"],
+                         "the earlier failed receipt is immutable")
+
+    def test_batch_read_reduces_requests_and_entering_tool_result_bytes(self):
+        batch = self.report["batchRead"]
+        direct, codemode = batch["direct"], batch["codemode"]
+        self.assertEqual(direct["providerRequests"], 5,
+                         "three reads, one missing read and the final answer are real requests")
+        self.assertEqual(codemode["providerRequests"], 2,
+                         "one batch script and the final answer are real requests")
+        self.assertIsNotNone(direct["lastToolResultBytes"])
+        self.assertIsNotNone(codemode["lastToolResultBytes"])
+        self.assertGreater(direct["toolResultDeltaBytes"], codemode["toolResultDeltaBytes"],
+                           "direct reads keep entering later requests; the batch result enters once")
+        direct_reads = {row["path"]: row for row in direct["reads"] if not row["isError"]}
+        nested_reads = {row["path"]: row for row in codemode["nestedReads"] if not row["isError"]}
+        for file in batch["files"]:
+            self.assertIn(file["path"], direct_reads, f"direct read missing for {file['name']}")
+            self.assertIn(file["path"], nested_reads, f"nested read missing for {file['name']}")
+            self.assertEqual(direct_reads[file["path"]]["text"], nested_reads[file["path"]]["text"],
+                             "both paths must return the same real read result")
+            self.assertGreater(direct_reads[file["path"]]["bytes"], 0)
+        direct_missing = [row for row in direct["reads"] if row["path"] == batch["missingPath"]]
+        nested_missing = [row for row in codemode["nestedReads"]
+                          if row["path"] == batch["missingPath"]]
+        self.assertEqual(len(direct_missing), 1)
+        self.assertIs(direct_missing[0]["isError"], True)
+        self.assertEqual(len(nested_missing), 1)
+        self.assertIs(nested_missing[0]["isError"], True)
+        payload = self.script_payload("read-codemode")
+        self.assertIn("missing", payload["failures"])
+        worktree = self.layout["worktree"]
+        for file in batch["files"]:
+            content = (worktree / file["name"]).read_text(encoding="utf-8")
+            expected = [line for line in content.splitlines() if "KEEP" in line]
+            kept = payload["kept"].get(file["key"], [])
+            self.assertEqual(len(kept), len(expected),
+                             f"filtered count differs for {file['name']}")
+            for line in expected:
+                self.assertTrue(any(line in got for got in kept),
+                                f"{line!r} was not really read into {file['name']}")
+
+    def test_active_state_never_compacts_or_aborts_the_task(self):
+        active = self.report["activeNegative"]
+        self.assertIs(active["markerAppeared"], True,
+                      "the active task must not be aborted by compaction")
+        self.assertEqual(active["marker"], "original")
+        self.assertEqual(active["compactionEventsDuringTask"], 0)
+        self.assertEqual(active["compactionEntriesDuringTask"],
+                         self.report["compactFacts"]["before"])
+        self.assertIs(active["compactToolExposed"], False)
+        self.assertIsNone(self.case("active-negative")["error"])
+
+    def test_idle_compaction_writes_one_real_entry_with_usage(self):
+        facts = self.report["compactFacts"]["success"]
+        self.assertIsNone(facts["error"])
+        entry = facts["entry"]
+        self.assertIsInstance(entry, dict, "idle compaction did not append a compaction entry")
+        self.assertEqual(entry["type"], "compaction")
+        self.assertIsInstance(entry.get("summary"), str)
+        self.assertGreater(len(entry["summary"]), 0)
+        self.assertGreater(entry["tokensBefore"], 0)
+        usage = entry.get("usage") or {}
+        calls = facts["providerRequests"]
+        self.assertGreaterEqual(calls, 1)
+        self.assertLessEqual(calls, 2, "the real compiler needs at most a history and a turn-prefix call")
+        self.assertEqual(usage.get("input"), 10 * calls)
+        self.assertEqual(usage.get("output"), 5 * calls)
+        self.assertEqual(usage.get("totalTokens"), 15 * calls)
+        self.assertEqual((usage.get("cost") or {}).get("total"), 0)
+        self.assertNotIn("probe: idle", entry["summary"],
+                         "each summarization call must get a deliberate scripted response")
+        self.assertEqual(facts["entriesAfter"], facts["entriesBefore"] + 1)
+        self.assertIs(facts["prefixPreserved"], True,
+                      "compaction must append, never rewrite the earlier session prefix")
+        self.assertGreater(facts["appendedBytes"], 0)
+        self.assertEqual((facts.get("result") or {}).get("usage", {}).get("input"), 10 * calls)
+
+    def test_failure_cancel_and_no_model_never_create_a_success_entry(self):
+        facts = self.report["compactFacts"]
+        base = facts["before"]
+        self.assertIsNotNone(facts["failure"]["error"])
+        self.assertIn("synthetic deterministic summary failure", facts["failure"]["error"])
+        self.assertEqual(facts["failure"]["entries"], base)
+        self.assertIs(facts["cancel"]["providerRequested"], True)
+        self.assertIsNotNone(facts["cancel"]["error"])
+        self.assertEqual(facts["cancel"]["entries"], base)
+        self.assertIsNotNone(facts["noModel"]["error"])
+        self.assertEqual(facts["noModel"]["entries"], base)
+
+    def test_resume_preserves_identity_store_contract_and_receipts(self):
+        facts = self.report["compactFacts"]["success"]
+        resume = self.report["resume"]
+        self.assertEqual(resume["sessionId"], self.report["sessionId"])
+        self.assertEqual(facts["sessionId"], self.report["sessionId"])
+        self.assertEqual(resume["model"], self.report["model"], "the model pin must not change")
+        self.assertEqual(facts["model"], self.report["model"])
+        self.assertIn('"ok":"kept"', self.case_text(self.case("post-compact-store")))
+        self.assertIn('"ok":"kept"', self.case_text(self.case("resume-store")))
+        self.assertIs(resume["contractInjected"], True,
+                      "the contract must be re-injected after resume")
+        before = self.report["receiptsBeforeDispose"]
+        after = self.report["receiptsAfterResume"]
+        self.assertEqual(before, after, "compaction and resume must not rewrite receipts")
+        failed = [row for row in after["precondition"] if row["exitCode"] != 0]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["exitCode"], 1,
+                         "a failed receipt must not become a pass through compaction")
+
+    def test_real_compaction_entry_feeds_the_auxiliary_usage_summary(self):
+        import importlib
+        sys.path.insert(0, str(RUNTIME))
+        pi_summary = importlib.import_module("pi_summary")
+        facts = self.report["compactFacts"]["success"]
+        entry_usage = facts["entry"]["usage"]
+        log = self.layout["roundDir"] / "context-crosscheck.jsonl"
+        log.write_text("", encoding="utf-8")
+        data = pi_summary.summarize(
+            log, self.layout["worktree"], self.layout["roundDir"], "probe/scripted",
+            checks_dir=self.layout["checks"], session_dir=self.layout["sessionDir"],
+            session_id=self.report["sessionId"], window=tuple(facts["window"]))
+        auxiliary = data["metrics"]["auxiliary"]
+        self.assertEqual(auxiliary["kinds"]["compaction"], 1)
+        self.assertEqual(auxiliary["usageMissingEntries"], 0)
+        self.assertTrue(auxiliary["complete"])
+        self.assertEqual(auxiliary["uncachedInput"]["value"], entry_usage["input"])
+        self.assertEqual(auxiliary["output"]["value"], entry_usage["output"])
+        self.assertEqual(auxiliary["totalTokens"]["value"], entry_usage["totalTokens"])
+        self.assertEqual(auxiliary["reportedCostUsd"]["value"],
+                         (entry_usage.get("cost") or {}).get("total"))
+        self.assertEqual(data["auxiliary_usage"]["kinds"]["compaction"], 1)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--concurrency', action='store_true')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--concurrency', action='store_true')
+    modes.add_argument('--context-workflow', action='store_true')
     args = parser.parse_args()
     if args.concurrency:
         os.environ['PI_PROBE_CONCURRENCY'] = '1'
     else:
         os.environ.pop('PI_PROBE_CONCURRENCY', None)
+    if args.context_workflow:
+        os.environ['PI_PROBE_CONTEXT_WORKFLOW'] = '1'
+    else:
+        os.environ.pop('PI_PROBE_CONTEXT_WORKFLOW', None)
     try:
         pi_bin, package_root, entry, pi_version = resolve_pi(os.environ.get("PI_BIN", "pi"))
         if shutil.which("node") is None:
@@ -335,6 +558,8 @@ def main() -> int:
         if args.concurrency:
             from concurrency_probe import ConcurrencyIntegrationTest
             test_class = ConcurrencyIntegrationTest
+        elif args.context_workflow:
+            test_class = ContextWorkflowIntegrationTest
         test_class.report = report
         test_class.layout = layout
         suite = unittest.TestLoader().loadTestsFromTestCase(test_class)
@@ -342,6 +567,10 @@ def main() -> int:
         if result.wasSuccessful():
             if args.concurrency:
                 print(json.dumps(test_class.measurements(), separators=(',', ':')))
+            elif args.context_workflow:
+                print("context-workflow properties: precondition=ok batch-read=ok "
+                      "idle-compact=ok active-negative=ok failure-controls=ok resume=ok "
+                      "auxiliary-usage=ok")
             else:
                 print("probe properties: native=ok models-absent=ok structured=ok nested-guard=ok "
                       "deadline=ok cancel=ok store=ok")

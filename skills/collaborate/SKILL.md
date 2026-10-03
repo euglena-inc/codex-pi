@@ -28,6 +28,7 @@ Done before the first dispatch, reused on every delivery, updated before takeove
 - Where an evaluator controls acceptance, calibrate it against independent expected facts (authorized real records plus corrupted, missing or stale variants) first; prior records are calibration, not proof for the candidate.
 - Fix behavior, constraints, evidence and the blocking standard before dispatch. A violation or missing evidence blocks acceptance; unrelated improvements are follow-up.
 - Reconcile scope against actual Git changes (plan files, dirty and untracked work included) at dispatch and delivery. Reuse valid evidence; a relevant failure or changed candidate reruns the affected checks; full regression and real acceptance run once on the exact combined candidate. The runtime computes one effective check window (request/contract cap, real remaining minus a fixed 60s wrap-up reserve, verifiable codemode deadline) and refuses a requirement above it; the admitted timeout is that window with fractional seconds kept. It also requires `final:true` on a clean tree for a full command that declares a `targetedCommand`; targeted runs are local repair only and never substitute for acceptance.
+- A brief may name one cheap precondition command that already exists in the task; when it fails, stop the dependent expensive checks and report that failure instead of running them. Precondition text never proves the command ran; only its receipt does. When repeated reads would be re-sent into later requests, one codemode batch may read and filter in a single script; judge it by real provider request counts and tool-result bytes, never by scripted-provider usage.
 
 ## One or two Pi outcomes
 
@@ -59,4 +60,4 @@ A delivery is a completed report reviewed by the main task, not a tool call, red
 
 ## Updates and savings
 
-Edit canonical plugin source, never managed caches, hook trust or a running task's frozen helpers. A new runtime does not migrate 0.5.x tasks: finish them with their own frozen helpers. Report savings only for comparable completed work.
+Edit canonical plugin source, never managed caches, hook trust or a running task's frozen helpers. A new runtime does not migrate 0.5.x tasks: finish them with their own frozen helpers. Report savings only for comparable completed work. Scripted/synthetic fixed usage observes requests and bytes; it is never a measured token or cost saving. Pi 1.0 `compact()` aborts the current operation first: validate it only on an idle synthetic session, never from an active worker, and never expose a production compact tool.
