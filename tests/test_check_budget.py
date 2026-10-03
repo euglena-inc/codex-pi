@@ -173,6 +173,8 @@ class AdmissionTest(BudgetCase):
         self.assertEqual(structured["requiredSeconds"], 60)
         self.assertGreaterEqual(structured["remainingSeconds"], 64)
         self.assertLessEqual(structured["remainingSeconds"], 66)
+        self.assertGreater(structured["allowedSeconds"], 4)
+        self.assertLessEqual(structured["allowedSeconds"], 5)
 
     def test_estimate_admits_a_short_check_near_the_deadline(self):
         self.write_state(remaining=65)
@@ -209,6 +211,61 @@ class AdmissionTest(BudgetCase):
         self.assertEqual(call["structuredContent"]["estimateSource"], "call")
         self.assertEqual(call["structuredContent"]["requiredSeconds"], 3)
 
+    def test_requested_timeout_below_the_estimate_is_refused(self):
+        self.write_state(remaining=300)
+        result = self.tool("check", id="too-short", command=self.command("too-short"),
+                           timeoutSeconds=1, estimatedSeconds=20)
+        structured = result["structuredContent"]
+        self.assertCleanRefusal(result, "timeout_below_estimate", "too-short")
+        self.assertEqual(structured["requiredSeconds"], 20)
+        self.assertEqual(structured["allowedSeconds"], 1)
+        self.assertEqual(structured["reserveSeconds"], 60)
+        self.assertGreaterEqual(structured["remainingSeconds"], 299)
+
+    def test_contract_cap_below_the_estimate_is_refused(self):
+        self.write_state(remaining=300)
+        command = self.command("cap-short")
+        config = dict(self.config, checkTimeoutSeconds=5,
+                      acceptanceItems=[{"id": "A", "checkId": "A", "command": command,
+                                        "estimatedSeconds": 20}])
+        result = self.tool("check", config=config, id="A", command=command)
+        structured = result["structuredContent"]
+        self.assertCleanRefusal(result, "timeout_below_estimate", "cap-short")
+        self.assertEqual(structured["requiredSeconds"], 20)
+        self.assertEqual(structured["allowedSeconds"], 5)
+
+    def test_smaller_call_estimate_does_not_lower_a_contract_estimate(self):
+        self.write_state(remaining=300)
+        command = self.command("maximal")
+        config = dict(self.config, acceptanceItems=[{"id": "A", "checkId": "A",
+                                                     "command": command, "estimatedSeconds": 20}])
+        result = self.tool("check", config=config, id="A", command=command, estimatedSeconds=1,
+                           timeoutSeconds=30)
+        self.assertNotIn("isError", result)
+        structured = result["structuredContent"]
+        self.assertEqual(structured["requiredSeconds"], 20)
+        self.assertEqual(structured["estimateSource"], "contract+call")
+        self.assertEqual(structured["allowedSeconds"], 30)
+        self.assertTrue(self.marker("maximal").exists())
+
+    def test_fractional_windows_are_not_rounded_below_the_estimate(self):
+        self.write_state(remaining=300)
+        result = self.tool("check", id="frac", command=self.command("frac"),
+                           timeoutSeconds=3.7, estimatedSeconds=3.5)
+        self.assertNotIn("isError", result)
+        self.assertEqual(result["structuredContent"]["allowedSeconds"], 3.7)
+        receipt = json.loads(Path(result["structuredContent"]["receipt"]).read_text())
+        self.assertGreaterEqual(receipt["deadline_at"] - receipt["started_at"], 3.69)
+        self.assertLessEqual(receipt["deadline_at"] - receipt["started_at"], 3.71)
+        boundary = self.tool("check", id="frac-eq", command=self.command("frac-eq"),
+                             timeoutSeconds=2.5, estimatedSeconds=2.5)
+        self.assertNotIn("isError", boundary)
+        self.assertEqual(boundary["structuredContent"]["requiredSeconds"], 2.5)
+        receipt = json.loads(Path(boundary["structuredContent"]["receipt"]).read_text())
+        self.assertAlmostEqual(receipt["deadline_at"] - receipt["started_at"], 2.5, places=6)
+        self.assertTrue(self.marker("frac").exists())
+        self.assertTrue(self.marker("frac-eq").exists())
+
     def test_unknown_budget_reads_fail_closed(self):
         command = self.command("unknown")
         cases = {
@@ -235,6 +292,7 @@ class AdmissionTest(BudgetCase):
         result = self.tool("check", id="unknown", command=command)
         self.assertCleanRefusal(result, "insufficient_budget", "unknown")
         self.assertEqual(result["structuredContent"]["remainingSeconds"], 0)
+        self.assertEqual(result["structuredContent"]["allowedSeconds"], 0)
 
     def test_old_config_without_deadline_metadata_keeps_old_behavior(self):
         config = dict(self.config)
@@ -351,6 +409,16 @@ class CodemodeEnvelopeTest(BudgetCase):
         self.assertTrue(self.marker("nested").exists())
         receipt = json.loads(Path(structured["receipt"]).read_text())
         self.assertLessEqual(receipt["deadline_at"] - receipt["started_at"], 5.5)
+
+    def test_nested_requested_timeout_below_the_estimate_is_refused(self):
+        self.write_state(remaining=300)
+        result = self.codemode_then_check('// @options: {"timeout_ms": 20000}\nreturn 1;',
+                                          id="nested-short", command=self.command("nested-short"),
+                                          timeoutSeconds=1, estimatedSeconds=20)
+        structured = result["structuredContent"]
+        self.assertCleanRefusal(result, "timeout_below_estimate", "nested-short")
+        self.assertEqual(structured["requiredSeconds"], 20)
+        self.assertEqual(structured["allowedSeconds"], 1)
 
 
 class ContractMetadataTest(BudgetCase):

@@ -7,9 +7,10 @@ credentials and no paid provider. The companion `scripts/codemode_probe.mjs`
 records raw observations; every expectation and negative control is asserted here.
 
 Required properties: native codemode registration and the absent `models` global,
-structured check success/failure, nested forbidden writes blocked by the same
-guard, bounded/omitted/invalid script deadlines with real cancellation, and
-`store`/`load` commit/resume semantics.
+structured check success/failure with real candidate-bound receipts, a structured
+nested budget refusal that leaves no receipt, nested forbidden writes blocked by
+the same guard, bounded/omitted/invalid script deadlines with real cancellation,
+and `store`/`load` commit/resume semantics.
 
 Missing Node or a Pi older than 1.0.0 fails nonzero; it never skips and reports
 success. A zero exit only proves execution finished, not acceptance.
@@ -23,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -100,6 +102,16 @@ def build_workdir(root: Path) -> dict:
         "python": sys.executable, "phase": False, "settleQuotaPath": None,
         "roundDir": str(round_dir), "contract": "codemode probe contract",
     }
+    # A synthetic but well-formed round state enables the 0.7.1 check admission:
+    # the probe must exercise the new window, not silently fall back to the old
+    # behavior of a worker.json without deadlinePath.
+    state_path = round_dir / "round.state.json"
+    state_path.write_text(json.dumps({
+        "schemaVersion": 1, "round": 1, "state": "running",
+        "taskDir": str((round_dir / ".." / "..").resolve()),
+        "startedAt": time.time(), "deadlineAt": time.time() + 3600}), encoding="utf-8")
+    worker_config["deadlinePath"] = str(state_path)
+    worker_config["acceptanceItems"] = []
     worker_config_path = round_dir / "worker.json"
     worker_config_path.write_text(json.dumps(worker_config, indent=2), encoding="utf-8")
     return {"root": root, "main": main, "worktree": worktree, "tools": tools,
@@ -192,6 +204,8 @@ class CodemodeIntegrationTest(unittest.TestCase):
         ok_nested = [entry for entry in ok["nestedEnds"] if entry["tool"] == "check"]
         self.assertEqual(len(ok_nested), 1)
         self.assertIs(ok_nested[0]["isError"], False)
+        self.assertTrue(list(self.layout["checks"].glob("probe-ok-*.json")),
+                        "the admitted nested check must write a real receipt")
 
         bad = self.case("check-fail")
         self.assertIsNone(bad["error"])
@@ -202,6 +216,18 @@ class CodemodeIntegrationTest(unittest.TestCase):
         bad_nested = [entry for entry in bad["nestedEnds"] if entry["tool"] == "check"]
         self.assertEqual(len(bad_nested), 1)
         self.assertIs(bad_nested[0]["isError"], True)
+
+    def test_nested_check_budget_refusal_is_structured_and_has_no_receipt(self):
+        case = self.case("check-refused")
+        self.assertIsNone(case["error"])
+        self.assertEqual(case["leftover"], 0)
+        self.assertTrue(case["codemode"], "the refusal must still return a codemode result")
+        text = self.case_text(case)
+        self.assertIn('"ok":false', text)
+        self.assertIn("codemode_deadline_too_short", text)
+        self.assertIn('"receipt":null', text)
+        self.assertEqual(list(self.layout["checks"].glob("probe-refused-*")), [],
+                         "a refused check must not leave a receipt, log or running marker")
 
     def test_nested_write_is_guarded_and_allowed_write_succeeds(self):
         case = self.case("nested-write")

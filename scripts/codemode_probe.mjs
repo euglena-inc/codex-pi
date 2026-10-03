@@ -197,13 +197,18 @@ async function main() {
 	]);
 
 	await runCase(session, "check-ok", [
-		{ code: "const r = await tools.check({ id: 'probe-ok', command: 'true' }); return JSON.stringify(r);" },
+		{ code: "// @options: {\"timeout_ms\": 10000}\nconst r = await tools.check({ id: 'probe-ok', command: 'true', estimatedSeconds: 1 }); return JSON.stringify(r);" },
 		{ text: "check-ok done" },
 	]);
 
 	await runCase(session, "check-fail", [
-		{ code: "const r = await tools.check({ id: 'probe-fail', command: 'false' }); return JSON.stringify({ok: r.ok, exit: r.exit_code, tail: typeof r.log_tail});" },
+		{ code: "// @options: {\"timeout_ms\": 10000}\nconst r = await tools.check({ id: 'probe-fail', command: 'false', estimatedSeconds: 1 }); return JSON.stringify({ok: r.ok, exit: r.exit_code, tail: typeof r.log_tail});" },
 		{ text: "check-fail done" },
+	]);
+
+	await runCase(session, "check-refused", [
+		{ code: "// @options: {\"timeout_ms\": 5000}\nconst r = await tools.check({ id: 'probe-refused', command: 'true', estimatedSeconds: 20 }); return JSON.stringify({ok: r.ok, reason: r.reason, receipt: r.receipt});" },
+		{ text: "check-refused done" },
 	]);
 
 	await runCase(session, "nested-write", [

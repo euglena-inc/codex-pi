@@ -407,6 +407,11 @@ function roundSeconds(value: number): number {
 	return Math.round(value * 1000) / 1000;
 }
 
+/** Report an allowed window without overstating it. */
+function floorSeconds(value: number): number {
+	return Math.floor(value * 1000) / 1000;
+}
+
 /** Contract items whose declared command normalizes to exactly the requested argv. */
 function matchingItems(cfg: WorkerConfig, argv: string[]): ContractItem[] {
 	if (!Array.isArray(cfg.acceptanceItems)) return [];
@@ -561,6 +566,7 @@ const CHECK_OUTPUT_SCHEMA = {
 		remainingSeconds: { type: ["number", "null"] },
 		requiredSeconds: { type: ["number", "null"] },
 		reserveSeconds: { type: ["number", "null"] },
+		allowedSeconds: { type: ["number", "null"] },
 		elapsedSeconds: { type: ["number", "null"] },
 		estimateSource: { type: ["string", "null"] },
 		targetedCommand: { type: ["string", "null"] },
@@ -692,8 +698,10 @@ export default async function (pi: ExtensionAPI) {
 		description:
 			"Run a verification command through the task's frozen pi_check helper and record an immutable receipt. " +
 			"Use this for every acceptance check. Returns exit code, test counts and, on failure, the log tail. " +
-			"Before spawning, a check is refused when the real round deadline minus a 60s wrap-up reserve cannot cover " +
-			"the estimate (estimatedSeconds, else the declared cap); a command that matches a contract item with " +
+			"Before spawning, the final effective window is computed from the requested/contract cap, the real round " +
+			"deadline minus a 60s wrap-up reserve, and a verifiable codemode outer deadline; a check is refused when " +
+			"the estimate (estimatedSeconds, else the declared cap) exceeds that window, and the admitted helper " +
+			"timeout is the window itself with fractional seconds kept. A command that matches a contract item with " +
 			"targetedCommand is a full acceptance check and requires final:true on a clean worktree. A refusal returns " +
 			"structured ok:false with receipt:null and never spawns or writes evidence.",
 		promptSnippet: "Run a recorded check (receipt-bound)",
@@ -777,17 +785,18 @@ export default async function (pi: ExtensionAPI) {
 						`${estimate.problem} is not a finite positive number`);
 				}
 				const values = [callEstimate, estimate.value].filter((value): value is number => value !== null);
+				// Without an estimate the effective requested/contract cap is the conservative
+				// requirement; phase remaining is a constraint, never an expected duration.
 				const requiredSeconds = values.length > 0 ? Math.max(...values) : requested;
 				const estimateSource = callEstimate !== null && estimate.value !== null ? "contract+call"
 					: callEstimate !== null ? "call" : estimate.value !== null ? "contract" : "timeout";
-				if (available < requiredSeconds) {
-					return refuseCheck(checkId,
-						`insufficient_budget: ${roundSeconds(remainingSeconds)}s remain minus a ` +
-						`${CHECK_RESERVE_SECONDS}s reserve, below the required ${roundSeconds(requiredSeconds)}s`,
-						{ remainingSeconds: roundSeconds(remainingSeconds),
-							requiredSeconds: roundSeconds(requiredSeconds), reserveSeconds: CHECK_RESERVE_SECONDS });
-				}
-				let effective = Math.min(requested, available);
+				// One final effective execution window: the requested/contract cap, the phase
+				// remaining minus the fixed wrap-up reserve, and a verifiable codemode outer
+				// deadline minus its cleanup grace. The estimate must fit this window, and the
+				// admitted helper timeout is the window itself: a fractional window is never
+				// rounded down below the requirement.
+				let windowSeconds = Math.min(requested, available);
+				let outerRemaining: number | null = null;
 				const separator = toolCallId.indexOf("/");
 				if (separator > 0) {
 					// A nested check runs inside the codemode script's outer deadline, which the
@@ -801,26 +810,33 @@ export default async function (pi: ExtensionAPI) {
 							"run it directly with the check tool",
 							{ requiredSeconds: roundSeconds(requiredSeconds), reserveSeconds: CHECK_RESERVE_SECONDS });
 					}
-					const outerRemaining = Math.max(0, (outerDeadline - Date.now()) / 1000);
-					const outerBudget = outerRemaining - CODEMODE_GRACE_SECONDS;
-					if (outerBudget < requiredSeconds) {
+					outerRemaining = Math.max(0, (outerDeadline - Date.now()) / 1000);
+					windowSeconds = Math.min(windowSeconds, outerRemaining - CODEMODE_GRACE_SECONDS);
+				}
+				const allowedSeconds = Math.max(0, floorSeconds(windowSeconds));
+				if (requiredSeconds > windowSeconds) {
+					const patch = { remainingSeconds: roundSeconds(remainingSeconds),
+						requiredSeconds: roundSeconds(requiredSeconds),
+						reserveSeconds: CHECK_RESERVE_SECONDS, allowedSeconds };
+					if (requested < requiredSeconds) {
 						return refuseCheck(checkId,
-							`codemode_deadline_too_short: ${roundSeconds(outerRemaining)}s remain in the codemode ` +
-							`script but ${roundSeconds(requiredSeconds)}s are required; run it directly with the check tool`,
-							{ remainingSeconds: roundSeconds(remainingSeconds),
-								requiredSeconds: roundSeconds(requiredSeconds), reserveSeconds: CHECK_RESERVE_SECONDS,
-								codemodeRemainingSeconds: roundSeconds(outerRemaining) });
+							`timeout_below_estimate: the requested or contract window ` +
+							`${roundSeconds(requested)}s is below the required ${roundSeconds(requiredSeconds)}s; ` +
+							"raise timeoutSeconds only if the estimate is wrong", patch);
 					}
-					effective = Math.min(effective, outerBudget);
-				}
-				timeout = Math.floor(effective);
-				if (timeout < 1) {
+					if (available < requiredSeconds) {
+						return refuseCheck(checkId,
+							`insufficient_budget: ${roundSeconds(remainingSeconds)}s remain minus a ` +
+							`${CHECK_RESERVE_SECONDS}s reserve, below the required ${roundSeconds(requiredSeconds)}s`,
+							patch);
+					}
 					return refuseCheck(checkId,
-						"insufficient_budget: less than one second of executable timeout remains after the reserve",
-						{ remainingSeconds: roundSeconds(remainingSeconds),
-							requiredSeconds: roundSeconds(requiredSeconds), reserveSeconds: CHECK_RESERVE_SECONDS });
+						`codemode_deadline_too_short: ${roundSeconds(outerRemaining ?? 0)}s remain in the codemode ` +
+						`script but ${roundSeconds(requiredSeconds)}s are required; run it directly with the check tool`,
+						{ ...patch, codemodeRemainingSeconds: roundSeconds(outerRemaining ?? 0) });
 				}
-				budgetPatch = { requiredSeconds: roundSeconds(requiredSeconds), estimateSource };
+				timeout = windowSeconds;
+				budgetPatch = { requiredSeconds: roundSeconds(requiredSeconds), estimateSource, allowedSeconds };
 			}
 			const args = [path.join(cfg.toolsDir, "pi_check.py"), "--output-dir", cfg.checksDir, "--id", checkId,
 				"--timeout-seconds", String(timeout)];
