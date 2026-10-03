@@ -1678,6 +1678,18 @@ def run_negative_controls() -> list:
 # Manifest and evidence integrity
 # ---------------------------------------------------------------------------
 
+def _pi_version() -> str:
+    try:
+        result = subprocess.run(["pi", "--version"], capture_output=True, text=True, check=False,
+                                timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    first = (result.stdout or "").strip().splitlines()
+    if not first or len(first[0]) > 32:
+        return "unknown"
+    return first[0]
+
+
 def new_manifest(out: Path, treatment: dict) -> dict:
     return {
         "schemaVersion": 1,
@@ -1687,8 +1699,7 @@ def new_manifest(out: Path, treatment: dict) -> dict:
         "piTools": PI_TOOLS,
         "wallSeconds": WALL_SECONDS,
         "maxAssistantTurns": MAX_ASSISTANT_TURNS,
-        "piVersion": subprocess.run(["pi", "--version"], capture_output=True, text=True,
-                                    check=False).stdout.strip(),
+        "piVersion": _pi_version(),
         "harnessSha256": sha256_file(Path(__file__)),
         "scenarioSpecsSha256": scenario_specs_hash(),
         "scheduleSha256": schedule_hash(),
