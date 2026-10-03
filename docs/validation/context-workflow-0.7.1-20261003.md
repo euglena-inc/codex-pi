@@ -6,7 +6,7 @@
 
 - 已安装 Pi `1.0.0`（`node_modules/@earendil-works/pi-coding-agent`）源码核实：`AgentSession.compact()` 先 `await abort()`，成功才 `appendCompaction(...usage)`；失败/取消只发 `compaction_end` 与 `session_compact_failed`，不写成功条目。session 条目类型 `compaction`/`branch_summary` 带可选 `usage`，`usage` 条目带任意 `kind` 与 `usage`；JSON 模式 `round.jsonl` 透出 `compaction_start`/`compaction_end`。
 - 脚本化 provider 固定 usage（input=10/output=5/totalTokens=15）只用于机制观察；SDK 的 `tokensBefore` 也引用该固定值，因此本记录不把它当真实 token 估计，更不声明费用节省。
-- 活动 worker 不触发 compact：探针确认 `compact` 不在工具列表，活动态无任何 compaction 事件/条目，原任务完成且标记未被 abort。
+- 活动 worker 不触发 compact：探针确认 `compact` 不在工具列表，活动态无任何 compaction 事件/条目，原任务完成且标记未被 abort。该结论限本插件不新增主动 compact；Pi 原生在 turn 间按默认阈值的自动压缩不受本验证覆盖。
 
 ## 三项验证（合成、真实 Pi SDK + QuickJS、本地 scripted provider）
 
@@ -28,7 +28,7 @@
 | 观察 | 直接多轮 read | codemode 一次批处理 |
 | --- | --- | --- |
 | scripted-provider 请求数 | 5（3 次读取 + 1 次缺失读取 + 1 次回答） | 2（1 个脚本 + 1 次回答） |
-| 本轮新增并进入后续请求的序列化工具结果字节 | 约 21.2 KB（所有文件正文随每轮请求重复进入） | 约 2.8 KB（一次筛选结果 + 嵌套调用记录） |
+| 本轮 case 工具结果新增的上下文体积（本 case 最后一次请求减去本 case 首请求的工具结果序列化字节，不是所有 provider 请求的累计传输量） | 约 21.2 KB（所有文件正文随每轮请求重复进入） | 约 2.8 KB（一次筛选结果 + 嵌套调用记录） |
 | 墙钟（单次观测） | 约 5 ms | 约 21 ms |
 | 读取结果 | 3 个文件正文 + 缺失错误 | 与直接读取逐字节相同的文件正文 + 缺失错误 |
 
@@ -40,15 +40,18 @@
 
 - 成功条目：1 个 `compaction` 条目，usage 与两次 scripted 摘要调用之和一致（input 20/output 10/totalTokens 30）；`tokensBefore` 受固定 usage 影响，仅作机制观察。session 文件追加约 12 KB，旧字节前缀逐字节不变。
 - 重新打开同一 session 后：session id、provider/model pin（`probe/scripted`）、codemode store 值、重新注入的合同、候选 head/dirty 与全部回执 hash 保持不变；失败回执仍为 exit 1，没有因摘要变成通过。
-- 负控：摘要 error 响应、取消（先 `abortCompaction()` 再放行迟到的摘要流）、缺模型三种情况都抛错且不新增任何 compaction 条目；活动态负控中压缩事件为 0、条目数不变、任务标记写入成功。
+- 负控：摘要 error 响应、取消（先 `abortCompaction()` 再放行迟到的摘要流）、缺模型三种情况都抛错且不新增任何 compaction 条目；活动态负控中压缩事件为 0、条目数不变、任务标记写入成功。该活动态观察只证明本插件未新增主动 compact、未暴露 compact 工具；它不能推广成 Pi 原生自动压缩永远不会在 run 内发生（原生仍可能在工具完成后的 turn 间按默认阈值触发），因此继续保留默认阈值、不提前自动压缩。
 
 ## 辅助用量统计闭环
 
 - `round.summary.json` 新增 `metrics.auxiliary`：只从显式 session 的严格本轮窗口（不含时间指标的 ±1s 容差）解析 `compaction`/`branch_summary`/`usage` 条目，按明确 entry id 去重，逐项报告种类/次数/known token/reported cost 与 known/incomplete/unknown。
-- 旧 assistant `usage`/`usage_complete`/`reported_cost_usd` 字段语义不变；`metrics.total` 只在 assistant 与 auxiliary 都完整时给出合计，缺失侧保持 null，不重复计费。
-- 缺 usage 的辅助条目不按 0；raw 有压缩失败/未完成信号而没有成功条目、缺 session 来源、身份缺失或多候选歧义时保持未知/incomplete；可靠且无信号的干净 session 报已知零。助手内层时间戳的窗口裁切不影响辅助完整性（辅助使用独立的 entry 级解析健康度）。
-- 合成校准：18 项定向测试覆盖严格窗口、entry id 去重、部分/缺失 usage、失败/未完成信号、成功报告缺条目、总数完整性、多候选歧义与 board 聚合。真实 `session.compact` 生成的条目经 `pi_summary.summarize` 交叉核验，辅助种类/次数/usage/cost 与真实条目一致。
-- 看板只聚合已存 summary（`derivedMetrics.auxiliary`、`auxiliaryUsage`、`totalComplete`），刷新时不解析 session、不重建 summary；旧 summary 保持未知，不原地改写。
+- 输入有效性：token 字段只接受有限非负整数（整数值的浮点也接受），cost 只接受有限非负数值；无效字段不参与已知和，逐字段记入 `invalidFields` 与叶子的 `invalid`，JSON 不输出 NaN/Infinity。缺值保持 unknown/partial。
+- 身份冲突：同一明确 entry id 的字节/规范化内容一致重放可去重；内容不同的同 id 冲突显式计为 `identityConflicts`/`conflictedEntries`，冲突记录不参与任何已知和，结果与先后顺序无关（反转顺序得到相同结论），不按首个赢家计作准确费用；扫描期映射在汇总后丢弃，不新增持久身份库。
+- 信号来源健康：`summarize` 将 round JSONL 的存在性与坏行计入完整性（`signalsVerified`）；可靠完整 round + 可靠无辅助 session 才报 known 0；round 缺失/坏行可隐藏 `compaction_start/end` 时保持 unknown/partial，不把实际未报告费用当 0。
+- 旧 assistant `usage`/`usage_complete`/`reported_cost_usd` 字段语义不变；`metrics.total` 只在两侧都完整且值有限非负时给出合计，缺失/无效侧保持 null，不重复计费。
+- 缺 usage 的辅助条目不按 0；raw 有压缩失败/未完成信号而没有成功条目、缺 session 来源、身份缺失或多候选歧义时保持未知/incomplete。助手内层时间戳的窗口裁切不影响辅助完整性（辅助使用独立的 entry 级解析健康度）。
+- 合成校准：新增同 id 冲突正/反转负例、NaN/Infinity/负数/非整数/负 cost 输入有效性、round 坏行与缺失 log 信号健康、以及 board 非有限存储叶子不污染已知和的定向测试；原严格窗口、缺失/部分 usage、失败/未完成信号、成功报告缺条目、多候选歧义与 board 聚合用例保留不变。真实 `session.compact` 生成的条目经 `pi_summary.summarize` 交叉核验，辅助种类/次数/usage/cost 与真实条目一致。
+- 看板只聚合已存 summary（`derivedMetrics.auxiliary`、`auxiliaryUsage`、`totalComplete`），刷新时不解析 session、不重建 summary；非有限存储值不进入已知和，旧 summary 保持未知，不原地改写。
 
 ## 边界与限制
 

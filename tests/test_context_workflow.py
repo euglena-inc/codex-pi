@@ -85,7 +85,7 @@ class AuxiliaryUsageTest(ContextWorkflowCase):
     def test_auxiliary_entries_are_summed_once_by_explicit_entry_id(self):
         # Independent expected sums: 10+3+1 input, 5+2+1 output, 1+0+0 cacheRead,
         # 2+0+0 cacheWrite, 18+5+2 totalTokens, 0.5+0.1+0.01 cost. The repeated
-        # c1 id is a duplicate delivery and must not add its different values.
+        # c1 entry is a byte-identical replay and must not add its values twice.
         entries = [
             session_entry("c1", 105.0, "compaction", summary="s1", firstKeptEntryId="x",
                           tokensBefore=100, usage=usage(10, 1, 2, 5, 18, 0.5)),
@@ -93,18 +93,18 @@ class AuxiliaryUsageTest(ContextWorkflowCase):
                           usage=usage(3, 0, 0, 2, 5, 0.1)),
             session_entry("u1", 115.0, "usage", kind="cache_warm", provider="p", model="m",
                           usage=usage(1, 0, 0, 1, 2, 0.01)),
-            session_entry("c1", 116.0, "compaction", summary="duplicate", firstKeptEntryId="x",
-                          tokensBefore=1, usage=usage(999, 999, 999, 999, 3996, 9.9)),
             session_entry("outside", 90.0, "usage", kind="cache_warm", provider="p", model="m",
                           usage=usage(777, 0, 0, 0, 777, 7.7)),
             session_entry("a1", 104.0, message=assistant(101000, usage=usage(2, 0, 0, 1, 3, 0.02))),
         ]
-        self.write_session(entries)
+        replay = dict(entries[0])
+        self.write_session(entries + [replay])
         data = self.summarize([assistant_event(101000, usage(2, 0, 0, 1, 3, 0.02))])
         auxiliary = data["metrics"]["auxiliary"]
         self.assertEqual(auxiliary["entries"], 3)
         self.assertEqual(auxiliary["kinds"], {"compaction": 1, "branch_summary": 1, "usage": 1})
         self.assertEqual(auxiliary["duplicateEntries"], 1)
+        self.assertEqual(auxiliary["identityConflicts"], 0)
         self.assertEqual(auxiliary["uncachedInput"]["value"], 14)
         self.assertEqual(auxiliary["cacheRead"]["value"], 1)
         self.assertEqual(auxiliary["cacheWrite"]["value"], 2)
@@ -123,6 +123,116 @@ class AuxiliaryUsageTest(ContextWorkflowCase):
         self.assertTrue(data["metrics"]["total"]["complete"])
         self.assertEqual(data["auxiliary_usage"]["usage"]["input"], 14)
         self.assertEqual(data["auxiliary_usage"]["reported_cost_usd"], 0.61)
+
+    def test_same_id_conflicting_usage_is_never_resolved_by_order(self):
+        conflict_low = session_entry("c1", 105.0, "compaction", summary="low",
+                                     firstKeptEntryId="x", tokensBefore=1,
+                                     usage=usage(1, 0, 0, 1, 2, 0.01))
+        conflict_high = session_entry("c1", 106.0, "compaction", summary="high",
+                                      firstKeptEntryId="x", tokensBefore=9,
+                                      usage=usage(10, 0, 0, 5, 15, 0.5))
+        valid = session_entry("u2", 110.0, "usage", kind="cache_warm", provider="p", model="m",
+                              usage=usage(7, 0, 0, 4, 11, 0.07))
+        observed = []
+        for session_id, pair in (("conflict-forward", [conflict_low, conflict_high]),
+                                 ("conflict-reverse", [conflict_high, conflict_low])):
+            self.write_session(pair + [valid], session_id=session_id)
+            auxiliary = self.summarize(session_id=session_id)["metrics"]["auxiliary"]
+            observed.append({
+                "input": auxiliary["uncachedInput"], "cost": auxiliary["reportedCostUsd"],
+                "entries": auxiliary["entries"], "conflicts": auxiliary["identityConflicts"],
+                "conflicted": auxiliary["conflictedEntries"],
+                "duplicate": auxiliary["duplicateEntries"], "complete": auxiliary["complete"],
+                "reason": auxiliary["reason"]})
+        first, second = observed
+        self.assertEqual(first, second, "reversing the conflict order must not pick a winner")
+        self.assertEqual(first["conflicts"], 1)
+        self.assertEqual(first["conflicted"], 1)
+        self.assertEqual(first["duplicate"], 0)
+        self.assertEqual(first["entries"], 2)
+        self.assertFalse(first["complete"])
+        self.assertEqual(first["reason"], "auxiliary_entry_identity_conflict")
+        self.assertEqual(first["input"]["value"], 7, "only the valid separate entry is counted")
+        self.assertEqual(first["input"]["samples"], 1)
+        self.assertFalse(first["input"]["complete"])
+        self.assertEqual(first["cost"]["value"], 0.07)
+        self.assertEqual(first["cost"]["samples"], 1)
+        self.assertFalse(first["cost"]["complete"])
+
+    def test_invalid_auxiliary_values_are_excluded_and_incomplete(self):
+        bad = {"input": float("nan"), "cacheRead": float("inf"), "cacheWrite": 1.5,
+               "output": -5, "totalTokens": 3, "cost": {"total": -1.0}}
+        entries = [
+            session_entry("bad", 105.0, "compaction", summary="s", firstKeptEntryId="x",
+                          tokensBefore=1, usage=bad),
+            session_entry("good", 110.0, "usage", kind="cache_warm", provider="p", model="m",
+                          usage=usage(2, 0, 0, 3, 5, 0.25)),
+        ]
+        self.write_session(entries)
+        data = self.summarize()
+        auxiliary = data["metrics"]["auxiliary"]
+        self.assertEqual(auxiliary["entries"], 2)
+        self.assertEqual(auxiliary["identityConflicts"], 0)
+        self.assertEqual(auxiliary["usageInvalidEntries"], 1)
+        self.assertEqual(auxiliary["costInvalidEntries"], 1)
+        self.assertEqual(auxiliary["invalidFields"], {"input": 1, "cacheRead": 1, "cacheWrite": 1,
+                                                      "output": 1, "totalTokens": 0})
+        self.assertEqual(auxiliary["uncachedInput"]["value"], 2, "only the valid entry is counted")
+        self.assertEqual(auxiliary["uncachedInput"]["samples"], 1)
+        self.assertFalse(auxiliary["uncachedInput"]["complete"])
+        self.assertEqual(auxiliary["output"]["value"], 3)
+        self.assertEqual(auxiliary["totalTokens"]["value"], 8)
+        self.assertEqual(auxiliary["reportedCostUsd"]["value"], 0.25)
+        self.assertEqual(auxiliary["reportedCostUsd"]["samples"], 1)
+        self.assertEqual(auxiliary["reportedCostUsd"]["invalid"], 1)
+        self.assertFalse(auxiliary["complete"])
+        self.assertEqual(auxiliary["status"], "partial")
+        self.assertEqual(auxiliary["reason"], "auxiliary_usage_invalid")
+        self.assertIsNone(data["metrics"]["total"]["reportedCostUsd"])
+        json.dumps(data, allow_nan=False)  # JSON must never carry NaN/Infinity
+
+    def test_malformed_round_line_marks_the_signal_source_unverified(self):
+        self.write_session([session_entry("a1", 104.0, message=assistant(101000, usage=usage(1, 0, 0, 1, 2, 0.01)))])
+        log = self.round_dir / "round.jsonl"
+        log.write_text('{"type": "turn_end"}\n{"broken": \n', encoding="utf-8")
+        data = pi_summary.summarize(log, self.tmp, self.round_dir, "p/m",
+                                    checks_dir=self.round_dir / "round.checks",
+                                    session_dir=self.session_dir, session_id="sid",
+                                    window=self.window)
+        auxiliary = data["metrics"]["auxiliary"]
+        self.assertFalse(auxiliary["signalsVerified"])
+        self.assertFalse(auxiliary["complete"])
+        self.assertIsNone(auxiliary["uncachedInput"]["value"])
+        self.assertEqual(auxiliary["reason"], "round_signal_source_unverified")
+
+    def test_unverified_round_signal_keeps_known_sum_but_not_complete(self):
+        self.write_session([
+            session_entry("c1", 105.0, "compaction", summary="s", firstKeptEntryId="x",
+                          tokensBefore=1, usage=usage(10, 0, 0, 5, 15, 0.5)),
+            session_entry("a1", 104.0, message=assistant(101000, usage=usage(1, 0, 0, 1, 2, 0.01))),
+        ])
+        log = self.round_dir / "round.jsonl"
+        log.write_text("not json at all\n", encoding="utf-8")
+        data = pi_summary.summarize(log, self.tmp, self.round_dir, "p/m",
+                                    checks_dir=self.round_dir / "round.checks",
+                                    session_dir=self.session_dir, session_id="sid",
+                                    window=self.window)
+        auxiliary = data["metrics"]["auxiliary"]
+        self.assertEqual(auxiliary["uncachedInput"]["value"], 10, "known sum stays visible")
+        self.assertFalse(auxiliary["uncachedInput"]["complete"])
+        self.assertFalse(auxiliary["complete"])
+        self.assertEqual(auxiliary["reason"], "round_signal_source_unverified")
+
+    def test_missing_round_log_is_not_a_definite_zero(self):
+        self.write_session([session_entry("a1", 104.0, message=assistant(101000, usage=usage(1, 0, 0, 1, 2, 0.01)))])
+        data = pi_summary.summarize(self.round_dir / "absent.jsonl", self.tmp, self.round_dir, "p/m",
+                                    checks_dir=self.round_dir / "round.checks",
+                                    session_dir=self.session_dir, session_id="sid",
+                                    window=self.window)
+        auxiliary = data["metrics"]["auxiliary"]
+        self.assertFalse(auxiliary["signalsVerified"])
+        self.assertFalse(auxiliary["complete"])
+        self.assertIsNone(auxiliary["uncachedInput"]["value"])
 
     def test_strict_window_ignores_timing_slack_for_cost_attribution(self):
         # 130.5 is inside the timing +-1s slack but outside the strict round window;
@@ -190,7 +300,8 @@ class AuxiliaryUsageTest(ContextWorkflowCase):
         self.assertTrue(auxiliary["reliable"])
         self.assertTrue(auxiliary["complete"])
         self.assertEqual(auxiliary["uncachedInput"], {"value": 0.0, "label": "exact",
-                                                      "samples": 0, "complete": True})
+                                                      "samples": 0, "invalid": 0,
+                                                      "complete": True})
         self.assertEqual(auxiliary["reportedCostUsd"]["value"], 0.0)
         self.assertEqual(self.summarize([assistant_event(101000, usage(1, 0, 0, 1, 2, 0.01))])
                          ["metrics"]["total"]["reportedCostUsd"], 0.01)
@@ -395,6 +506,31 @@ class BoardAuxiliaryAggregationTest(unittest.TestCase):
         self.assertEqual(counts["signal_compactionAborted"], 1)
         self.assertEqual(counts["signal_compactionUnfinished"], 1)
         self.assertEqual(counts["kind_compaction"], 1)
+
+    def test_non_finite_stored_leaf_never_enters_the_known_sum(self):
+        section = auxiliary_section(complete=True, input=10, cost=0.5)
+        section["uncachedInput"] = {"value": float("nan"), "label": "exact",
+                                    "samples": 1, "complete": True}
+        section["invalidFields"] = {"input": 2}
+        section["identityConflicts"] = 1
+        self.write_summary(1, stored_summary(section))
+        record = pi_board.task_metrics(self.board_file, None, "T")
+        derived = record["derivedMetrics"]
+        self.assertIsNone(derived["auxiliary"]["uncachedInput"]["known"])
+        self.assertEqual(derived["auxiliary"]["uncachedInput"]["roundsUnknown"], [1])
+        self.assertFalse(derived["auxiliary"]["uncachedInput"]["complete"])
+        self.assertEqual(derived["auxiliary"]["output"]["known"], 5)
+        self.assertEqual(record["auxiliaryUsage"]["counts"]["invalid_input"], 2)
+        self.assertEqual(record["auxiliaryUsage"]["counts"]["identityConflicts"], 1)
+        self.assertFalse(record["auxiliaryUsage"]["complete"])
+        self.assertFalse(derived["totalComplete"])
+
+    def test_unverified_signal_count_is_visible(self):
+        section = auxiliary_section(complete=False, input=10, cost=0.5)
+        section["signalsVerified"] = False
+        self.write_summary(1, stored_summary(section))
+        counts = pi_board.task_metrics(self.board_file, None, "T")["auxiliaryUsage"]["counts"]
+        self.assertEqual(counts["signalsUnverified"], 1)
 
 
 class VersionStillReads(unittest.TestCase):

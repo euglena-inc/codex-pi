@@ -172,57 +172,120 @@ def _iter_session_lines(path, limit=MAX_SESSION_LINE_BYTES):
             yield "line", raw
 
 
+def _valid_auxiliary_token(value) -> bool:
+    """Token counts must be finite non-negative integers; whole floats stay valid."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if not math.isfinite(value) or value < 0:
+        return False
+    return float(value).is_integer()
+
+
+def _valid_auxiliary_cost(value) -> bool:
+    """A reported cost must be finite and non-negative."""
+    return (not isinstance(value, bool) and isinstance(value, (int, float))
+            and math.isfinite(value) and value >= 0)
+
+
 def _new_auxiliary():
-    """Mutable accumulator for one bounded session pass; finalized afterwards."""
+    """Mutable accumulator for one bounded session pass; finalized afterwards.
+
+    ``records``/``byId`` are a scan-scoped identity map only: records are
+    aggregated into known totals after the pass and never persist as state.
+    """
     return {"status": "unknown", "label": "unknown", "reliable": False, "complete": False,
             "sessionFile": None, "window": None, "reason": None, "sourceReason": None,
+            "signalsVerified": False,
             "entries": 0, "kinds": {kind: 0 for kind in AUXILIARY_ENTRY_TYPES},
             "duplicateEntries": 0, "identityMissingEntries": 0,
-            "usageMissingEntries": 0, "costMissingEntries": 0,
+            "identityConflicts": 0, "conflictedEntries": 0,
+            "usageMissingEntries": 0, "usageInvalidEntries": 0,
+            "costMissingEntries": 0, "costInvalidEntries": 0,
             "successfulCompactionEntries": 0, "reportedCompactionsWithoutEntry": 0,
-            "failureSignals": None, "totals": Counter(), "samples": Counter(),
-            "costTotal": 0.0, "costSamples": 0, "seen": set()}
+            "failureSignals": None, "records": [], "byId": {},
+            "totals": Counter(), "samples": Counter(),
+            "invalidFields": Counter(), "costTotal": 0.0, "costSamples": 0}
+
+
+def _auxiliary_fingerprint(entry) -> str:
+    """Canonical content of one entry; non-finite numbers use a stable JSON spelling."""
+    return json.dumps(entry, sort_keys=True, separators=(",", ":"))
 
 
 def _collect_auxiliary(auxiliary, entry):
-    """One strict-window auxiliary entry; explicit ids deduplicate, never merge silently."""
+    """Record one strict-window entry; an id conflict is never resolved by order.
+
+    A byte/canonically identical replay is a duplicate. The same explicit id
+    with different content is an explicit conflict: both occurrences are kept
+    unscored instead of silently preferring the first.
+    """
+    fingerprint = _auxiliary_fingerprint(entry)
     entry_id = entry.get("id")
-    if isinstance(entry_id, str) and entry_id:
-        if entry_id in auxiliary["seen"]:
-            auxiliary["duplicateEntries"] += 1
+    record = {"id": entry_id if isinstance(entry_id, str) and entry_id else None,
+              "kind": entry.get("type"), "fingerprint": fingerprint,
+              "usage": entry.get("usage"), "conflict": False}
+    if record["id"] is not None:
+        existing = auxiliary["byId"].get(record["id"])
+        if existing is not None:
+            if existing["fingerprint"] == fingerprint:
+                auxiliary["duplicateEntries"] += 1
+                return
+            auxiliary["identityConflicts"] += 1
+            existing["conflict"] = True
             return
-        auxiliary["seen"].add(entry_id)
+        auxiliary["byId"][record["id"]] = record
     else:
         auxiliary["identityMissingEntries"] += 1
-    auxiliary["entries"] += 1
-    auxiliary["kinds"][entry.get("type")] += 1
-    usage = entry.get("usage")
-    if not isinstance(usage, dict):
-        auxiliary["usageMissingEntries"] += 1
-        auxiliary["costMissingEntries"] += 1
-        return
-    for key in USAGE_KEYS:
-        value = usage.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            auxiliary["totals"][key] += value
-            auxiliary["samples"][key] += 1
-    cost = usage.get("cost")
-    value = cost.get("total") if isinstance(cost, dict) else None
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        auxiliary["costTotal"] += value
-        auxiliary["costSamples"] += 1
-    else:
-        auxiliary["costMissingEntries"] += 1
+    auxiliary["records"].append(record)
 
 
-def _finalize_auxiliary(auxiliary, parse_clean, compaction_signals=None):
+def _aggregate_auxiliary(auxiliary):
+    """Aggregate unique records; invalid fields never join the known sums."""
+    invalid = Counter()
+    for record in auxiliary["records"]:
+        auxiliary["entries"] += 1
+        auxiliary["kinds"][record["kind"]] += 1
+        if record["conflict"]:
+            auxiliary["conflictedEntries"] += 1
+            continue
+        usage = record["usage"]
+        if not isinstance(usage, dict):
+            auxiliary["usageMissingEntries"] += 1
+            auxiliary["costMissingEntries"] += 1
+            continue
+        entry_invalid = False
+        for key in USAGE_KEYS:
+            value = usage.get(key)
+            if _valid_auxiliary_token(value):
+                auxiliary["totals"][key] += value
+                auxiliary["samples"][key] += 1
+            elif key in usage:
+                invalid[key] += 1
+                entry_invalid = True
+        cost = usage.get("cost")
+        cost_value = cost.get("total") if isinstance(cost, dict) else None
+        if _valid_auxiliary_cost(cost_value):
+            auxiliary["costTotal"] += cost_value
+            auxiliary["costSamples"] += 1
+        elif cost_value is not None:
+            auxiliary["costInvalidEntries"] += 1
+        else:
+            auxiliary["costMissingEntries"] += 1
+        if entry_invalid:
+            auxiliary["usageInvalidEntries"] += 1
+    auxiliary["invalidFields"] = {key: invalid.get(key, 0) for key in USAGE_KEYS}
+
+
+def _finalize_auxiliary(auxiliary, parse_clean, compaction_signals=None, round_signals_complete=True):
     """Per-key known/partial/unknown auxiliary totals with a conservative zero rule.
 
-    A reliable session with no auxiliary entries and no failed or unfinished
-    compaction signal is a real zero. A failure/unfinished signal without a
-    successful entry, a missing session source, or an entry without usage stays
+    A reliable session with no auxiliary entries, a verified round-signal source
+    and no failed or unfinished compaction signal is a real zero. Invalid or
+    conflicting values, a failure/unfinished signal without a successful entry,
+    a missing session source, or an unverified round transcript stay
     unknown/incomplete instead of fabricating a definite zero.
     """
+    _aggregate_auxiliary(auxiliary)
     signals = compaction_signals or {}
     started = int(signals.get("compactionStarted", 0) or 0)
     succeeded = int(signals.get("compactionSucceeded", 0) or 0)
@@ -235,58 +298,87 @@ def _finalize_auxiliary(auxiliary, parse_clean, compaction_signals=None):
     auxiliary["successfulCompactionEntries"] = auxiliary["kinds"]["compaction"]
     auxiliary["reportedCompactionsWithoutEntry"] = max(0, succeeded - auxiliary["kinds"]["compaction"])
     auxiliary["reliable"] = bool(auxiliary["sessionFile"]) and bool(parse_clean)
+    auxiliary["signalsVerified"] = bool(round_signals_complete)
     entries = auxiliary["entries"]
     failure_total = failed + aborted + unfinished
-    zero_confident = (auxiliary["reliable"] and entries == 0 and failure_total == 0
+    conflicts = auxiliary["identityConflicts"]
+    zero_confident = (auxiliary["reliable"] and auxiliary["signalsVerified"]
+                      and entries == 0 and failure_total == 0
                       and auxiliary["reportedCompactionsWithoutEntry"] == 0)
     for key in USAGE_KEYS:
         samples = auxiliary["samples"].get(key, 0)
+        invalid = auxiliary["invalidFields"].get(key, 0)
         if zero_confident:
-            leaf = _leaf(0.0, "exact", samples=0, complete=True)
+            leaf = _leaf(0.0, "exact", samples=0, invalid=0, complete=True)
         elif not auxiliary["reliable"]:
-            leaf = _leaf(None, "unknown", samples=samples, complete=False,
+            leaf = _leaf(None, "unknown", samples=samples, invalid=invalid, complete=False,
                          reason=auxiliary.get("sourceReason") or "session_parse_incomplete")
         elif samples == 0:
-            leaf = _leaf(None, "unknown", samples=0, complete=False,
-                         reason="compaction_attempt_without_success_entry" if failure_total
-                         else "compaction_summary_without_session_entry"
-                         if auxiliary["reportedCompactionsWithoutEntry"]
-                         else "auxiliary_usage_missing")
+            if invalid:
+                reason = "auxiliary_usage_invalid"
+            elif failure_total:
+                reason = "compaction_attempt_without_success_entry"
+            elif auxiliary["reportedCompactionsWithoutEntry"]:
+                reason = "compaction_summary_without_session_entry"
+            elif conflicts:
+                reason = "auxiliary_entry_identity_conflict"
+            elif not auxiliary["signalsVerified"]:
+                reason = "round_signal_source_unverified"
+            else:
+                reason = "auxiliary_usage_missing"
+            leaf = _leaf(None, "unknown", samples=0, invalid=invalid, complete=False, reason=reason)
         else:
-            complete = (samples == entries and failure_total == 0
+            complete = (samples == entries and invalid == 0 and conflicts == 0
+                        and auxiliary["signalsVerified"] and failure_total == 0
                         and auxiliary["reportedCompactionsWithoutEntry"] == 0
                         and auxiliary["identityMissingEntries"] == 0)
             leaf = _leaf(auxiliary["totals"][key], "exact" if complete else "estimated",
-                         samples=samples, complete=complete,
-                         reason=None if complete else "auxiliary_usage_or_signal_incomplete")
+                         samples=samples, invalid=invalid, complete=complete,
+                         reason=None if complete else "auxiliary_usage_invalid_or_incomplete")
         auxiliary[AUXILIARY_LEAF_NAMES[key]] = leaf
     if zero_confident:
-        cost_leaf = _leaf(0.0, "exact", samples=0, complete=True)
+        cost_leaf = _leaf(0.0, "exact", samples=0, invalid=0, complete=True)
     elif not auxiliary["reliable"]:
-        cost_leaf = _leaf(None, "unknown", samples=auxiliary["costSamples"], complete=False,
+        cost_leaf = _leaf(None, "unknown", samples=auxiliary["costSamples"],
+                          invalid=auxiliary["costInvalidEntries"], complete=False,
                           reason=auxiliary.get("sourceReason") or "session_parse_incomplete")
     elif auxiliary["costSamples"] == 0:
-        cost_leaf = _leaf(None, "unknown", samples=0, complete=False,
-                          reason="compaction_attempt_without_success_entry" if failure_total
-                          else "compaction_summary_without_session_entry"
-                          if auxiliary["reportedCompactionsWithoutEntry"]
-                          else "auxiliary_cost_missing")
+        if auxiliary["costInvalidEntries"]:
+            reason = "auxiliary_cost_invalid"
+        elif failure_total:
+            reason = "compaction_attempt_without_success_entry"
+        elif auxiliary["reportedCompactionsWithoutEntry"]:
+            reason = "compaction_summary_without_session_entry"
+        elif conflicts:
+            reason = "auxiliary_entry_identity_conflict"
+        elif not auxiliary["signalsVerified"]:
+            reason = "round_signal_source_unverified"
+        else:
+            reason = "auxiliary_cost_missing"
+        cost_leaf = _leaf(None, "unknown", samples=0, invalid=auxiliary["costInvalidEntries"],
+                          complete=False, reason=reason)
     else:
-        cost_complete = (auxiliary["costSamples"] == entries and failure_total == 0
+        cost_complete = (auxiliary["costSamples"] == entries
+                         and not auxiliary["costInvalidEntries"] and conflicts == 0
+                         and auxiliary["signalsVerified"] and failure_total == 0
                          and auxiliary["reportedCompactionsWithoutEntry"] == 0
                          and auxiliary["identityMissingEntries"] == 0)
         cost_leaf = _leaf(auxiliary["costTotal"], "exact" if cost_complete else "estimated",
-                          samples=auxiliary["costSamples"], complete=cost_complete,
-                          reason=None if cost_complete else "auxiliary_cost_or_signal_incomplete")
+                          samples=auxiliary["costSamples"],
+                          invalid=auxiliary["costInvalidEntries"], complete=cost_complete,
+                          reason=None if cost_complete else "auxiliary_cost_invalid_or_incomplete")
     auxiliary["reportedCostUsd"] = cost_leaf
     auxiliary["complete"] = bool(
-        auxiliary["reliable"] and failure_total == 0
-        and auxiliary["reportedCompactionsWithoutEntry"] == 0
+        auxiliary["reliable"] and auxiliary["signalsVerified"] and conflicts == 0
+        and failure_total == 0 and auxiliary["reportedCompactionsWithoutEntry"] == 0
         and auxiliary["identityMissingEntries"] == 0
+        and auxiliary["usageInvalidEntries"] == 0 and auxiliary["costInvalidEntries"] == 0
         and (entries == 0 or (all(auxiliary[AUXILIARY_LEAF_NAMES[key]]["complete"] for key in USAGE_KEYS)
                               and cost_leaf["complete"])))
     if not auxiliary["reliable"]:
         reason = auxiliary.get("sourceReason") or "session_parse_incomplete"
+    elif conflicts:
+        reason = "auxiliary_entry_identity_conflict"
     elif failure_total and entries == 0:
         reason = "compaction_attempt_without_success_entry"
     elif failure_total:
@@ -295,6 +387,10 @@ def _finalize_auxiliary(auxiliary, parse_clean, compaction_signals=None):
         reason = "compaction_summary_without_session_entry"
     elif auxiliary["identityMissingEntries"]:
         reason = "auxiliary_entry_identity_missing"
+    elif auxiliary["usageInvalidEntries"] or auxiliary["costInvalidEntries"]:
+        reason = "auxiliary_usage_invalid"
+    elif not auxiliary["signalsVerified"]:
+        reason = "round_signal_source_unverified"
     elif entries and not all(auxiliary[AUXILIARY_LEAF_NAMES[key]]["complete"] for key in USAGE_KEYS):
         reason = "auxiliary_usage_missing_or_partial"
     elif entries and not cost_leaf["complete"]:
@@ -305,13 +401,16 @@ def _finalize_auxiliary(auxiliary, parse_clean, compaction_signals=None):
     auxiliary["status"] = "complete" if auxiliary["complete"] else (
         "partial" if auxiliary["reliable"] else "unknown")
     auxiliary["label"] = auxiliary["status"]
-    # Internal accumulators are not evidence: leaves already carry values and samples.
-    auxiliary.pop("seen", None)
+    # Scan-scoped state is not evidence: leaves already carry values and samples;
+    # ``invalidFields`` stays as bounded per-field evidence instead.
+    auxiliary.pop("byId", None)
+    auxiliary.pop("records", None)
     auxiliary.pop("totals", None)
     auxiliary.pop("samples", None)
 
 
-def derive_session_metrics(session_dir, session_id, window, compaction_signals=None):
+def derive_session_metrics(session_dir, session_id, window, compaction_signals=None,
+                           round_signals_complete=True):
     """One bounded pass over the explicit session source for timing and auxiliary usage.
 
     Model intervals use the persisted session entry's outer write time and the
@@ -319,9 +418,11 @@ def derive_session_metrics(session_dir, session_id, window, compaction_signals=N
     assistant persistence boundary and the matching tool-result message time;
     parent/child or concurrent intervals are unioned, never added. The same
     pass collects strict-window ``compaction``/``branch_summary``/``usage``
-    entries; they are deduplicated by explicit entry id and never folded into
-    the assistant fields. Missing or unreliable sources return null with an
-    explicit reason instead of zero.
+    entries; identical replays are deduplicated by explicit entry id, conflicting
+    repeats stay unresolved, and none of them fold into the assistant fields.
+    Missing or unreliable sources return null with an explicit reason instead of
+    zero; ``round_signals_complete`` carries the round transcript's health, so an
+    unreadable or truncated transcript never proves that no compaction ran.
     """
     coverage = {"sessionFile": None, "sessionCandidates": 0, "entriesInWindow": 0,
                 "malformedLines": 0, "overlongLines": 0, "duplicateEntries": 0,
@@ -343,7 +444,7 @@ def derive_session_metrics(session_dir, session_id, window, compaction_signals=N
     if start is None or end is None or end < start:
         timing["reason"] = "round_window_missing"
         auxiliary["sourceReason"] = "round_window_missing"
-        _finalize_auxiliary(auxiliary, False, compaction_signals)
+        _finalize_auxiliary(auxiliary, False, compaction_signals, round_signals_complete)
         return {"timing": timing, "auxiliary": auxiliary}
     wall = end - start
     timing["windowSeconds"] = _leaf(wall, "exact",
@@ -354,7 +455,7 @@ def derive_session_metrics(session_dir, session_id, window, compaction_signals=N
     if session_file is None:
         timing["reason"] = problem
         auxiliary["sourceReason"] = problem
-        _finalize_auxiliary(auxiliary, False, compaction_signals)
+        _finalize_auxiliary(auxiliary, False, compaction_signals, round_signals_complete)
         return {"timing": timing, "auxiliary": auxiliary}
     coverage["sessionFile"] = str(session_file)
     auxiliary["sessionFile"] = str(session_file)
@@ -450,7 +551,8 @@ def derive_session_metrics(session_dir, session_id, window, compaction_signals=N
     coverage["auxiliaryParseClean"] = auxiliary_parse_clean
     if not coverage["entriesInWindow"]:
         timing["reason"] = "no_entries_in_window"
-        _finalize_auxiliary(auxiliary, auxiliary_parse_clean, compaction_signals)
+        _finalize_auxiliary(auxiliary, auxiliary_parse_clean, compaction_signals,
+                            round_signals_complete)
         return {"timing": timing, "auxiliary": auxiliary}
     coverage["modelComplete"] = parse_clean and bool(model_intervals)
     coverage["toolComplete"] = (parse_clean and not open_tools
@@ -504,7 +606,7 @@ def derive_session_metrics(session_dir, session_id, window, compaction_signals=N
             reason="requires complete model and tool coverage")
         timing["status"] = "partial" if (model_value is not None or tool_value is not None) else "unknown"
     timing["label"] = "estimated" if timing["status"] == "ok" else timing["status"]
-    _finalize_auxiliary(auxiliary, auxiliary_parse_clean, compaction_signals)
+    _finalize_auxiliary(auxiliary, auxiliary_parse_clean, compaction_signals, round_signals_complete)
     return {"timing": timing, "auxiliary": auxiliary}
 
 
@@ -549,20 +651,24 @@ def total_metrics(usage, usage_complete, assistant_cost, cost_samples, unique_me
 
     Assistant fields keep their original meaning and are never merged into the
     auxiliary report; this block is the explicit overall view. A sum is only
-    given when both sides are known, so a missing side stays null, not zero.
+    given when both sides are finite and known, so a missing or non-finite side
+    stays null and no NaN/Infinity reaches the JSON.
     """
+    def finite(value):
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and value >= 0)
+
     combined = {}
     for key in USAGE_KEYS:
         assistant_value = usage.get(key)
         auxiliary_value = (auxiliary.get(AUXILIARY_LEAF_NAMES[key]) or {}).get("value")
         combined[key] = (assistant_value + auxiliary_value
-                         if isinstance(assistant_value, (int, float))
-                         and isinstance(auxiliary_value, (int, float)) else None)
+                         if finite(assistant_value) and finite(auxiliary_value) else None)
     assistant_cost_known = bool(unique_messages) and cost_samples == unique_messages
     auxiliary_complete = bool(auxiliary.get("complete"))
     auxiliary_cost = (auxiliary.get("reportedCostUsd") or {}).get("value")
-    cost_known = (assistant_cost_known and auxiliary_complete
-                  and isinstance(auxiliary_cost, (int, float)))
+    cost_known = (assistant_cost_known and auxiliary_complete and finite(assistant_cost)
+                  and finite(auxiliary_cost))
     reasons = []
     if not usage_complete:
         reasons.append("assistant_usage_incomplete")
@@ -801,7 +907,8 @@ def summarize(log: Path, worktree: Path, run_dir: Path | None = None,
     check_receipts = receipts(check_dir)
     terminal = terminal_evidence(log)
     final = terminal.get("finalText") or ""
-    session_metrics = derive_session_metrics(session_dir, session_id, window, compaction_signals)
+    session_metrics = derive_session_metrics(session_dir, session_id, window, compaction_signals,
+                                             round_signals_complete=log.exists() and malformed == 0)
     auxiliary = session_metrics["auxiliary"]
     metrics = {"schema": 1,
                "usage": usage_metrics(totals, usage_samples, unique_usage_messages,

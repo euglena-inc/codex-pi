@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -993,14 +994,20 @@ def _sum_known(total: dict, usage) -> None:
 
 
 def _metric_value(section, key):
-    """Leaf value from a summary metrics section; None (unknown) is preserved."""
+    """Leaf value from a summary metrics section; None (unknown) is preserved.
+
+    Only finite numbers enter aggregation: a NaN/Infinity claim in an old or
+    corrupt summary must never poison the known sum.
+    """
     if not isinstance(section, dict):
         return None
     leaf = section.get(key)
     if not isinstance(leaf, dict):
         return None
     value = leaf.get("value")
-    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return value
+    return None
 
 
 def _metric_complete(section, key) -> bool:
@@ -1057,7 +1064,9 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
     checks_rounds = {"known": [], "incomplete": [], "unknown": []}
     # Auxiliary usage is aggregated only from stored summaries; this function never
     # resolves or scans a session file, so an old summary without it stays unknown.
-    auxiliary_metric_keys = usage_metric_keys + ("reportedCostUsd",)
+    # These are the auxiliary's own keys; assistant-only reasoning is not one of them.
+    auxiliary_metric_keys = ("uncachedInput", "cacheRead", "cacheWrite", "output",
+                             "totalTokens", "reportedCostUsd")
     derived_auxiliary = {}
     auxiliary_rounds = {key: {"known": [], "incomplete": [], "unknown": []}
                         for key in auxiliary_metric_keys}
@@ -1124,11 +1133,21 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
             else:
                 auxiliary_incomplete.append(number)
             for key in ("entries", "duplicateEntries", "identityMissingEntries",
-                        "usageMissingEntries", "costMissingEntries",
+                        "identityConflicts", "conflictedEntries",
+                        "usageMissingEntries", "usageInvalidEntries",
+                        "costMissingEntries", "costInvalidEntries",
                         "successfulCompactionEntries", "reportedCompactionsWithoutEntry"):
                 value = auxiliary.get(key)
                 if isinstance(value, int) and not isinstance(value, bool):
                     auxiliary_counts[key] += value
+            if auxiliary.get("signalsVerified") is False:
+                auxiliary_counts["signalsUnverified"] += 1
+            invalid_fields = auxiliary.get("invalidFields")
+            if isinstance(invalid_fields, dict):
+                for field in ("input", "cacheRead", "cacheWrite", "output", "totalTokens"):
+                    value = invalid_fields.get(field)
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        auxiliary_counts[f"invalid_{field}"] += value
             kinds = auxiliary.get("kinds")
             if isinstance(kinds, dict):
                 for kind in ("compaction", "branch_summary", "usage"):
@@ -1164,6 +1183,12 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
                 checks_elapsed += value
         else:
             checks_rounds["unknown"].append(number)
+    auxiliary_metrics = {key: _aggregate_metric(derived_auxiliary.get(key), auxiliary_rounds[key],
+                                                 rounds)
+                         for key in auxiliary_metric_keys}
+    auxiliary_usage_complete = (bool(rounds) and not auxiliary_incomplete
+                                and not auxiliary_unknown
+                                and all(item["complete"] for item in auxiliary_metrics.values()))
     record = {"task": task_id, "rounds": len(rounds),
               "usage": {"known": usage, "complete": bool(rounds) and not missing and not incomplete,
                         "roundsMissing": missing, "roundsIncomplete": incomplete},
@@ -1172,7 +1197,7 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
               "auxiliaryUsage": {
                   "known": {key: derived_auxiliary.get(key) for key in auxiliary_metric_keys},
                   "counts": {key: auxiliary_counts[key] for key in sorted(auxiliary_counts)},
-                  "complete": bool(rounds) and not auxiliary_incomplete and not auxiliary_unknown,
+                  "complete": auxiliary_usage_complete,
                   "roundsComplete": auxiliary_complete,
                   "roundsIncomplete": auxiliary_incomplete,
                   "roundsUnknown": auxiliary_unknown},
@@ -1188,14 +1213,13 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
                                                                 "unverifiedLogs")}
                             | {"elapsedSeconds": _aggregate_metric(checks_elapsed, checks_rounds,
                                                                   rounds)},
-                  "auxiliary": {key: _aggregate_metric(derived_auxiliary.get(key), auxiliary_rounds[key],
-                                                       rounds)
-                                for key in auxiliary_metric_keys},
+                  "auxiliary": auxiliary_metrics,
                   "totalComplete": bool(rounds) and not missing and not incomplete
-                                   and not auxiliary_incomplete and not auxiliary_unknown,
+                                   and auxiliary_usage_complete,
                   "note": "aggregated from stored round summaries only; every round is partitioned "
                           "into known/incomplete/unknown per metric, completeness requires all "
-                          "rounds, and no session is scanned during board refresh"}}
+                          "rounds, non-finite stored values stay unknown, and no session is scanned "
+                          "during board refresh"}}
     if isinstance(card, dict):
         by_kind, failure_kinds = {}, {}
         for row in decision_records(card).values():
