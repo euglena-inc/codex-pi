@@ -18,6 +18,8 @@ PATTERNS = {
     "email address": rb"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
 }
 ALLOWED_EMAIL_DOMAINS = {b"example.com", b"example.org", b"example.invalid", b"local.invalid", b"users.noreply.github.com"}
+# Public tool attribution only; do not allow the provider domain generally.
+ALLOWED_PUBLIC_BOT_EMAILS = {b"noreply@anthropic.com"}
 
 
 def git(*args: str) -> bytes:
@@ -29,7 +31,8 @@ def inspect(label: str, data: bytes) -> list[str]:
     for kind, pattern in PATTERNS.items():
         matches = list(re.finditer(pattern, data))
         if kind == "email address":
-            matches = [m for m in matches if m.group().split(b"@")[-1].lower() not in ALLOWED_EMAIL_DOMAINS
+            matches = [m for m in matches if m.group().lower() not in ALLOWED_PUBLIC_BOT_EMAILS
+                       and m.group().split(b"@")[-1].lower() not in ALLOWED_EMAIL_DOMAINS
                        and not m.group().split(b"@")[-1].lower().endswith(b".invalid")]
         if matches:
             issues.append(f"{label}: {kind} ({len(matches)} matches)")

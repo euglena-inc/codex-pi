@@ -2,6 +2,15 @@
 
 当前 Codex 主任务负责设计、派工与验收；Pi 的模型由项目配置选择（模型政策只在 [协作 Skill](skills/collaborate/SKILL.md) 中陈述）。项目只需 `.agents/codex-pi.json` 和自己的领域约束，公共插件维护进程、同会话返修、看板和原始证据。
 
+## 0.8.0 指令清晰度与连接诊断
+
+- worker 合同、工具说明和派工模板明确区分 Promise 完成与检查通过、执行失败与准入拒绝，以及定向检查与正式验收；保持原有权限、预算与验收语义。
+- 新增允许模型 `newapi/deepseek-flash`。模型由项目配置选择并按任务冻结，不自动换接口或回退。使用 NewAPI 时，应确认本机 Pi 配置能传递 `thinking: enabled` 和 `reasoning_effort: max`；插件不复制凭据，也不保证网关与官方转发完全等价。
+- 可选 `network.proxyUrl` 和 `network.diagnostics` 为新任务冻结显式代理策略与有界、脱敏的连接观察记录。诊断仅观察 supervisor 直接启动的 Pi 主进程，区分连接重置、代理 CONNECT 错误与正常流清理；不自动重试、不改变系统代理，也不承诺修复代理故障。旧任务继续使用原冻结策略和工具。
+- 新增可复核的真实 Pi 指令对照工具。36 会话观察到旧版完成 15/18、新版 17/18，但场景带明确提示且评分经过事后校正；不宣称通用能力、速度或费用收益。详见[实验报告](docs/validation/instruction-clarity-pilot-20261003.md)及[连接支持验证](docs/validation/connection-support-20261003.md)。
+
+升级通过正式插件安装流程完成。新版用于新会话和新任务；正在运行或保留的旧任务不自动改写模型、期限、会话和 helper 快照。桌面 Hook 信任仍由应用管理，Python 测试不能替代桌面验证。
+
 ## 0.7.1 检查预算、流式日志与指标
 
 `check` 在创建子进程前重读本轮真实 `deadlineAt`，固定预留 60 秒收尾。预计耗时与 timeout 分离：调用与合同的有限正数估计取较大值，均无估计时以有效的请求/合同上限作保守需求，不把阶段剩余缩小当作预计耗时。先算最终有效执行窗口（请求/合同上限、remaining−60、codemode 外层−清理余量），需求超过该窗口时返回结构化 `ok:false`（含 reason、requiredSeconds、allowedSeconds、remainingSeconds、reserveSeconds、`receipt:null`），不 spawn、不写回执、不产生零测试假回执；期限读取/身份校验失败同样拒绝。实际传入 helper 的 timeout 就是该窗口本身，保留小数、不向下取整。codemode 脚本内的嵌套检查同时计入该脚本自身的外层期限；扩展无法验证外层期限时拒绝并提示直接调用 `check`，已准入的检查不会被外层期限提前杀死。真实执行的返回带实际 `elapsedSeconds`、`allowedSeconds` 与采用的 `estimateSource`，估计不被写成实际耗时。拒绝提示只能在授权上限内调整 timeout 以覆盖可信估计，或在有证据时修正估计，不鼓励编低估计或扩预算。
