@@ -8,6 +8,7 @@ other way round.
 from __future__ import annotations
 
 import fcntl
+import ipaddress
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import signal
 import subprocess
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pi_takeover import review_policy
 
@@ -23,7 +25,7 @@ SCHEMA_VERSION = 1
 # The CLI entry that task-side messages and records name.
 TASK_CLI = Path(__file__).with_name("pi_task.py").resolve()
 DEFAULT_MODEL = "deepseek/deepseek-flash"
-ALLOWED_MODELS = (DEFAULT_MODEL, "newapi/glm-5.3")
+ALLOWED_MODELS = (DEFAULT_MODEL, "newapi/glm-5.3", "newapi/deepseek-flash")
 DEFAULT_THINKING = "max"
 DEFAULT_TIMEOUT = 14400
 MAX_TIMEOUT = 604800
@@ -38,7 +40,15 @@ TERMINAL_STATES = ("completed", "failed", "timed_out", "cancelled", "interrupted
 ACTIVE_STATES = ("starting", "running")
 FULL_OID_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 CONFIG_KEYS = ("schemaVersion", "model", "thinking", "constraints", "checks",
-               "maxWorkers", "timeoutSeconds")
+               "maxWorkers", "timeoutSeconds", "network")
+NETWORK_KEYS = ("proxyUrl", "diagnostics")
+# Explicit routing overrides every conflicting proxy form for the Pi child
+# only. NO_PROXY/no_proxy are deliberately preserved so intentional exclusions
+# keep their documented meaning.
+NETWORK_PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+                          "ALL_PROXY", "all_proxy")
+NETWORK_FILE = "round.network.jsonl"
+_MAX_NETWORK_FILE_BYTES = 65536
 REFERENCE_EXTENSIONS = ("md", "markdown", "txt", "json", "sh", "bash", "zsh", "py",
                         "js", "mjs", "cjs", "ts", "tsx", "yaml", "yml", "toml", "cfg", "ini")
 
@@ -253,6 +263,184 @@ def validate_reference(root: Path, entry: str, kind: str) -> None:
         raise ValueError(f"{kind} reference escapes the repository and is rejected: {entry!r}")
 
 
+_PROXY_HOST_RE = re.compile(
+    r"(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\Z")
+
+
+def normalize_proxy_url(value) -> str:
+    """Validate and canonicalize one credential-free http(s) proxy URL.
+
+    Errors never echo the supplied value: a rejected URL may carry credentials
+    or private hostnames, so no error message may include any part of it.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValueError("config network.proxyUrl must be a non-empty string")
+    if value != value.strip():
+        raise ValueError("config network.proxyUrl must not have surrounding whitespace")
+    for character in value:
+        if character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F:
+            raise ValueError("config network.proxyUrl must not contain whitespace or control "
+                             "characters")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("config network.proxyUrl must be a valid URL with an explicit numeric "
+                         "port") from None
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError("config network.proxyUrl must use the http or https scheme")
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        raise ValueError("config network.proxyUrl must not contain user information or "
+                         "credentials")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("config network.proxyUrl must include a host")
+    if port is None:
+        raise ValueError("config network.proxyUrl must include an explicit port")
+    if not 1 <= port <= 65535:
+        raise ValueError("config network.proxyUrl port must be between 1 and 65535")
+    if parsed.path not in ("", "/"):
+        raise ValueError("config network.proxyUrl must not include a path")
+    if parsed.query or parsed.fragment:
+        raise ValueError("config network.proxyUrl must not include a query or fragment")
+    if "%" in host:
+        raise ValueError("config network.proxyUrl host must not use percent-encoding")
+    normalized = host.lower()
+    if ":" in normalized:
+        try:
+            if ipaddress.ip_address(normalized).version != 6:
+                raise ValueError
+        except ValueError:
+            raise ValueError("config network.proxyUrl host is not a valid IPv6 address") from None
+        authority = f"[{normalized}]"
+    else:
+        try:
+            ipaddress.ip_address(normalized)
+        except ValueError:
+            if not _PROXY_HOST_RE.match(normalized):
+                raise ValueError("config network.proxyUrl host is not a valid hostname or IP "
+                                 "address") from None
+        authority = normalized
+    return f"{scheme}://{authority}:{port}"
+
+
+def parse_network_policy(raw, context: str = "config network") -> dict:
+    """Return ``{proxyUrl, diagnostics}`` or raise without echoing values."""
+    if raw is None:
+        return {"proxyUrl": None, "diagnostics": False}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{context} must be an object with only {list(NETWORK_KEYS)}")
+    unknown = sorted(set(raw) - set(NETWORK_KEYS))
+    if unknown:
+        raise ValueError(f"{context} has unsupported keys {unknown}; allowed: {list(NETWORK_KEYS)}")
+    proxy = raw.get("proxyUrl")
+    if proxy is not None:
+        proxy = normalize_proxy_url(proxy)
+    diagnostics = raw.get("diagnostics", False)
+    if not isinstance(diagnostics, bool):
+        raise ValueError(f"{context}.diagnostics must be a boolean")
+    return {"proxyUrl": proxy, "diagnostics": diagnostics}
+
+
+def network_policy_for_task(task: dict) -> dict:
+    """Frozen task policy; an absent key is the legacy inherited behavior."""
+    raw = task.get("network") if isinstance(task, dict) else None
+    if raw is None:
+        return {"proxyUrl": None, "diagnostics": False, "source": "legacy"}
+    policy = parse_network_policy(raw, "frozen task network")
+    policy["source"] = "frozen"
+    return policy
+
+
+def apply_network_policy(env: dict, policy: dict, diagnostics_file=None, scope: str | None = None,
+                         supervisor_pid: int | None = None, preload_path=None):
+    """Return ``(env, bounded record)`` for the Pi child process only.
+
+    The supervisor and any Codex queue transport keep their original
+    environment. Explicit routing overrides every conflicting proxy form and
+    preserves NO_PROXY/no_proxy. Diagnostics append one ``--import`` option to
+    the existing NODE_OPTIONS so unrelated options survive.
+    """
+    result = dict(env)
+    proxy = policy.get("proxyUrl")
+    proxy_present = any(result.get(key) for key in NETWORK_PROXY_ENV_KEYS)
+    if proxy:
+        for key in NETWORK_PROXY_ENV_KEYS:
+            result[key] = proxy
+    enabled = bool(policy.get("diagnostics"))
+    if enabled:
+        if diagnostics_file is None or not scope:
+            raise ValueError("network diagnostics need a sidecar path and a bounded scope")
+        if preload_path is None:
+            raise ValueError("network diagnostics preload module is unavailable")
+        preload = Path(preload_path)
+        if not preload.is_file() or preload.is_symlink():
+            raise ValueError("network diagnostics preload module is missing from the frozen tools")
+        result["CODEX_PI_NETWORK_DIAG_FILE"] = str(diagnostics_file)
+        result["CODEX_PI_NETWORK_DIAG_SCOPE"] = str(scope)
+        if supervisor_pid is not None:
+            result["CODEX_PI_NETWORK_DIAG_SUPERVISOR"] = str(int(supervisor_pid))
+        existing = result.get("NODE_OPTIONS", "")
+        addition = f"--import={preload.resolve().as_uri()}"
+        result["NODE_OPTIONS"] = f"{existing.rstrip()} {addition}".lstrip() if existing.strip() \
+            else addition
+    record = {
+        "proxy": {
+            "mode": "explicit" if proxy else "inherited",
+            "source": policy.get("source", "frozen"),
+            "origin": proxy,
+            "envProxyPresent": bool(proxy_present),
+        },
+        "diagnostics": {"enabled": enabled,
+                         "file": str(diagnostics_file) if enabled else None},
+    }
+    return result, record
+
+
+def read_network_sidecar(path) -> dict:
+    """Bounded observational summary of one round sidecar; never raises."""
+    result = {"status": "missing", "records": 0, "failures": 0, "truncated": False,
+              "classes": {}}
+    if path is None:
+        return result
+    path = Path(path)
+    try:
+        if not path.is_file():
+            return result
+        raw = path.read_bytes()[:_MAX_NETWORK_FILE_BYTES]
+    except OSError:
+        result["status"] = "unreadable"
+        return result
+    invalid = False
+    classes = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            invalid = True
+            continue
+        if not isinstance(record, dict):
+            invalid = True
+            continue
+        if record.get("phase") == "truncated":
+            result["truncated"] = True
+            continue
+        result["records"] += 1
+        kind = record.get("class")
+        if isinstance(kind, str):
+            classes[kind] = classes.get(kind, 0) + 1
+            if kind != "abort_cleanup":
+                result["failures"] += 1
+    result["classes"] = dict(sorted(classes.items(), key=lambda item: (-item[1], item[0]))[:8])
+    result["status"] = "unreadable" if invalid else "present"
+    return result
+
+
 def require_allowed_model(model, context: str) -> str:
     """Allow only the explicit, locally configured worker model choices."""
     if model not in ALLOWED_MODELS:
@@ -324,9 +512,10 @@ def load_config(root: Path) -> dict:
     timeout = data.get("timeoutSeconds", DEFAULT_TIMEOUT)
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= MAX_TIMEOUT:
         raise ValueError(f"config timeoutSeconds must be positive and at most {MAX_TIMEOUT}")
+    network = parse_network_policy(data.get("network"))
     return {"path": str(real), "schemaVersion": SCHEMA_VERSION, "model": model, "thinking": thinking,
             "constraints": list(constraints), "checks": list(checks),
-            "maxWorkers": max_workers, "timeoutSeconds": timeout}
+            "maxWorkers": max_workers, "timeoutSeconds": timeout, "network": network}
 
 
 # ---------------------------------------------------------------------------

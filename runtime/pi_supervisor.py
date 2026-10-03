@@ -13,14 +13,17 @@ from pathlib import Path
 
 from pi_brief import WORKER_CONFIG_FILE, WORKER_READY_FILE
 from pi_core import (
+    NETWORK_FILE,
     TASK_CLI,
     LockHeld,
     READ_ONLY_TOOLS,
     WRITABLE_TOOLS,
+    apply_network_policy,
     atomic,
     board_pause_active,
     git,
     lock_fd,
+    network_policy_for_task,
     read_json,
     require_allowed_model,
     runtime_version,
@@ -281,6 +284,16 @@ def run_worker(args) -> int:
             timeout_seconds=min(timeout_seconds,remaining)
             state['deadlineAt']=min(state['deadlineAt'],budget['deadlineAt'])
             atomic(state_path,state)
+        # Explicit routing and diagnostics apply to the Pi child only; the
+        # supervisor keeps its own environment for Codex queue transport.
+        network_policy = network_policy_for_task(task)
+        diagnostics_file = round_dir / NETWORK_FILE if network_policy["diagnostics"] else None
+        worker_environment, network_record = apply_network_policy(
+            worker_environment, network_policy, diagnostics_file=diagnostics_file,
+            scope=f"round-{round_number}", supervisor_pid=os.getpid(),
+            preload_path=round_tools(task_dir, round_number) / "pi_network_diagnostics.mjs")
+        state["network"] = network_record
+        atomic(state_path, state)
         with (round_dir / "round.jsonl").open("ab") as out, \
                 (round_dir / "round.err").open("ab") as err:
             # Pi inherits the task lock, so a SIGKILLed supervisor cannot free

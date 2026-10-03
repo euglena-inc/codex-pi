@@ -111,25 +111,28 @@ class LifecycleTest(unittest.TestCase):
         self.assertIn("read-only", (repo.task_dir("ro") / "rounds" / "1" / "contract.md").read_text())
 
     def test_project_selected_newapi_model_is_pinned_and_passed_to_pi(self):
-        model = "newapi/glm-5.3"
-        repo, worktree = self.make(default_config(model=model))
-        trace = self.tmp / "newapi-trace.jsonl"
-        env = base_env(PI_DOUBLE_MODE="session-trace", PI_DOUBLE_TRACE=str(trace),
-                       PI_DOUBLE_REPORTED_PROVIDER="newapi",
-                       PI_DOUBLE_REPORTED_MODEL="glm-5.3")
+        for index, (model, reported) in enumerate((("newapi/glm-5.3", "glm-5.3"),
+                                                   ("newapi/deepseek-flash", "deepseek-flash"))):
+            with self.subTest(model=model):
+                repo, worktree = self.make(default_config(model=model), name=f"newapi-repo-{index}")
+                trace = self.tmp / f"newapi-trace-{index}.jsonl"
+                env = base_env(PI_DOUBLE_MODE="session-trace", PI_DOUBLE_TRACE=str(trace),
+                               PI_DOUBLE_REPORTED_PROVIDER="newapi",
+                               PI_DOUBLE_REPORTED_MODEL=reported)
 
-        started = repo.start_json("newapi-model", worktree, env=env)
-        self.assertEqual(started["model"], model)
-        result = repo.wait_terminal("newapi-model", env=env)
-        self.assertEqual(result["state"], "completed")
-        self.assertEqual(result["modelCheck"], "matched")
+                started = repo.start_json(f"newapi-model-{index}", worktree, env=env)
+                self.assertEqual(started["model"], model)
+                result = repo.wait_terminal(f"newapi-model-{index}", env=env)
+                self.assertEqual(result["state"], "completed")
+                self.assertEqual(result["modelCheck"], "matched")
 
-        task = json.loads((repo.task_dir("newapi-model") / "task.json").read_text())
-        self.assertEqual(task["model"], model)
-        contract = (repo.task_dir("newapi-model") / "rounds" / "1" / "contract.md").read_text()
-        self.assertIn(f"pinned to `{model}`", contract)
-        recorded = json.loads(trace.read_text().splitlines()[0])
-        self.assertEqual(recorded["model"], model)
+                task = json.loads((repo.task_dir(f"newapi-model-{index}") / "task.json").read_text())
+                self.assertEqual(task["model"], model)
+                contract = (repo.task_dir(f"newapi-model-{index}") / "rounds" / "1"
+                            / "contract.md").read_text()
+                self.assertIn(f"pinned to `{model}`", contract)
+                recorded = json.loads(trace.read_text().splitlines()[0])
+                self.assertEqual(recorded["model"], model)
 
     # ------------------------------------------------------------------
     def test_failed_attempt_stays_visible_and_continue_uses_same_session(self):
