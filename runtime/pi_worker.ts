@@ -1246,28 +1246,29 @@ export default async function (pi: ExtensionAPI) {
 			}
             // One acquisition loop; pressure becoming unknown can only downgrade
             // once to an exclusive permit. Every await consumes the original budget.
-            const queueStarted = Date.now();
+            let queuedSeconds = 0;
             let req = resolved.req;
-            let pressure = await samplePressure();
+            let pressure: PressureSnapshot | null = null;
             let held = false;
             let pressurePatch: Record<string, unknown> = {};
             let queueObservations: Record<string, unknown> = {};
             try {
                 for (;;) {
                     if (signal?.aborted) return refuseCheck(checkId, "cancelled_before_spawn", {cancelled:true});
-                    if (pressure.state === "high" || pressure.state === "low") {
+                    if (pressure?.state === "high" || pressure?.state === "low") {
                         return refuseCheck(checkId, "memory_pressure: refusing new check", {pressureState:pressure.state, pressureSynthetic:pressure.synthetic});
                     }
-                    if (pressure.state === "unknown") req = exclusiveRequirement(cfg, resolved.req.declaration);
-                    if (pressure.availableMiB !== null && pressure.availableMiB < req.memoryMiB + (pressure.thresholdMiB ?? 0)) {
+                    if (pressure?.state === "unknown") req = exclusiveRequirement(cfg, resolved.req.declaration);
+                    if (pressure?.availableMiB != null && pressure.availableMiB < req.memoryMiB + (pressure.thresholdMiB ?? 0)) {
                         return refuseCheck(checkId, "memory_pressure: available memory below declared requirement plus headroom",
                             {pressureState:pressure.state, availableMiB:pressure.availableMiB, requiredMiB:req.memoryMiB});
                     }
                     const admission = checkWindow(cfg, requested, requiredSeconds, outerDeadline, estimateSource);
                     if (admission.reason) return refuseCheck(checkId, admission.reason, admission.patch);
                     const acquired = await pool.acquire(req, signal, admission.latestStart);
+                    queuedSeconds += acquired.queueSeconds;
                     queueObservations = {...resourceObservations, resourceMode:req.parallelSafe ? "parallel" : "exclusive",
-                        queueSeconds:roundSeconds((Date.now()-queueStarted)/1000), pool:pool.snapshot()};
+                        queueSeconds:roundSeconds(queuedSeconds), pool:pool.snapshot()};
                     if (!acquired.granted) return refuseCheck(checkId,
                         acquired.cancelled ? "cancelled_while_waiting" : "insufficient_budget_while_waiting",
                         {...queueObservations, cancelled:acquired.cancelled, requiredSeconds});

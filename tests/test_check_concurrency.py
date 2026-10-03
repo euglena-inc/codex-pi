@@ -118,3 +118,15 @@ class ConcurrencyTest(BudgetCase):
         items=[self.item(id='A',command='python3 -c pass',checkResources={'parallelSafe':True,'cpuSlots':1,'memoryMiB':32}),
                self.item(id='B',command='python3  -c pass',checkResources={'parallelSafe':True,'cpuSlots':1,'memoryMiB':64})]
         with self.assertRaises(ValueError):pi_phase.validate_contract(self.contract(items),self.main)
+
+    def test_fifo_order_is_preserved_across_real_async_pressure_probe(self):
+        # No injected snapshot: macOS sysctl is asynchronous and must not reorder
+        # calls before permit acquisition (the native cancellation probe found this).
+        with patch.dict('os.environ'):
+            import os
+            os.environ.pop('CODEX_PI_PRESSURE_SNAPSHOT',None)
+            first=self.job('realfirst',.35,parallelSafe=False)
+            later=self.job('reallater')
+            results=self.run_jobs([first,later])
+        self.assertTrue(all(r['structuredContent']['ok'] for r in results))
+        self.assertGreaterEqual(self.interval('reallater')['start'],self.interval('realfirst')['end'])
