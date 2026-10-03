@@ -260,21 +260,24 @@ def analyze_log(path, chunk_size: int = STREAM_CHUNK_BYTES) -> dict:
     """One streaming read produces the full hash, conservative counts and tail.
 
     The digest and the summary come from the same pass, so no second full-file
-    decode is needed for the tail. A missing or empty log keeps the historical
-    empty-bytes behavior (SHA-256 of empty input, unknown counts, empty tail).
+    decode is needed for the tail. Only a truly absent file keeps the historical
+    empty-bytes behavior; an existing but unreadable file or a failed mid-read
+    raises, so the caller never gets a normal-looking receipt for missing
+    evidence.
     """
     analyzer = LogAnalyzer()
     try:
-        with Path(path).open('rb') as stream:
-            while True:
-                chunk = stream.read(chunk_size)
-                if not chunk:
-                    break
-                analyzer.feed_bytes(chunk)
-            analyzer.flush()
-    except OSError:
+        stream = Path(path).open('rb')
+    except FileNotFoundError:
         return {'sha256': hashlib.sha256(b'').hexdigest(), 'bytes': 0,
                 'test_counts': None, 'tail': '', 'overlong': False}
+    with stream:
+        while True:
+            chunk = stream.read(chunk_size)
+            if not chunk:
+                break
+            analyzer.feed_bytes(chunk)
+        analyzer.flush()
     analyzer.close()
     return {'sha256': analyzer.digest.hexdigest(), 'bytes': analyzer.bytes,
             'test_counts': analyzer.analysis_counts(),

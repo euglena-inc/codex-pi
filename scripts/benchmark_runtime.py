@@ -4,9 +4,10 @@
 The baseline helpers are materialized read-only from ``--baseline-ref`` into a
 temporary directory with ``git archive``; the current source, history and index
 are never touched. The candidate helpers are a temporary copy of ``runtime/``.
-Each implementation runs in its own subprocess, so peak RSS values never
-accumulate, and the wall clock includes the identical ``cat`` log capture for
-both. Hash, test counts and the bounded log tail are compared with independent
+Each implementation runs helper then terminal summary in its own sequential
+child sequence, so the measured peak RSS covers the check-log hash/tail path and
+the summary receipt-verification path together and never accumulates peaks.
+The wall clock includes the identical ``cat`` log capture for both. Hash, test counts and the bounded log tail are compared with independent
 expected facts and with each other.
 
 Peak RSS is reported in bytes (converted from KiB on Linux) and the process is
@@ -39,19 +40,32 @@ SIGNIFICANT_SAVING_BYTES = 32 * 1024 * 1024
 MEASURE_TIMEOUT_SECONDS = 900.0
 
 MEASURE_SCRIPT = r'''
-import json, resource, subprocess, sys, time
-helper, log_path, outdir, cwd = sys.argv[1:5]
-started = time.monotonic()
+import json, os, resource, subprocess, sys, time
+helper, log_path, round_dir, cwd, summary_cli = sys.argv[1:6]
+checks = os.path.join(round_dir, "round.checks")
+os.makedirs(checks, exist_ok=True)
+round_log = os.path.join(round_dir, "round.jsonl")
+open(round_log, "ab").close()
+helper_started = time.monotonic()
 proc = subprocess.run(
-    [sys.executable, helper, "--output-dir", outdir, "--id", "bench",
+    [sys.executable, helper, "--output-dir", checks, "--id", "bench",
      "--timeout-seconds", "600", "--", "sh", "-c", "cat '%s'; exit 1" % log_path.replace("'", "'\\''")],
     cwd=cwd, capture_output=True, text=True)
-wall = time.monotonic() - started
+helper_wall = time.monotonic() - helper_started
+summary_started = time.monotonic()
+summary = subprocess.run(
+    [sys.executable, summary_cli, round_log, "--worktree", cwd, "--run-dir", round_dir,
+     "--checks-dir", checks, "--json"],
+    cwd=cwd, capture_output=True, text=True)
+summary_wall = time.monotonic() - summary_started
 usage = resource.getrusage(resource.RUSAGE_CHILDREN)
 unit = "bytes" if sys.platform == "darwin" else "kib"
 peak = usage.ru_maxrss if unit == "bytes" else usage.ru_maxrss * 1024
-print(json.dumps({"wallSeconds": wall, "helperExit": proc.returncode,
+print(json.dumps({"wallSeconds": helper_wall + summary_wall, "helperWall": helper_wall,
+                  "summaryWall": summary_wall, "helperExit": proc.returncode,
                   "helperStdout": proc.stdout[-20000:], "helperStderr": proc.stderr[-2000:],
+                  "summaryExit": summary.returncode, "summaryStdout": summary.stdout[-200000:],
+                  "summaryStderr": summary.stderr[-2000:],
                   "peakRssBytes": peak, "rssUnit": unit}, separators=(",", ":")))
 '''
 
@@ -112,10 +126,12 @@ def copy_candidate(destination: Path) -> Path:
 
 
 def measure(runtime_dir: Path, log_path: Path, work: Path, tag: str) -> dict:
-    outdir = work / f"checks-{tag}"
-    outdir.mkdir(parents=True, exist_ok=True)
+    """Run helper then summary in one measured child sequence and verify both."""
+    round_dir = work / f"round-{tag}"
+    (round_dir / "round.checks").mkdir(parents=True, exist_ok=True)
     proc = subprocess.run([sys.executable, "-c", MEASURE_SCRIPT,
-                           str(runtime_dir / "pi_check.py"), str(log_path), str(outdir), str(work)],
+                           str(runtime_dir / "pi_check.py"), str(log_path), str(round_dir),
+                           str(work), str(runtime_dir / "pi_summary.py")],
                           capture_output=True, text=True, timeout=MEASURE_TIMEOUT_SECONDS)
     if proc.returncode != 0:
         raise RuntimeError(f"measurement {tag} failed: {proc.stderr[-500:]}")
@@ -125,8 +141,16 @@ def measure(runtime_dir: Path, log_path: Path, work: Path, tag: str) -> dict:
     except (ValueError, IndexError) as exc:
         raise RuntimeError(f"measurement {tag} produced no helper JSON: {exc}") from exc
     receipt = json.loads(Path(helper["receipt"]).read_text(encoding="utf-8"))
+    try:
+        summary = json.loads(result["summaryStdout"].strip().splitlines()[-1])
+    except (ValueError, IndexError) as exc:
+        raise RuntimeError(f"measurement {tag} produced no summary JSON: {exc}") from exc
+    verified = any(isinstance(item, dict) and item.get("id") == "bench"
+                   and item.get("log_verified") is True
+                   for item in (summary.get("check_receipts") or []))
     result.update({"receipt": helper["receipt"], "logTail": helper.get("log_tail"),
-                   "logSha256": receipt["log_sha256"], "testCounts": receipt["test_counts"]})
+                   "logSha256": receipt["log_sha256"], "testCounts": receipt["test_counts"],
+                   "summaryVerified": verified})
     return result
 
 
@@ -265,7 +289,8 @@ def main() -> int:
                 and candidate_run["testCounts"] == facts["counts"]
                 and (baseline_run["logTail"] or "").splitlines()[-1:] == [facts["tailLastLine"]]
                 and (candidate_run["logTail"] or "").splitlines()[-1:] == [facts["tailLastLine"]]
-                and baseline_run["logTail"] == candidate_run["logTail"])
+                and baseline_run["logTail"] == candidate_run["logTail"]
+                and baseline_run["summaryVerified"] and candidate_run["summaryVerified"])
             results["factsOk"] = results["factsOk"] and facts_ok
             if not facts_ok:
                 results["errors"].append(f"fact mismatch at {size_mib} MiB")
@@ -296,6 +321,12 @@ def main() -> int:
         summary = {"ok": ok, "baselineCommit": baseline_commit, "sizesMiB": sizes,
                    "factsOk": results["factsOk"], "gates": gates,
                    "timingFixtureOk": fixture["ok"],
+                   "summaryVerified": {key: {"old": results["runs"][key]["old"]["summaryVerified"],
+                                             "new": results["runs"][key]["new"]["summaryVerified"]}
+                                       for key in results["runs"]},
+                   "summaryWallSeconds": {key: {side: results["runs"][key][side]["summaryWall"]
+                                                for side in ("old", "new")}
+                                          for key in results["runs"]},
                    "wallSeconds": results["wallSeconds"], "peakRssBytes": results["peakRssBytes"],
                    "newGrowthBytes": growth, "oldMinusNewLargestBytes": saving,
                    "evidence": str(evidence_dir / "result.json"),

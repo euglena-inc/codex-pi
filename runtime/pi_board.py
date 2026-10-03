@@ -1003,6 +1003,34 @@ def _metric_value(section, key):
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
+def _metric_complete(section, key) -> bool:
+    """A leaf is complete only when its own summary explicitly says so."""
+    if not isinstance(section, dict):
+        return False
+    leaf = section.get(key)
+    return bool(isinstance(leaf, dict) and leaf.get("complete") is True)
+
+
+def _record_round_metric(target: dict, section, key: str, number: int) -> None:
+    """Partition one round into exactly one of known/incomplete/unknown."""
+    if _metric_value(section, key) is None:
+        target["unknown"].append(number)
+    elif _metric_complete(section, key):
+        target["known"].append(number)
+    else:
+        target["incomplete"].append(number)
+
+
+def _aggregate_metric(known_sum, rounds_map: dict, rounds: list) -> dict:
+    """Known parts stay visible; completeness requires every round complete."""
+    return {"known": known_sum if rounds_map["known"] or rounds_map["incomplete"] else None,
+            "roundsKnown": rounds_map["known"],
+            "roundsIncomplete": rounds_map["incomplete"],
+            "roundsUnknown": rounds_map["unknown"],
+            "complete": bool(rounds) and not rounds_map["incomplete"]
+                        and not rounds_map["unknown"]}
+
+
 def task_metrics(board_file: Path, card, task_id: str) -> dict:
     """One compact metrics record; unknown stays unknown, never a partial sum as complete."""
     task_dir = Path(board_file).parent / "tasks" / task_id
@@ -1012,15 +1040,21 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
                         if entry.name.isdigit() and entry.is_dir())
     usage, cost = {}, 0.0
     missing, incomplete, cost_unknown = [], [], []
+    usage_metric_keys = ("uncachedInput", "cacheRead", "cacheWrite", "output", "reasoning",
+                         "totalTokens")
+    timing_keys = ("windowSeconds", "modelResponseSeconds", "toolSeconds",
+                   "unattributedSeconds")
     metrics_missing = []
-    derived_usage, derived_usage_rounds = {}, {}
-    context_peak, context_rounds = None, []
-    timing_rounds = {key: 0 for key in ("windowSeconds", "modelResponseSeconds",
-                                        "toolSeconds", "unattributedSeconds")}
-    timing_known = dict.fromkeys(timing_rounds, 0.0)
-    timing_unknown = {key: [] for key in timing_rounds}
+    derived_usage = {}
+    usage_rounds = {key: {"known": [], "incomplete": [], "unknown": []}
+                    for key in usage_metric_keys}
+    context_peak = None
+    context_rounds = {"known": [], "incomplete": [], "unknown": []}
+    timing_known = dict.fromkeys(timing_keys, 0.0)
+    timing_rounds = {key: {"known": [], "incomplete": [], "unknown": []} for key in timing_keys}
     checks_total = Counter()
-    checks_elapsed, checks_elapsed_rounds, checks_elapsed_unknown = 0.0, 0, []
+    checks_elapsed = 0.0
+    checks_rounds = {"known": [], "incomplete": [], "unknown": []}
     for number in rounds:
         summary, problem = _read_bounded_json(task_dir / "rounds" / str(number)
                                               / "round.summary.json", 4_000_000)
@@ -1028,6 +1062,12 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
             missing.append(number)
             cost_unknown.append(number)
             metrics_missing.append(number)
+            for key in usage_metric_keys:
+                usage_rounds[key]["unknown"].append(number)
+            context_rounds["unknown"].append(number)
+            for key in timing_keys:
+                timing_rounds[key]["unknown"].append(number)
+            checks_rounds["unknown"].append(number)
             continue
         _sum_known(usage, summary.get("usage"))
         if not summary.get("usage_complete"):
@@ -1040,30 +1080,30 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
         metrics = summary.get("metrics")
         if not isinstance(metrics, dict):
             metrics_missing.append(number)
-            for key in timing_unknown:
-                if key != "windowSeconds":
-                    timing_unknown[key].append(number)
-            checks_elapsed_unknown.append(number)
+            for key in usage_metric_keys:
+                usage_rounds[key]["unknown"].append(number)
+            context_rounds["unknown"].append(number)
+            for key in timing_keys:
+                timing_rounds[key]["unknown"].append(number)
+            checks_rounds["unknown"].append(number)
             continue
-        usage_metrics = metrics.get("usage")
-        for key in ("uncachedInput", "cacheRead", "cacheWrite", "output", "reasoning",
-                    "totalTokens"):
-            value = _metric_value(usage_metrics, key)
+        usage_section = metrics.get("usage")
+        for key in usage_metric_keys:
+            _record_round_metric(usage_rounds[key], usage_section, key, number)
+            value = _metric_value(usage_section, key)
             if value is not None:
                 derived_usage[key] = derived_usage.get(key, 0) + value
-                derived_usage_rounds[key] = derived_usage_rounds.get(key, 0) + 1
-        value = _metric_value(metrics.get("context"), "peak")
+        context_section = metrics.get("context")
+        _record_round_metric(context_rounds, context_section, "peak", number)
+        value = _metric_value(context_section, "peak")
         if value is not None:
             context_peak = value if context_peak is None else max(context_peak, value)
-            context_rounds.append(number)
         timing = metrics.get("timing")
-        for key in timing_rounds:
+        for key in timing_keys:
+            _record_round_metric(timing_rounds[key], timing, key, number)
             value = _metric_value(timing, key)
             if value is not None:
                 timing_known[key] += value
-                timing_rounds[key] += 1
-            elif key != "windowSeconds":
-                timing_unknown[key].append(number)
         checks_metrics = metrics.get("checks")
         if isinstance(checks_metrics, dict):
             for key in ("attempts", "completed", "passed", "failed", "interrupted",
@@ -1071,12 +1111,12 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
                 value = checks_metrics.get(key)
                 if isinstance(value, int) and not isinstance(value, bool):
                     checks_total[key] += value
+            _record_round_metric(checks_rounds, checks_metrics, "elapsedSeconds", number)
             value = _metric_value(checks_metrics, "elapsedSeconds")
             if value is not None:
                 checks_elapsed += value
-                checks_elapsed_rounds += 1
-            else:
-                checks_elapsed_unknown.append(number)
+        else:
+            checks_rounds["unknown"].append(number)
     record = {"task": task_id, "rounds": len(rounds),
               "usage": {"known": usage, "complete": bool(rounds) and not missing and not incomplete,
                         "roundsMissing": missing, "roundsIncomplete": incomplete},
@@ -1084,30 +1124,19 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
                           "roundsUnknown": cost_unknown},
               "derivedMetrics": {
                   "roundsWithoutMetrics": metrics_missing,
-                  "usage": {key: {"known": derived_usage.get(key) if derived_usage_rounds.get(key) else None,
-                                  "roundsKnown": derived_usage_rounds.get(key, 0),
-                                  "roundsMissingCount": len(rounds) - derived_usage_rounds.get(key, 0),
-                                  "complete": bool(rounds) and derived_usage_rounds.get(key, 0) == len(rounds)}
-                              for key in ("uncachedInput", "cacheRead", "cacheWrite", "output",
-                                          "reasoning", "totalTokens")},
-                  "contextPeak": {"known": context_peak,
-                                  "roundsKnown": context_rounds,
-                                  "complete": bool(rounds) and len(context_rounds) == len(rounds)},
-                  "timing": {key: {"known": timing_known[key] if timing_rounds[key] else None,
-                                   "roundsKnown": timing_rounds[key],
-                                   "roundsUnknown": timing_unknown[key],
-                                   "complete": bool(rounds) and timing_rounds[key] == len(rounds)}
-                             for key in timing_rounds},
+                  "usage": {key: _aggregate_metric(derived_usage.get(key), usage_rounds[key], rounds)
+                            for key in usage_metric_keys},
+                  "contextPeak": _aggregate_metric(context_peak, context_rounds, rounds),
+                  "timing": {key: _aggregate_metric(timing_known[key], timing_rounds[key], rounds)
+                             for key in timing_keys},
                   "checks": {key: checks_total[key] for key in ("attempts", "completed", "passed",
                                                                 "failed", "interrupted", "unknown",
                                                                 "unverifiedLogs")}
-                            | {"elapsedSeconds": {
-                                "known": checks_elapsed if checks_elapsed_rounds else None,
-                                "roundsKnown": checks_elapsed_rounds,
-                                "roundsUnknown": checks_elapsed_unknown,
-                                "complete": bool(rounds) and checks_elapsed_rounds == len(rounds)}},
-                  "note": "aggregated from stored round summaries only; no session scan during "
-                          "board refresh, and missing rounds stay unknown"}}
+                            | {"elapsedSeconds": _aggregate_metric(checks_elapsed, checks_rounds,
+                                                                  rounds)},
+                  "note": "aggregated from stored round summaries only; every round is partitioned "
+                          "into known/incomplete/unknown per metric, completeness requires all "
+                          "rounds, and no session is scanned during board refresh"}}
     if isinstance(card, dict):
         by_kind, failure_kinds = {}, {}
         for row in decision_records(card).values():

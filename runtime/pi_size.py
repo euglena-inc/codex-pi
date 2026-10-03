@@ -12,6 +12,7 @@ bytes.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 import time
@@ -21,6 +22,26 @@ DEFAULT_MAX_SECONDS = 5.0
 MAX_BYTES_VALUE = 10 ** 18
 MAX_PATH_TEXT = 400
 MAX_REASON_TEXT = 200
+
+
+def sha256_file(path, chunk_size: int = 1 << 20) -> str:
+    """Streaming SHA-256 of one file; I/O errors propagate, nothing is buffered whole.
+
+    A missing path raises ``FileNotFoundError`` exactly like ``open``. Callers
+    that need the historical "absent file means empty" behavior must decide that
+    themselves before calling this helper; unreadable existing files never
+    silently become an empty or successful result.
+    """
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
+        raise ValueError("chunk_size must be a positive integer")
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while True:
+            chunk = stream.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _path_text(path) -> str:

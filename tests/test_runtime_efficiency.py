@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -207,6 +208,60 @@ class StreamingAnalyzerTest(unittest.TestCase):
             self.assertEqual(payload["log_tail"], naive_tail(raw))
             self.assertIsNone(receipt["test_counts"])
 
+    def test_unreadable_existing_log_fails_instead_of_emptying(self):
+        self.assertNotEqual(os.geteuid(), 0, "permission negatives need a non-root uid")
+        with tempfile.TemporaryDirectory(prefix="codex-pi-stream-") as tmp:
+            path = Path(tmp) / "check.log"
+            path.write_bytes(b"=== RUN TestA\n")
+            original = path.read_bytes()
+            path.chmod(0)
+            try:
+                with self.assertRaises(OSError):
+                    pi_check.analyze_log(path)
+            finally:
+                path.chmod(0o600)
+            self.assertEqual(path.read_bytes(), original, "the original log stays untouched")
+
+    def test_mid_read_failure_is_not_an_empty_log(self):
+        class FailingStream:
+            def __init__(self, data: bytes):
+                self.data, self.calls = data, 0
+
+            def read(self, size: int = -1) -> bytes:
+                self.calls += 1
+                if self.calls == 1:
+                    return self.data
+                raise OSError("simulated mid-read failure")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with mock.patch.object(Path, "open", return_value=FailingStream(b"partial\n")):
+            with self.assertRaises(OSError):
+                pi_check.analyze_log(Path("/ignored/not-used.log"))
+
+    def test_pi_check_permission_failure_writes_no_receipt(self):
+        with tempfile.TemporaryDirectory(prefix="codex-pi-stream-") as tmp:
+            work = Path(tmp)
+            checks = work / "checks"
+            checks.mkdir()
+            proc = subprocess.run(
+                [sys.executable, str(CHECK), "--output-dir", str(checks), "--id", "noperm",
+                 "--", "sh", "-c", 'chmod 000 "$1"/*.log', "sh", str(checks)],
+                cwd=str(work), capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout.strip(), "", "no normal-looking receipt JSON on stdout")
+            self.assertIn("Permission", proc.stderr)
+            self.assertEqual(list(checks.glob("*.json")), [])
+            self.assertEqual(list(checks.glob("*.running")), [])
+            logs = list(checks.glob("*.log"))
+            self.assertEqual(len(logs), 1, "the original log file is retained")
+            logs[0].chmod(0o600)
+            self.assertEqual(logs[0].read_bytes(), b"")
+
 
 class TimingCase(unittest.TestCase):
     def setUp(self):
@@ -255,12 +310,15 @@ class TimingMetricsTest(TimingCase):
         self.assertEqual(timing["status"], "ok")
         self.assertEqual(timing["label"], "estimated")
         self.assertEqual(timing["windowSeconds"], {"value": 30.0, "label": "exact",
-                                                    "source": "round state startedAt/endedAt"})
+                                                    "source": "round state startedAt/endedAt",
+                                                    "complete": True})
         self.assertEqual(timing["modelResponseSeconds"]["value"], 11.0)
         self.assertEqual(timing["modelResponseSeconds"]["samples"], 3)
+        self.assertTrue(timing["modelResponseSeconds"]["complete"])
         self.assertEqual(timing["toolSeconds"]["value"], 2.5,
                          "concurrent tool intervals must be unioned, not summed")
         self.assertEqual(timing["toolSeconds"]["samples"], 3)
+        self.assertTrue(timing["toolSeconds"]["complete"])
         self.assertEqual(timing["coveredSeconds"]["value"], 13.5)
         self.assertEqual(timing["unattributedSeconds"]["value"], 16.5)
         coverage = timing["coverage"]
@@ -275,7 +333,79 @@ class TimingMetricsTest(TimingCase):
         self.assertEqual(timing["status"], "ok")
         self.assertEqual(timing["toolSeconds"]["value"], 0.0)
         self.assertEqual(timing["toolSeconds"]["label"], "estimated")
+        self.assertTrue(timing["toolSeconds"]["complete"])
         self.assertEqual(timing["coverage"]["parseClean"], True)
+
+    def test_orphan_tool_result_blocks_completeness(self):
+        self.write_session([
+            session_entry("a1", 105.0, assistant(101000)),
+            session_entry("t1", 106.0, tool_result(105500, "missing"), parent="a1"),
+        ])
+        timing = self.summarize()["metrics"]["timing"]
+        self.assertEqual(timing["status"], "partial")
+        self.assertEqual(timing["toolSeconds"]["value"], 0.0,
+                         "the measured part stays visible")
+        self.assertFalse(timing["toolSeconds"]["complete"],
+                         "an unmatched tool result means a tool was never measured")
+        self.assertEqual(timing["toolSeconds"]["orphanResults"], 1)
+        self.assertEqual(timing["coverage"]["toolComplete"], False)
+        self.assertIsNone(timing["coveredSeconds"]["value"])
+        self.assertIsNone(timing["unattributedSeconds"]["value"])
+
+    def test_open_tool_intervals_use_union_not_sum(self):
+        self.write_session([session_entry("a1", 105.0, assistant(101000, calls=("c1", "c2")))])
+        timing = self.summarize()["metrics"]["timing"]
+        self.assertEqual(timing["toolSeconds"]["openIntervals"], 2)
+        self.assertEqual(timing["coverage"]["openToolSeconds"], 25.0,
+                         "two concurrent open calls union to one [105, 130] interval")
+        self.assertFalse(timing["toolSeconds"]["complete"])
+
+    def test_session_header_identity_not_filename_order(self):
+        header = json.dumps({"type": "session", "version": 3, "id": "sid",
+                             "timestamp": "1970-01-01T00:00:00.000Z", "cwd": "/tmp"})
+        other_header = json.dumps({"type": "session", "version": 3, "id": "other",
+                                   "timestamp": "1970-01-01T00:00:00.000Z", "cwd": "/tmp"})
+        entry = json.dumps(session_entry("a1", 105.0, assistant(101000)))
+        (self.session_dir / "2026-01-01T00-00-00-000Z_sid.jsonl").write_text(
+            header + "\n" + entry + "\n", encoding="utf-8")
+        (self.session_dir / "2026-02-01T00-00-00-000Z_sid.jsonl").write_text(
+            other_header + "\n" + entry + "\n", encoding="utf-8")
+        timing = self.summarize()["metrics"]["timing"]
+        self.assertEqual(timing["status"], "ok", "only the header-verified file is authoritative")
+        self.assertEqual(timing["modelResponseSeconds"]["value"], 4.0)
+        self.assertEqual(timing["coverage"]["sessionCandidates"], 2)
+        # Two files both claiming the id are ambiguous, never a filename guess.
+        (self.session_dir / "2026-02-01T00-00-00-000Z_sid.jsonl").write_text(
+            header + "\n" + entry + "\n", encoding="utf-8")
+        timing = self.summarize()["metrics"]["timing"]
+        self.assertEqual(timing["reason"], "session_identity_ambiguous")
+        self.assertIsNone(timing["modelResponseSeconds"]["value"])
+
+    def test_multi_round_window_does_not_mix(self):
+        self.write_session([
+            session_entry("old-a", 50.0, assistant(40000, calls=("c1",))),
+            session_entry("old-t", 51.0, tool_result(40500, "c1"), parent="old-a"),
+            session_entry("new-a", 105.0, assistant(101000, calls=("c1",))),
+            session_entry("new-t", 106.5, tool_result(106000, "c1"), parent="new-a"),
+        ])
+        timing = self.summarize()["metrics"]["timing"]
+        self.assertEqual(timing["modelResponseSeconds"]["value"], 4.0)
+        self.assertEqual(timing["toolSeconds"]["value"], 1.0)
+        self.assertTrue(timing["toolSeconds"]["complete"])
+        self.assertEqual(timing["coverage"]["outOfWindowEntries"], 2)
+
+    def test_other_session_dir_is_not_read(self):
+        other = self.tmp / "other-session"
+        other.mkdir()
+        header = json.dumps({"type": "session", "version": 3, "id": "sid",
+                             "timestamp": "1970-01-01T00:00:00.000Z", "cwd": "/tmp"})
+        entry = json.dumps(session_entry("a1", 105.0, assistant(101000)))
+        (other / "2026-01-01T00-00-00-000Z_sid.jsonl").write_text(
+            header + "\n" + entry + "\n", encoding="utf-8")
+        self.write_session([])
+        timing = self.summarize(window=(100.0, 130.0))["metrics"]["timing"]
+        self.assertEqual(timing["reason"], "no_entries_in_window")
+        self.assertIsNone(timing["modelResponseSeconds"]["value"])
 
     def test_partial_tail_open_interval_and_bad_timestamps_are_explicit(self):
         entries = [
@@ -290,7 +420,11 @@ class TimingMetricsTest(TimingCase):
         timing = self.summarize()["metrics"]["timing"]
         self.assertEqual(timing["status"], "partial")
         self.assertEqual(timing["modelResponseSeconds"]["value"], 4.0)
-        self.assertIsNone(timing["toolSeconds"]["value"])
+        self.assertFalse(timing["modelResponseSeconds"]["complete"],
+                         "a bad session line must not look like complete model coverage")
+        self.assertEqual(timing["toolSeconds"]["value"], 1.0)
+        self.assertFalse(timing["toolSeconds"]["complete"])
+        self.assertEqual(timing["toolSeconds"]["openIntervals"], 1)
         self.assertIsNotNone(timing["toolSeconds"]["reason"])
         self.assertEqual(timing["coverage"]["openToolIntervals"], 1)
         self.assertEqual(timing["coverage"]["toolResultsWithoutCall"], 1)
@@ -359,6 +493,63 @@ class UsageMetricsTest(TimingCase):
         self.assertEqual(context["peak"]["value"], 105.0)
         self.assertEqual(context["samples"], 2)
 
+    def test_unique_usage_identity_and_unified_unique_count(self):
+        first = {"role": "assistant", "provider": "p", "model": "m", "timestamp": 1000,
+                 "stopReason": "stop",
+                 "usage": {"input": 1, "cacheRead": 0, "output": 1, "totalTokens": 2},
+                 "content": []}
+        second = {"role": "assistant", "provider": "p", "model": "m", "timestamp": 2000,
+                  "stopReason": "stop",
+                  "usage": {"input": 2, "cacheRead": 0, "output": 2, "totalTokens": 4},
+                  "content": []}
+        no_stamp = {key: value for key, value in second.items() if key != "timestamp"}
+        events = [{"type": "message_end", "message": message}
+                  for message in (first, first, second, no_stamp)]
+        usage = self.summarize(events)["metrics"]["usage"]
+        self.assertEqual(usage["messages"], 3,
+                         "a message with no identity is still counted exactly once")
+        self.assertEqual(usage["duplicateMessages"], 1)
+        self.assertEqual(usage["heuristicDuplicates"], 1)
+        self.assertEqual(usage["identity"], "timestamp_usage")
+        self.assertFalse(usage["identityReliable"])
+        self.assertEqual(usage["uncachedInput"]["value"], 5)
+        self.assertTrue(usage["uncachedInput"]["complete"])
+
+    def test_response_id_identity_is_reliable(self):
+        message = {"role": "assistant", "provider": "p", "model": "m", "timestamp": 1000,
+                   "responseId": "resp-1", "stopReason": "stop",
+                   "usage": {"input": 1, "cacheRead": 0, "output": 1, "totalTokens": 2},
+                   "content": []}
+        shifted = dict(message, timestamp=9999)
+        usage = self.summarize([{"type": "message_end", "message": entry}
+                                for entry in (message, shifted)])["metrics"]["usage"]
+        self.assertEqual(usage["messages"], 1)
+        self.assertEqual(usage["duplicateMessages"], 1)
+        self.assertEqual(usage["identity"], "response_id")
+        self.assertTrue(usage["identityReliable"])
+        self.assertEqual(usage["heuristicDuplicates"], 0)
+
+    def test_same_timestamp_never_merges_different_usage(self):
+        def assistant_with(input_tokens):
+            return {"role": "assistant", "provider": "p", "model": "m", "timestamp": 1000,
+                    "stopReason": "stop",
+                    "usage": {"input": input_tokens, "cacheRead": 0, "output": 0,
+                              "totalTokens": input_tokens},
+                    "content": []}
+        distinct = self.summarize([{"type": "message_end", "message": assistant_with(1)},
+                                   {"type": "message_end", "message": assistant_with(2)}])
+        usage = distinct["metrics"]["usage"]
+        self.assertEqual(usage["messages"], 2)
+        self.assertEqual(usage["duplicateMessages"], 0)
+        # An indistinguishable pair is only a heuristic duplicate and is never
+        # reported as fully reliable.
+        merged = self.summarize([{"type": "message_end", "message": assistant_with(1)},
+                                 {"type": "message_end", "message": assistant_with(1)}])
+        usage = merged["metrics"]["usage"]
+        self.assertEqual(usage["messages"], 1)
+        self.assertEqual(usage["heuristicDuplicates"], 1)
+        self.assertFalse(usage["identityReliable"])
+
     def test_reasoning_and_context_unknown_when_usage_missing(self):
         events = [{"type": "message_end", "message": {
             "role": "assistant", "provider": "p", "model": "m", "timestamp": 1000,
@@ -404,6 +595,39 @@ class CheckMetricsTest(TimingCase):
         self.assertEqual(metrics["completed"], 1)
         self.assertEqual(metrics["failed"], 1)
         self.assertEqual(metrics["elapsedSeconds"]["value"], 2.5)
+        self.assertTrue(metrics["elapsedSeconds"]["complete"])
+
+    def test_zero_checks_is_a_complete_zero(self):
+        metrics = self.summarize()["metrics"]["checks"]
+        self.assertEqual(metrics["attempts"], 0)
+        self.assertEqual(metrics["elapsedSeconds"]["value"], 0.0)
+        self.assertTrue(metrics["elapsedSeconds"]["complete"])
+        self.assertEqual(metrics["elapsedSeconds"]["missingTime"], 0)
+
+    def test_missing_receipt_time_is_known_partial_not_complete(self):
+        self.write_receipt("clean")
+        self.write_receipt("notime", started_at=None, ended_at=None)
+        metrics = self.summarize()["metrics"]["checks"]
+        self.assertEqual(metrics["completed"], 2)
+        self.assertEqual(metrics["elapsedSeconds"]["value"], 2.5)
+        self.assertFalse(metrics["elapsedSeconds"]["complete"])
+        self.assertEqual(metrics["elapsedSeconds"]["missingTime"], 1)
+        self.assertEqual(metrics["elapsedSeconds"]["label"], "estimated")
+
+    def test_all_interrupted_is_a_complete_zero(self):
+        self.write_receipt("timeout", timed_out=True, started_at=200.0, ended_at=260.0)
+        metrics = self.summarize()["metrics"]["checks"]
+        self.assertEqual(metrics["attempts"], 1)
+        self.assertEqual(metrics["interrupted"], 1)
+        self.assertEqual(metrics["elapsedSeconds"]["value"], 0.0)
+        self.assertTrue(metrics["elapsedSeconds"]["complete"])
+
+    def test_unknown_exit_is_incomplete(self):
+        self.write_receipt("unknownexit", exit_code=None)
+        metrics = self.summarize()["metrics"]["checks"]
+        self.assertEqual(metrics["unknown"], 1)
+        self.assertEqual(metrics["elapsedSeconds"]["value"], 0.0)
+        self.assertFalse(metrics["elapsedSeconds"]["complete"])
 
 
 class BoardMetricsTest(unittest.TestCase):
@@ -424,21 +648,28 @@ class BoardMetricsTest(unittest.TestCase):
         return {"usage": {"input": uncached, "output": 1, "totalTokens": uncached + 1},
                 "usage_complete": True, "reported_cost_usd": 0.1,
                 "metrics": {"usage": {
-                    "uncachedInput": {"value": uncached, "label": "exact", "samples": 1},
-                    "cacheRead": {"value": 5, "label": "exact", "samples": 1},
-                    "output": {"value": 1, "label": "exact", "samples": 1},
-                    "reasoning": {"value": None, "label": "unknown", "samples": 0},
-                    "totalTokens": {"value": uncached + 1, "label": "exact", "samples": 1}},
-                    "context": {"first": {"value": 10, "label": "exact"},
-                                "last": {"value": 12, "label": "exact"},
-                                "peak": {"value": 12, "label": "exact"}},
+                    "uncachedInput": {"value": uncached, "label": "exact", "samples": 1,
+                                      "complete": True},
+                    "cacheRead": {"value": 5, "label": "exact", "samples": 1, "complete": True},
+                    "output": {"value": 1, "label": "exact", "samples": 1, "complete": True},
+                    "reasoning": {"value": None, "label": "unknown", "samples": 0,
+                                  "complete": False},
+                    "totalTokens": {"value": uncached + 1, "label": "exact", "samples": 1,
+                                    "complete": True}},
+                    "context": {"first": {"value": 10, "label": "exact", "complete": True},
+                                "last": {"value": 12, "label": "exact", "complete": True},
+                                "peak": {"value": 12, "label": "exact", "complete": True}},
                     "checks": {"attempts": checks, "completed": checks, "passed": checks,
                                "failed": 0, "interrupted": 0, "unknown": 0,
-                               "elapsedSeconds": {"value": 2.0, "label": "exact", "samples": checks}},
-                    "timing": {"windowSeconds": {"value": 60.0, "label": "exact"},
-                               "modelResponseSeconds": {"value": model, "label": "estimated"},
-                               "toolSeconds": {"value": tool, "label": "estimated"},
-                               "unattributedSeconds": {"value": unattributed, "label": "estimated"}}}}
+                               "elapsedSeconds": {"value": 2.0, "label": "exact", "samples": checks,
+                                                  "complete": True}},
+                    "timing": {"windowSeconds": {"value": 60.0, "label": "exact", "complete": True},
+                               "modelResponseSeconds": {"value": model, "label": "estimated",
+                                                        "complete": True},
+                               "toolSeconds": {"value": tool, "label": "estimated",
+                                               "complete": True},
+                               "unattributedSeconds": {"value": unattributed, "label": "estimated",
+                                                       "complete": True}}}}
 
     def test_derived_metrics_aggregate_and_old_summaries_stay_unknown(self):
         self.write_summary(1, self.new_summary(10, 3.0, 1.0, 56.0, 2))
@@ -452,14 +683,19 @@ class BoardMetricsTest(unittest.TestCase):
         derived = record["derivedMetrics"]
         self.assertEqual(derived["usage"]["uncachedInput"]["known"], 10)
         self.assertFalse(derived["usage"]["uncachedInput"]["complete"])
-        self.assertEqual(derived["usage"]["uncachedInput"]["roundsMissingCount"], 1)
+        self.assertEqual(derived["usage"]["uncachedInput"]["roundsKnown"], [1])
+        self.assertEqual(derived["usage"]["uncachedInput"]["roundsUnknown"], [2])
+        self.assertEqual(derived["usage"]["uncachedInput"]["roundsIncomplete"], [])
         self.assertEqual(derived["contextPeak"]["known"], 12)
         self.assertFalse(derived["contextPeak"]["complete"])
+        self.assertEqual(derived["contextPeak"]["roundsUnknown"], [2])
         self.assertEqual(derived["timing"]["modelResponseSeconds"]["known"], 3.0)
+        self.assertEqual(derived["timing"]["modelResponseSeconds"]["roundsKnown"], [1])
         self.assertEqual(derived["timing"]["modelResponseSeconds"]["roundsUnknown"], [2])
         self.assertEqual(derived["checks"]["attempts"], 2)
         self.assertEqual(derived["checks"]["elapsedSeconds"]["known"], 2.0)
         self.assertEqual(derived["checks"]["elapsedSeconds"]["roundsUnknown"], [2])
+        self.assertFalse(derived["checks"]["elapsedSeconds"]["complete"])
         self.assertIn(2, derived["roundsWithoutMetrics"])
         # The stored evidence is read-only: no summary was rewritten.
         before = (self.task_dir / "rounds" / "1" / "round.summary.json").read_bytes()
@@ -467,7 +703,41 @@ class BoardMetricsTest(unittest.TestCase):
         self.assertEqual((self.task_dir / "rounds" / "1" / "round.summary.json").read_bytes(), before)
 
 
+    def test_incomplete_round_blocks_aggregate_completeness(self):
+        summary = self.new_summary(10, 3.0, 1.0, 56.0, 2)
+        summary["metrics"]["checks"]["elapsedSeconds"]["complete"] = False
+        summary["metrics"]["timing"]["modelResponseSeconds"]["complete"] = False
+        self.write_summary(1, summary)
+        with mock.patch.object(pi_summary, "derive_timing",
+                               side_effect=AssertionError("board refresh must not scan sessions")):
+            derived = pi_board.task_metrics(self.board_file, None, "T")["derivedMetrics"]
+        checks = derived["checks"]["elapsedSeconds"]
+        self.assertEqual(checks["known"], 2.0, "the known part stays visible")
+        self.assertEqual(checks["roundsIncomplete"], [1])
+        self.assertEqual(checks["roundsKnown"], [])
+        self.assertEqual(checks["roundsUnknown"], [2])
+        self.assertFalse(checks["complete"])
+        model = derived["timing"]["modelResponseSeconds"]
+        self.assertEqual(model["known"], 3.0)
+        self.assertEqual(model["roundsIncomplete"], [1])
+        self.assertFalse(model["complete"])
+
+
 class BenchmarkHelperTest(unittest.TestCase):
+    def test_benchmark_measures_helper_then_summary_end_to_end(self):
+        with tempfile.TemporaryDirectory(prefix="codex-pi-benche2e-") as tmp:
+            proc = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "benchmark_runtime.py"),
+                 "--baseline-ref", "HEAD", "--sizes-mib", "1", "--evidence-dir", tmp],
+                capture_output=True, text=True, timeout=300, cwd=str(ROOT))
+            self.assertIn(proc.returncode, (0, 1), proc.stderr)
+            data = json.loads(proc.stdout.strip().splitlines()[-1])
+            self.assertTrue(data["factsOk"], data)
+            for size, sides in data["summaryVerified"].items():
+                self.assertTrue(sides["old"], f"old summary did not verify the log at {size}")
+                self.assertTrue(sides["new"], f"new summary did not verify the log at {size}")
+            self.assertTrue(Path(data["evidence"]).is_file())
+
     def test_synthetic_generator_facts_are_independent(self):
         spec = importlib.util.spec_from_file_location(
             "benchmark_runtime", ROOT / "scripts" / "benchmark_runtime.py")

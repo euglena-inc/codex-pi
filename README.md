@@ -8,11 +8,11 @@
 
 合同验收项可选 `targetedCommand`（仅局部调试建议，永不替代正式 command）与 `estimatedSeconds`；同一规范化 argv 的元数据矛盾在合同验证时拒绝。与带 `targetedCommand` 的全量命令 argv 相同的 `check` 默认拒绝并返回该建议，只有显式 `final:true` 且工作树干净才运行；匹配按 argv 而非 id，定向检查不能覆盖正式验收。不自动缓存 PASS、不制造复用回执、不限制全量只跑一次：定向通过、固定最终提交后全量仍须真实执行。没有新服务、状态库或通用调度器；旧冻结 worker 与缺少可选字段的旧合同保持原行为。
 
-检查日志改为单次流式分析：固定字节块同时产出完整 SHA-256、保守的 Go/unittest 计数和有限 `log_tail`，不为尾部再解码整个文件。多字节跨块、重复/矛盾摘要、空/缺失与非法 UTF-8 保持原有保守语义；超过硬上限的单行保持 unknown，不丢前缀后误匹配。原始日志仍完整落盘，回执的 exit/timeout/cancel/resource、head/dirty 和 hash/原子发布语义不变。
+检查日志改为单次流式分析：固定字节块同时产出完整 SHA-256、保守的 Go/unittest 计数和有限 `log_tail`，不为尾部再解码整个文件。多字节跨块、重复/矛盾摘要、空/缺失与非法 UTF-8 保持原有保守语义；超过硬上限的单行保持 unknown，不丢前缀后误匹配。只有日志确实不存在才按历史上的空日志兼容处理；已有文件权限失败或读取中途 I/O 失败显式失败，不生成看似正常的完整 hash 或成功回执。原始日志仍完整落盘，回执的 exit/timeout/cancel/resource、head/dirty 和 hash/原子发布语义不变。summary 的终态回执核验也用流式 hash，不再把大检查日志整读进内存。
 
-`round.summary.json` 新增 `metrics` 紧凑分解：未缓存输入/缓存读取/输出/缓存比例、请求上下文首末峰值、真实 check 次数与已完成耗时（中断/未知不计入）、模型响应区间、工具区间并集及未归因余量，并标注 exact/estimated/unknown。usage 只累计唯一 assistant 最终消息，reasoning 是 output 子项不重复相加，重复投递的 `agent_end`/`turn_end` 不累计。时间指标由调用方显式传入 session 目录/id 与本轮时间窗口，从原生持久 session 的写入时间和消息内部时间派生；没有可靠来源返回 null 和 reason，不输出假 0。summary 只在轮次终态汇总或显式查询路径计算，看板周期刷新只读既有状态/回执/摘要，不做全量会话读取；旧 summary 的新指标保持未知，不原地改写。`pi_board.py metrics` 原有字段保留，新增 `derivedMetrics` 聚合，缺失轮次显式未知。
+`round.summary.json` 新增 `metrics` 紧凑分解：未缓存输入/缓存读取/输出/缓存比例、请求上下文首末峰值、真实 check 次数与已完成耗时（中断/未知不计入）、模型响应区间、工具区间并集及未归因余量，并标注 exact/estimated/unknown。usage 只累计唯一 assistant 最终消息，reasoning 是 output 子项不重复相加，重复投递的 `agent_end`/`turn_end` 不累计。时间指标由调用方显式传入 session 目录/id 与本轮时间窗口，从原生持久 session 的写入时间和消息内部时间派生；没有可靠来源返回 null 和 reason，不输出假 0。每个派生指标区分 known/coverage/complete：已知部分可保留，但缺失、坏行、未闭合工具、无法匹配的 toolResult 或缺少耗时的回执都使该项不完整，不冒充完整；模型区间在会话坏行下不标完整。session 文件按持久 header 的 id 校验，不按文件名排序猜权威；多候选同 id 或多轮条目按显式窗口过滤。usage 用统一的 unique 计数与可靠 identity（优先 responseId，时间+usage 仅作启发式并显式标注），无 identity 的消息仍只计一次。summary 只在轮次终态汇总或显式查询路径计算，看板周期刷新只读既有状态/回执/摘要，不做全量会话读取；旧 summary 的新指标保持未知，不原地改写。`pi_board.py metrics` 原有字段保留，新增 `derivedMetrics` 聚合，为每轮列出 known/incomplete/unknown，complete 只在全部轮次都完整时为真。
 
-新增 `scripts/benchmark_runtime.py --baseline-ref REF`：用 `git archive` 从基线只读物化旧 helper 到临时目录，旧新实现分别在独立子进程分析相同合成 10MiB/200MiB 日志，比较 hash/计数/尾部并测 wall 与 peak RSS（区分 macOS/Linux 单位、顺序运行不叠加）。候选 200MiB 峰值相对 10MiB 的增长有界，并须显著低于同输入旧实现；超出则非零退出并保留证据。脚本同时用已知总量的合成计时 fixture 校验指标分解，原始测量只留私有目录，公开只给无业务内容的紧凑结论。合成对照与未知边界见 [验证记录](docs/validation/runtime-efficiency-0.7.1-20261003.md)。
+新增 `scripts/benchmark_runtime.py --baseline-ref REF`：用 `git archive` 从基线只读物化旧 helper 到临时目录，旧新实现分别在独立子进程分析相同合成 10MiB/200MiB 日志，比较 hash/计数/尾部并测 wall 与 peak RSS（区分 macOS/Linux 单位、顺序运行不叠加）。候选 200MiB 峰值相对 10MiB 的增长有界，并须显著低于同输入旧实现；超出则非零退出并保留证据。脚本同时用已知总量的合成计时 fixture 校验指标分解，原始测量只留私有目录，公开只给无业务内容的紧凑结论。benchmark 在独立子进程中顺序执行 helper 与终态 summary 两条同输入路径，峰值按两者最大值计、不叠加，验证汇总回执核验同样有界；同输入 hash/计数/尾部对照与 10/200MiB 峰值增量阈值保留。合成对照与未知边界见 [验证记录](docs/validation/runtime-efficiency-0.7.1-20261003.md)。
 
 ## 0.7.0 原生 codemode
 
