@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "model": "deepseek/deepseek-flash",
+  "model": "newapi/deepseek-flash",
   "thinking": "max",
   "constraints": [
     "skills/collaborate/SKILL.md"
@@ -9,5 +9,8 @@
     "Run the Python behavioral suite for affected runtime paths."
   ],
   "maxWorkers": 1,
-  "timeoutSeconds": 14400
+  "timeoutSeconds": 14400,
+  "network": {
+    "diagnostics": true
+  }
 }
