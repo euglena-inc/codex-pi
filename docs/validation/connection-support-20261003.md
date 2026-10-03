@@ -48,27 +48,30 @@ disabled-mode silence.
 
 ## Real Pi smoke
 
-One bounded session (of the authorized maximum three) ran through the check tool
-with the pinned route `newapi/deepseek-flash`, `thinking=max`, the read tool and
-the candidate preload loaded via `NODE_OPTIONS`. The old localhost HTTP proxy
-was deliberately not exported for this LAN endpoint, per the authorized route
-change; no model fallback and no automatic rerun happened.
+Two bounded sessions (of the authorized maximum three) ran through the check
+tool with the pinned route `newapi/deepseek-flash`, `thinking=max`, the read
+tool and the candidate preload loaded via `NODE_OPTIONS`. The old localhost
+HTTP proxy was deliberately not exported for this LAN endpoint, per the
+authorized route change; no model fallback and no automatic rerun happened.
+Both sessions completed a real read-tool round trip with the exact synthetic
+file content and `stopReason=stop`.
 
-- Check receipt `smoke-pi-newapi-eb72104e60ca`, candidate head `bf5c564`, clean
-  tree, exit 0, wall 1.9 s, 38686 stdout bytes, 1 tool round trip
-  (`tool_execution_start`/`end`), final assistant text exactly the synthetic
-  file content, `stopReason=stop`.
-- Sidecar present with `observer_ready` and 2 post-header records both
-  classified `abort_cleanup` with `failures=0`: the ordinary response-stream
-  cleanup abort is observed but never counted as a connection failure, exactly
-  as designed.
-- Raw stdout/stderr and sidecar were preserved privately under this round's
-  checks directory; only the compact summary above is public.
+- First session: check receipt `smoke-pi-newapi-eb72104e60ca`, implementation
+  commit `bf5c564`, clean tree, exit 0, wall 1.9 s, 1 tool round trip. Sidecar
+  present with `observer_ready` and 2 post-header records both classified
+  `abort_cleanup` with `failures=0`: the ordinary response-stream cleanup abort
+  is observed but never counted as a connection failure, exactly as designed.
+- Second session: check receipt `smoke-pi-newapi-final-bc66325937c6`, final
+  candidate `268df64`, clean tree, exit 0, wall 1.9 s, 1 tool round trip,
+  sidecar `observer_ready` with no error records. It re-confirms the preload on
+  the exact final candidate after the truncation-marker reserve change.
 
-This proves the candidate preload loads inside the real Pi CLI on this route and
-that a successful tool session is not misclassified. It does not prove the route
-is permanently stable, and the observed `abort_cleanup` count is not a failure
-count.
+Raw stdout/stderr and both sidecars were preserved privately under this round's
+checks directory; only the compact summaries above are public. These sessions
+prove the candidate preload loads inside the real Pi CLI on this route and that
+a successful tool session is not misclassified. They do not prove the route is
+permanently stable, and an observed `abort_cleanup` count is not a failure
+count. One authorized smoke session remains unused.
 
 ## Known limits and unknowns
 
