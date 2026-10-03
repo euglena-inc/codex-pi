@@ -114,6 +114,12 @@ def compose_contract(task: dict) -> str:
                          + (f" min_run={item.get('minRun')}" if item.get('minRun') is not None else "")
                          + (" forbid_skip=true" if item.get("forbidSkip") else ""))
             lines.append(f"    command: {item.get('command')}")
+            if item.get("targetedCommand"):
+                lines.append(f"    targeted_command: {item.get('targetedCommand')} "
+                             "(local repair suggestion; never substitutes for the formal command)")
+            if item.get("estimatedSeconds") is not None:
+                lines.append(f"    estimated_seconds: {item.get('estimatedSeconds')} "
+                             "(planning estimate, not a completion guarantee)")
             lines.append(f"    pass_condition: {item.get('passCondition')}")
             lines.append(f"    evidence: {item.get('evidence')}")
         lines.append("autonomous_repair:")
@@ -122,17 +128,28 @@ def compose_contract(task: dict) -> str:
         lines += [f"  - {entry}" for entry in contract.get("escalateWhen") or []]
         lines.append("Rules: stay inside the declared scope and the phase budget; run every "
                      "acceptance check through the `check` tool with the item's exact command so "
-                     "the receipt binds the candidate. When the round ends with only evidence "
+                     "the receipt binds the candidate. Run the item's targetedCommand for local "
+                     "repair first, commit the fixed candidate, and reserve time for the full "
+                     "acceptance command with final:true on the clean tree; a targeted run never "
+                     "replaces formal acceptance. When the round ends with only evidence "
                      "missing you may be asked once to continue in this same session.")
     elif phase_problem not in (None, "absent"):
         lines.append(f"Phase contract state is {phase_problem}; treat phase-wide readiness as "
                      "unknown and report it instead of inventing coverage.")
     lines += [
         "## Native tools",
-        "- check(id, command, timeoutSeconds?, watchPath?, maxBytes?): run a verification command "
-        "through the task's frozen pi_check helper; receipts capture the true exit, log hash, HEAD "
-        "and dirty state. A failing check returns the log tail. Use it instead of bash for every "
-        "recorded check; with a phase contract the command must be the declared one.",
+        "- check(id, command, timeoutSeconds?, estimatedSeconds?, final?, watchPath?, maxBytes?): "
+        "run a verification command through the task's frozen pi_check helper; receipts capture "
+        "the true exit, log hash, HEAD and dirty state. A failing check returns the log tail. "
+        "estimatedSeconds is a finite positive planning estimate, never a completion guarantee; "
+        "without one the declared command cap is the conservative startup requirement. Before "
+        "spawning, a check is refused with a structured ok:false when the real round deadline "
+        "minus a fixed 60s wrap-up reserve cannot cover the requirement; the same bounds clamp "
+        "the child timeout, and a long check is never admitted inside a shorter codemode script. "
+        "A command whose argv equals a contract item with targetedCommand is a full acceptance "
+        "check: it is refused unless final:true is passed on a clean worktree, and the response "
+        "names the targeted command. Run cheap targeted checks first; reserve time for the full "
+        "checks and wrap-up.",
         "- progress(activity, step?, next?, blocker?, completedCriteria?, evidenceRefs?): "
         "self-reported progress, never acceptance.",
         "- readiness(): read-only delivery check of the contract against the receipts.",
@@ -195,10 +212,30 @@ def write_worker_config(task_dir: Path, round_number: int, task: dict, contract_
         "settleQuotaPath": str(settle_quota_path(
             task_dir, (phase_record.get("contract") or {}).get("phaseId"))) if phase else None,
         "roundDir": str(round_dir), "contract": contract_text,
+        # New-round budget and targeted-repair metadata: absence keeps the older
+        # frozen worker behavior, presence enables deadline admission in the
+        # check tool. The real deadline is re-read from round.state.json.
+        "deadlinePath": str(round_dir / "round.state.json"),
+        "acceptanceItems": acceptance_items(phase_record),
     }
     path = round_dir / WORKER_CONFIG_FILE
     atomic(path, config)
     return path
+
+
+def acceptance_items(phase_record) -> list:
+    """Compact per-item check metadata for the worker's budget admission path."""
+    items = []
+    if isinstance(phase_record, dict):
+        for item in (phase_record.get("contract") or {}).get("acceptanceItems") or []:
+            entry = {"id": item.get("id"), "checkId": item.get("checkId"),
+                     "command": item.get("command")}
+            if item.get("targetedCommand"):
+                entry["targetedCommand"] = item["targetedCommand"]
+            if item.get("estimatedSeconds") is not None:
+                entry["estimatedSeconds"] = float(item["estimatedSeconds"])
+            items.append(entry)
+    return items
 
 
 def ensure_round_inputs(task_dir: Path, round_number: int, prompt: str, task: dict,

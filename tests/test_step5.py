@@ -72,7 +72,10 @@ class LaunchTest(Step5Case):
         self.assertEqual(sorted(worker), sorted([
             "schemaVersion", "task", "round", "repo", "worktree", "forbiddenRoots", "allowedRoots",
             "bashDefaultTimeoutSeconds", "bashCeilingSeconds", "checkTimeoutSeconds", "checksDir",
-            "toolsDir", "python", "phase", "settleQuotaPath", "roundDir", "contract"]))
+            "toolsDir", "python", "phase", "settleQuotaPath", "roundDir", "contract",
+            "deadlinePath", "acceptanceItems"]))
+        self.assertEqual(worker["deadlinePath"], str(self.round_dir("cfg") / "round.state.json"))
+        self.assertEqual(worker["acceptanceItems"], [])
         self.assertEqual((worker["task"], worker["round"], worker["phase"]), ("cfg", 1, False))
         self.assertEqual(worker["python"], sys.executable)
         self.assertEqual(worker["checksDir"], str(self.round_dir("cfg") / "round.checks"))

@@ -65,7 +65,8 @@ for (const step of scenario.steps) {
 			if (!tool) {
 				out.push({ error: `no tool ${step.name}` });
 			} else {
-				out.push(await tool.execute(`call-${++counter}`, structuredClone(step.params ?? {}), undefined, undefined, ctx));
+				const callId = typeof step.toolCallId === "string" ? step.toolCallId : `call-${++counter}`;
+				out.push(await tool.execute(callId, structuredClone(step.params ?? {}), undefined, undefined, ctx));
 			}
 		} else if (step.op === "registered") {
 			out.push({ tools: [...tools.keys()].sort(), events: [...handlers.keys()].sort() });

@@ -26,6 +26,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+interface ContractItem {
+	id: string;
+	checkId?: string;
+	command: string;
+	targetedCommand?: string;
+	estimatedSeconds?: number;
+}
+
 interface WorkerConfig {
 	task: string;
 	round: number;
@@ -43,6 +51,10 @@ interface WorkerConfig {
 	settleQuotaPath: string | null;
 	roundDir: string;
 	contract: string;
+	/** When present, the check tool reads the real deadline from this round state file. */
+	deadlinePath?: string;
+	/** Acceptance item metadata for targeted repair and full-check admission. */
+	acceptanceItems?: ContractItem[];
 }
 
 interface Verdict {
@@ -79,6 +91,32 @@ export function loadConfig(file: string | undefined): WorkerConfig {
 		}
 	}
 	if (!Number.isInteger(data.round) || data.round < 1) throw new Error("worker config round is invalid");
+	if (data.deadlinePath !== undefined
+		&& (typeof data.deadlinePath !== "string" || data.deadlinePath.length === 0)) {
+		throw new Error("worker config field deadlinePath is invalid");
+	}
+	if (data.acceptanceItems !== undefined) {
+		if (!Array.isArray(data.acceptanceItems)) throw new Error("worker config field acceptanceItems is invalid");
+		for (const item of data.acceptanceItems) {
+			if (typeof item !== "object" || item === null || typeof item.id !== "string" || !ID_RE.test(item.id)
+				|| typeof item.command !== "string" || item.command.length === 0) {
+				throw new Error("worker config acceptanceItems entry is invalid");
+			}
+			const entry = item as ContractItem;
+			if (entry.checkId !== undefined && (typeof entry.checkId !== "string" || !ID_RE.test(entry.checkId))) {
+				throw new Error("worker config acceptanceItems checkId is invalid");
+			}
+			if (entry.targetedCommand !== undefined
+				&& (typeof entry.targetedCommand !== "string" || entry.targetedCommand.length === 0)) {
+				throw new Error("worker config acceptanceItems targetedCommand is invalid");
+			}
+			if (entry.estimatedSeconds !== undefined
+				&& (typeof entry.estimatedSeconds !== "number" || !Number.isFinite(entry.estimatedSeconds)
+					|| entry.estimatedSeconds <= 0)) {
+				throw new Error("worker config acceptanceItems estimatedSeconds is invalid");
+			}
+		}
+	}
 	return data as WorkerConfig;
 }
 
@@ -204,6 +242,22 @@ export function normalizeCodemode(code: string, cfg: WorkerConfig): string {
 	const timeoutMs = Math.min(requestedTimeout ?? defaultMs, ceilingMs);
 	const maxOutputTokens = Math.min(requestedOutput ?? CODEMODE_MAX_OUTPUT_TOKENS, CODEMODE_MAX_OUTPUT_TOKENS);
 	return `${CODEMODE_OPTIONS_PREFIX} ${JSON.stringify({ max_output_tokens: maxOutputTokens, timeout_ms: timeoutMs })}\n${body}`;
+}
+
+export function codemodeTimeoutMs(code: string): number | null {
+	const first = code.split("\n", 1)[0].trimStart();
+	if (!first.startsWith(CODEMODE_OPTIONS_PREFIX)) return null;
+	try {
+		const parsed = JSON.parse(first.slice(CODEMODE_OPTIONS_PREFIX.length).trim());
+		if (parsed && typeof parsed === "object" && typeof (parsed as { timeout_ms?: unknown }).timeout_ms === "number"
+			&& Number.isFinite((parsed as { timeout_ms: number }).timeout_ms)
+			&& (parsed as { timeout_ms: number }).timeout_ms > 0) {
+			return (parsed as { timeout_ms: number }).timeout_ms;
+		}
+	} catch {
+		// normalizeCodemode always emits valid JSON; an unreadable value stays unknown
+	}
+	return null;
 }
 
 /** Decide one tool call. Throws on anything it cannot decide (the caller blocks). */
@@ -340,6 +394,109 @@ interface RunResult {
 	timedOut: boolean;
 }
 
+const CHECK_RESERVE_SECONDS = 60;
+const CODEMODE_GRACE_SECONDS = 0.5;
+const MAX_ROUND_STATE_BYTES = 65_536;
+const CLEAN_STATUS_TIMEOUT_MS = 30_000;
+
+function positiveFinite(value: unknown): number | null {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function roundSeconds(value: number): number {
+	return Math.round(value * 1000) / 1000;
+}
+
+/** Contract items whose declared command normalizes to exactly the requested argv. */
+function matchingItems(cfg: WorkerConfig, argv: string[]): ContractItem[] {
+	if (!Array.isArray(cfg.acceptanceItems)) return [];
+	const matches: ContractItem[] = [];
+	for (const item of cfg.acceptanceItems) {
+		let declared: string[];
+		try {
+			declared = shlexSplit(item.command);
+		} catch {
+			continue; // an unparseable contract command cannot match a parsed argv
+		}
+		if (declared.length === argv.length && declared.every((token, index) => token === argv[index])) {
+			matches.push(item);
+		}
+	}
+	return matches;
+}
+
+/** The single targeted-command suggestion for one normalized argv, or a contradiction. */
+function targetedAdvice(matches: ContractItem[]): { targeted: string | null; problem: string | null } {
+	let targeted: string | null = null;
+	for (const item of matches) {
+		if (item.targetedCommand === undefined) continue;
+		if (targeted !== null && targeted !== item.targetedCommand) {
+			return { targeted: null, problem: "the matched items declare contradictory targetedCommand values" };
+		}
+		targeted = item.targetedCommand;
+	}
+	return { targeted, problem: null };
+}
+
+/** Largest declared estimate across the matched items; a malformed entry fails closed. */
+function contractEstimate(matches: ContractItem[]): { value: number | null; problem: string | null } {
+	let value: number | null = null;
+	for (const item of matches) {
+		if (item.estimatedSeconds === undefined) continue;
+		const candidate = positiveFinite(item.estimatedSeconds);
+		if (candidate === null) return { value: null, problem: `item ${item.id}` };
+		if (value === null || candidate > value) value = candidate;
+	}
+	return { value, problem: null };
+}
+
+/** The real round deadline, re-read from round.state.json before every admitted check. */
+function readBudgetState(cfg: WorkerConfig): { ok: true; remainingSeconds: number } | { ok: false; reason: string } {
+	const deadlinePath = cfg.deadlinePath as string;
+	let raw: string;
+	try {
+		const stat = fs.statSync(deadlinePath);
+		if (!stat.isFile() || stat.size > MAX_ROUND_STATE_BYTES) {
+			return { ok: false, reason: "budget_unknown: the round state is not a bounded regular file" };
+		}
+		raw = fs.readFileSync(deadlinePath, "utf8");
+	} catch (error) {
+		return { ok: false, reason: `budget_unknown: cannot read the round state: ${String(error)}` };
+	}
+	let state: Record<string, unknown>;
+	try {
+		state = JSON.parse(raw);
+	} catch {
+		return { ok: false, reason: "budget_unknown: the round state is not valid JSON" };
+	}
+	if (!state || typeof state !== "object") {
+		return { ok: false, reason: "budget_unknown: the round state is not an object" };
+	}
+	if (state.round !== cfg.round) {
+		return { ok: false, reason: `budget_unknown: the round state identifies round ${String(state.round)}, not ${cfg.round}` };
+	}
+	const taskDir = path.resolve(path.join(cfg.roundDir, "..", ".."));
+	if (typeof state.taskDir !== "string" || path.resolve(state.taskDir) !== taskDir) {
+		return { ok: false, reason: "budget_unknown: the round state task identity is missing or does not match" };
+	}
+	const deadlineAt = state.deadlineAt;
+	if (typeof deadlineAt !== "number" || !Number.isFinite(deadlineAt) || deadlineAt <= 0) {
+		return { ok: false, reason: "budget_unknown: the round state deadlineAt is missing or not a finite number" };
+	}
+	return { ok: true, remainingSeconds: Math.max(0, deadlineAt - Date.now() / 1000) };
+}
+
+async function worktreeClean(cfg: WorkerConfig, signal?: AbortSignal): Promise<{ ok: boolean; reason?: string }> {
+	const result = await run("git", ["status", "--porcelain"], cfg.worktree, signal, CLEAN_STATUS_TIMEOUT_MS);
+	if (result.timedOut || result.code === null || result.code !== 0) {
+		return { ok: false, reason: `cannot verify the worktree is clean (${result.timedOut ? "git status timed out" : `exit ${result.code}`})` };
+	}
+	if (result.stdout.trim() !== "") {
+		return { ok: false, reason: "the worktree has uncommitted or untracked changes; commit the final candidate first" };
+	}
+	return { ok: true };
+}
+
 function run(cmd: string, args: string[], cwd: string, signal?: AbortSignal, limitMs = 0): Promise<RunResult> {
 	return new Promise((resolve) => {
 		let stdout = "";
@@ -386,6 +543,12 @@ function checkStructured(id: string, ok: boolean, patch: Record<string, unknown>
 		test_counts: null, log_tail: null, error: null, ...patch };
 }
 
+/** Structured refusal: no child, no receipt, no fake success evidence. */
+function refuseCheck(id: string, reason: string, patch: Record<string, unknown> = {}) {
+	return textResult(`check ${id}: refused ${reason}`, {}, checkStructured(id, false,
+		{ receipt: null, error: reason, reason, ...patch }), true);
+}
+
 const CHECK_OUTPUT_SCHEMA = {
 	type: "object",
 	properties: {
@@ -394,6 +557,14 @@ const CHECK_OUTPUT_SCHEMA = {
 		cancelled: { type: "boolean" }, receipt: { type: ["string", "null"] },
 		test_counts: { type: ["object", "null"] }, log_tail: { type: ["string", "null"] },
 		error: { type: ["string", "null"] },
+		reason: { type: ["string", "null"] },
+		remainingSeconds: { type: ["number", "null"] },
+		requiredSeconds: { type: ["number", "null"] },
+		reserveSeconds: { type: ["number", "null"] },
+		elapsedSeconds: { type: ["number", "null"] },
+		estimateSource: { type: ["string", "null"] },
+		targetedCommand: { type: ["string", "null"] },
+		codemodeRemainingSeconds: { type: ["number", "null"] },
 	},
 	required: ["id", "ok", "exit_code", "timed_out", "cancelled"],
 } as never;
@@ -431,6 +602,7 @@ function writeReady(cfg: WorkerConfig, version: string): void {
 
 export default async function (pi: ExtensionAPI) {
 	let cfg: WorkerConfig | null = null;
+	const codemodeDeadlines = new Map<string, number>();
 	try {
 		// The load proof is written only after the native codemode tool registered: a Pi without
 		// the public export, or a failing registration, must not let the round claim it loaded.
@@ -448,8 +620,25 @@ export default async function (pi: ExtensionAPI) {
 		const nested = Boolean((event as { parentToolCallId?: unknown }).parentToolCallId);
 		try {
 			if (!cfg) return { block: true, reason: "undecidable: worker configuration is unavailable; blocked" };
-			const verdict = judge(toolName, (event as { input: Record<string, unknown> }).input, cfg, nested);
-			if (!verdict.block) return undefined;
+			const input = (event as { input: Record<string, unknown> }).input;
+			const verdict = judge(toolName, input, cfg, nested);
+			if (!verdict.block) {
+				if (toolName === CODEMODE_TOOL) {
+					// The codemode tool_call is the only place the extension's own outer deadline is
+					// observable; remember it so a nested check is admitted inside that envelope or
+					// refused as unverifiable instead of being killed by the script timeout.
+					const timeoutMs = codemodeTimeoutMs(String(input.code));
+					if (timeoutMs !== null) {
+						codemodeDeadlines.set(String((event as { toolCallId?: unknown }).toolCallId),
+							Date.now() + timeoutMs);
+						if (codemodeDeadlines.size > 64) {
+							const oldest = codemodeDeadlines.keys().next().value;
+							if (oldest !== undefined) codemodeDeadlines.delete(oldest);
+						}
+					}
+				}
+				return undefined;
+			}
 			logBlock(cfg, toolName, verdict);
 			return { block: true, reason: verdict.reason };
 		} catch (error) {
@@ -502,7 +691,11 @@ export default async function (pi: ExtensionAPI) {
 		label: "Check",
 		description:
 			"Run a verification command through the task's frozen pi_check helper and record an immutable receipt. " +
-			"Use this for every acceptance check. Returns exit code, test counts and, on failure, the log tail.",
+			"Use this for every acceptance check. Returns exit code, test counts and, on failure, the log tail. " +
+			"Before spawning, a check is refused when the real round deadline minus a 60s wrap-up reserve cannot cover " +
+			"the estimate (estimatedSeconds, else the declared cap); a command that matches a contract item with " +
+			"targetedCommand is a full acceptance check and requires final:true on a clean worktree. A refusal returns " +
+			"structured ok:false with receipt:null and never spawns or writes evidence.",
 		promptSnippet: "Run a recorded check (receipt-bound)",
 		parameters: {
 			type: "object",
@@ -510,6 +703,8 @@ export default async function (pi: ExtensionAPI) {
 				id: { type: "string", description: "Stable check id, letters, digits, '_' or '-'" },
 				command: { type: "string", description: "Command line, split like a POSIX shell without running a shell" },
 				timeoutSeconds: { type: "number", description: "Wrapper deadline in seconds (clamped to the task cap)" },
+				estimatedSeconds: { type: "number", description: "Finite positive planning estimate; never a completion guarantee" },
+				final: { type: "boolean", description: "Set true only for a full acceptance command with targetedCommand on a clean worktree" },
 				watchPath: { type: "string", description: "Directory whose byte budget is guarded" },
 				maxBytes: { type: "number", description: "Byte budget for watchPath (required with it)" },
 			},
@@ -517,7 +712,7 @@ export default async function (pi: ExtensionAPI) {
 			additionalProperties: false,
 		} as never,
 		outputSchema: CHECK_OUTPUT_SCHEMA,
-		async execute(_id: string, params: any, signal: AbortSignal | undefined) {
+		async execute(toolCallId: string, params: any, signal: AbortSignal | undefined) {
 			if (!cfg) {
 				const error = "worker configuration is unavailable";
 				return textResult(error, {}, checkStructured("", false, { error }), true);
@@ -537,9 +732,95 @@ export default async function (pi: ExtensionAPI) {
 			if (argv.length === 0) {
 				return textResult("empty command", {}, checkStructured(checkId, false, { error: "empty command" }), true);
 			}
-			let timeout = cfg.checkTimeoutSeconds;
+			let requested = cfg.checkTimeoutSeconds;
 			if (typeof params.timeoutSeconds === "number" && Number.isFinite(params.timeoutSeconds) && params.timeoutSeconds > 0) {
-				timeout = Math.min(params.timeoutSeconds, cfg.checkTimeoutSeconds);
+				requested = Math.min(params.timeoutSeconds, cfg.checkTimeoutSeconds);
+			}
+			let callEstimate: number | null = null;
+			if (params.estimatedSeconds !== undefined) {
+				callEstimate = positiveFinite(params.estimatedSeconds);
+				if (callEstimate === null) {
+					return refuseCheck(checkId, "invalid_estimate: estimatedSeconds must be a finite positive number");
+				}
+			}
+			if (params.final !== undefined && typeof params.final !== "boolean") {
+				return refuseCheck(checkId, "invalid_final: final must be a boolean");
+			}
+			const matches = matchingItems(cfg, argv);
+			const advice = targetedAdvice(matches);
+			if (advice.problem !== null) {
+				return refuseCheck(checkId, `contract_metadata: ${advice.problem}`);
+			}
+			if (advice.targeted !== null) {
+				if (params.final !== true) {
+					return refuseCheck(checkId,
+						`final_required: this is a full acceptance command; run the targeted check first (${advice.targeted}) ` +
+						"and pass final:true only on the clean final candidate",
+						{ targetedCommand: advice.targeted });
+				}
+				const clean = await worktreeClean(cfg, signal);
+				if (!clean.ok) {
+					return refuseCheck(checkId, `dirty_final: ${clean.reason}`,
+						{ targetedCommand: advice.targeted });
+				}
+			}
+			let timeout = requested;
+			let budgetPatch: Record<string, unknown> = {};
+			if (typeof cfg.deadlinePath === "string") {
+				const state = readBudgetState(cfg);
+				if (!state.ok) return refuseCheck(checkId, state.reason);
+				const remainingSeconds = state.remainingSeconds;
+				const available = remainingSeconds - CHECK_RESERVE_SECONDS;
+				const estimate = contractEstimate(matches);
+				if (estimate.problem !== null) {
+					return refuseCheck(checkId, `invalid_estimate: the contract estimate for ` +
+						`${estimate.problem} is not a finite positive number`);
+				}
+				const values = [callEstimate, estimate.value].filter((value): value is number => value !== null);
+				const requiredSeconds = values.length > 0 ? Math.max(...values) : requested;
+				const estimateSource = callEstimate !== null && estimate.value !== null ? "contract+call"
+					: callEstimate !== null ? "call" : estimate.value !== null ? "contract" : "timeout";
+				if (available < requiredSeconds) {
+					return refuseCheck(checkId,
+						`insufficient_budget: ${roundSeconds(remainingSeconds)}s remain minus a ` +
+						`${CHECK_RESERVE_SECONDS}s reserve, below the required ${roundSeconds(requiredSeconds)}s`,
+						{ remainingSeconds: roundSeconds(remainingSeconds),
+							requiredSeconds: roundSeconds(requiredSeconds), reserveSeconds: CHECK_RESERVE_SECONDS });
+				}
+				let effective = Math.min(requested, available);
+				const separator = toolCallId.indexOf("/");
+				if (separator > 0) {
+					// A nested check runs inside the codemode script's outer deadline, which the
+					// native context does not expose directly. This extension recorded its own
+					// normalized timeout at the parent tool_call; without that record the envelope
+					// is unverifiable and the check must run directly instead.
+					const outerDeadline = codemodeDeadlines.get(toolCallId.slice(0, separator));
+					if (outerDeadline === undefined) {
+						return refuseCheck(checkId,
+							"codemode_deadline_unknown: a check from codemode has no verifiable outer deadline; " +
+							"run it directly with the check tool",
+							{ requiredSeconds: roundSeconds(requiredSeconds), reserveSeconds: CHECK_RESERVE_SECONDS });
+					}
+					const outerRemaining = Math.max(0, (outerDeadline - Date.now()) / 1000);
+					const outerBudget = outerRemaining - CODEMODE_GRACE_SECONDS;
+					if (outerBudget < requiredSeconds) {
+						return refuseCheck(checkId,
+							`codemode_deadline_too_short: ${roundSeconds(outerRemaining)}s remain in the codemode ` +
+							`script but ${roundSeconds(requiredSeconds)}s are required; run it directly with the check tool`,
+							{ remainingSeconds: roundSeconds(remainingSeconds),
+								requiredSeconds: roundSeconds(requiredSeconds), reserveSeconds: CHECK_RESERVE_SECONDS,
+								codemodeRemainingSeconds: roundSeconds(outerRemaining) });
+					}
+					effective = Math.min(effective, outerBudget);
+				}
+				timeout = Math.floor(effective);
+				if (timeout < 1) {
+					return refuseCheck(checkId,
+						"insufficient_budget: less than one second of executable timeout remains after the reserve",
+						{ remainingSeconds: roundSeconds(remainingSeconds),
+							requiredSeconds: roundSeconds(requiredSeconds), reserveSeconds: CHECK_RESERVE_SECONDS });
+				}
+				budgetPatch = { requiredSeconds: roundSeconds(requiredSeconds), estimateSource };
 			}
 			const args = [path.join(cfg.toolsDir, "pi_check.py"), "--output-dir", cfg.checksDir, "--id", checkId,
 				"--timeout-seconds", String(timeout)];
@@ -551,12 +832,14 @@ export default async function (pi: ExtensionAPI) {
 				args.push("--watch-path", params.watchPath, "--max-bytes", String(Math.trunc(params.maxBytes)));
 			}
 			args.push("--", ...argv);
+			const startedAt = Date.now();
 			const result = await run(cfg.python, args, cfg.worktree, signal);
+			const elapsedSeconds = roundSeconds((Date.now() - startedAt) / 1000);
 			const summary = lastJson(result.stdout);
 			if (!summary) {
 				const error = `pi_check produced no receipt summary (exit ${result.code}): ${result.stderr.slice(-500)}`;
 				return textResult(error, { code: result.code },
-					checkStructured(checkId, false, { exit_code: result.code, error }), true);
+					checkStructured(checkId, false, { exit_code: result.code, error, elapsedSeconds }), true);
 			}
 			const failed = summary.exit_code !== 0 || summary.timed_out === true || summary.cancelled === true;
 			const structured = checkStructured(checkId, !failed, {
@@ -566,10 +849,12 @@ export default async function (pi: ExtensionAPI) {
 				test_counts: summary.test_counts && typeof summary.test_counts === "object" ? summary.test_counts : null,
 				log_tail: typeof summary.log_tail === "string" ? summary.log_tail : null,
 				error: failed ? (summary.timed_out ? "timed_out" : summary.cancelled ? "cancelled" : `exit ${summary.exit_code}`) : null,
+				elapsedSeconds,
+				...budgetPatch,
 			});
 			const counts = summary.test_counts && typeof summary.test_counts === "object"
 				? ` counts=${JSON.stringify(summary.test_counts)}` : "";
-			const lines = [`check ${params.id}: exit=${summary.exit_code}${summary.timed_out ? " TIMED_OUT" : ""}${summary.cancelled ? " CANCELLED" : ""}${counts}`,
+			const lines = [`check ${params.id}: exit=${summary.exit_code}${summary.timed_out ? " TIMED_OUT" : ""}${summary.cancelled ? " CANCELLED" : ""}${counts} elapsed=${elapsedSeconds}s`,
 				`receipt=${summary.receipt}`];
 			if (typeof summary.log_tail === "string") lines.push("log_tail:", summary.log_tail);
 			return textResult(lines.join("\n"), summary, structured, failed);

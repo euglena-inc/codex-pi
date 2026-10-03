@@ -27,7 +27,7 @@ Done before the first dispatch, reused on every delivery, updated before takeove
 - From source, establish the real entrypoints, data forms and state/ordering/restart sequences a shared rule touches, including async error returns and revalidation after waits. Missing or unknown coverage is not a pass. A shared rule has one owner and one implementation, proven through its public interface first.
 - Where an evaluator controls acceptance, calibrate it against independent expected facts (authorized real records plus corrupted, missing or stale variants) first; prior records are calibration, not proof for the candidate.
 - Fix behavior, constraints, evidence and the blocking standard before dispatch. A violation or missing evidence blocks acceptance; unrelated improvements are follow-up.
-- Reconcile scope against actual Git changes (plan files, dirty and untracked work included) at dispatch and delivery. Reuse valid evidence; a relevant failure or changed candidate reruns the affected checks; full regression and real acceptance run once on the exact combined candidate.
+- Reconcile scope against actual Git changes (plan files, dirty and untracked work included) at dispatch and delivery. Reuse valid evidence; a relevant failure or changed candidate reruns the affected checks; full regression and real acceptance run once on the exact combined candidate. The runtime refuses a check that cannot fit the real remaining budget minus a fixed 60s wrap-up reserve, and requires `final:true` on a clean tree for a full command that declares a `targetedCommand`; targeted runs are local repair only and never substitute for acceptance.
 
 ## One or two Pi outcomes
 

@@ -57,7 +57,7 @@ Delete lines that do not apply; do not paste repository rules. Dispatch through 
 
 ## Mapping to the contract
 
-Fields of `runtime/pi_phase.py`: `phaseId`, `goal`, `result`, `baseline`, `scope`, `designRef` + `designSha256` (a real worktree file), `acceptanceItems[]` (`id`, `description`, `checkId`, `command`, `passCondition`, `evidence`, optional `minRun`, `forbidSkip`), `budgetSeconds`, `commandTimeoutSeconds`, `resourceLimits`, `autonomousRepair`, `escalateWhen`. Commands must be real; an unbuilt gate is part of the deliverable, never a placeholder PASS. Check before dispatch: spec and contract share goal and boundary, inputs exist, pass conditions are falsifiable.
+Fields of `runtime/pi_phase.py`: `phaseId`, `goal`, `result`, `baseline`, `scope`, `designRef` + `designSha256` (a real worktree file), `acceptanceItems[]` (`id`, `description`, `checkId`, `command`, `passCondition`, `evidence`, optional `minRun`, `forbidSkip`, `targetedCommand`, `estimatedSeconds`), `budgetSeconds`, `commandTimeoutSeconds`, `resourceLimits`, `autonomousRepair`, `escalateWhen`. Commands must be real; an unbuilt gate is part of the deliverable, never a placeholder PASS. `targetedCommand` is only a local repair suggestion and never substitutes for the formal `command`; `estimatedSeconds` is a finite positive planning estimate, not a completion guarantee. Before dispatch: spec and contract share goal and boundary, inputs exist, pass conditions are falsifiable.
 
 ## Delivery format
 

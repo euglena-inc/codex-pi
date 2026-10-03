@@ -66,7 +66,7 @@ CONTRACT_KEYS = (
     "resourceLimits", "autonomousRepair", "escalateWhen", "preconditions", "nextPhaseRef",
 )
 ITEM_KEYS = ("id", "description", "checkId", "command", "passCondition", "evidence",
-             "minRun", "forbidSkip")
+             "minRun", "forbidSkip", "targetedCommand", "estimatedSeconds")
 
 
 def _text(value, limit: int, label: str, required: bool = True) -> str:
@@ -198,7 +198,20 @@ def validate_contract(data, root, check_design: bool = True) -> dict:
         forbid_skip = item.get("forbidSkip", False)
         if not isinstance(forbid_skip, bool):
             raise ValueError(f"phase contract acceptanceItems[{index}].forbidSkip must be a boolean")
-        normalized_items.append({
+        targeted = item.get("targetedCommand")
+        if targeted is not None:
+            targeted = _text(targeted, MAX_LIST_TEXT,
+                             f"acceptanceItems[{index}].targetedCommand")
+        estimate = item.get("estimatedSeconds")
+        if estimate is not None:
+            if isinstance(estimate, bool) or not isinstance(estimate, (int, float)) \
+                    or not math.isfinite(float(estimate)) \
+                    or not 0 < float(estimate) <= MAX_COMMAND_TIMEOUT_SECONDS:
+                raise ValueError(f"phase contract acceptanceItems[{index}].estimatedSeconds must be "
+                                 "a finite positive number at most "
+                                 f"{int(MAX_COMMAND_TIMEOUT_SECONDS)}")
+            estimate = float(estimate)
+        normalized = {
             "id": item_id,
             "checkId": check_id,
             "description": _text(item.get("description"), MAX_TEXT,
@@ -211,7 +224,30 @@ def validate_contract(data, root, check_design: bool = True) -> dict:
                               f"acceptanceItems[{index}].evidence"),
             "minRun": min_run,
             "forbidSkip": forbid_skip,
-        })
+        }
+        # Optional fields stay absent when undeclared so the canonical hash of an
+        # older contract does not change under this runtime.
+        if targeted is not None:
+            normalized["targetedCommand"] = targeted
+        if estimate is not None:
+            normalized["estimatedSeconds"] = estimate
+        normalized_items.append(normalized)
+    # One normalized argv must never carry contradictory budget/targeted advice:
+    # the check path matches commands by argv, not by id, so ambiguity is rejected
+    # at contract freeze time instead of guessed at execution time.
+    canonical_argv = {}
+    for index, item in enumerate(normalized_items):
+        try:
+            argv = tuple(shlex.split(item["command"], posix=True))
+        except ValueError:
+            continue
+        metadata = (item.get("targetedCommand"), item.get("estimatedSeconds"))
+        previous = canonical_argv.get(argv)
+        if previous is not None and previous[1] != metadata:
+            raise ValueError(f"phase contract acceptanceItems[{previous[0]}] and "
+                             f"acceptanceItems[{index}] normalize to the same command with "
+                             "contradictory targetedCommand/estimatedSeconds metadata")
+        canonical_argv[argv] = (index, metadata)
     budget = data.get("budgetSeconds")
     if isinstance(budget, bool) or not isinstance(budget, (int, float)) \
             or not math.isfinite(float(budget)) or not 0 < float(budget) <= MAX_BUDGET_SECONDS:
@@ -310,6 +346,8 @@ def contract_view(contract: dict, limit: int = 20) -> dict:
             "description": item.get("description"), "command": item.get("command"),
             "passCondition": item.get("passCondition"), "evidence": item.get("evidence"),
             "minRun": item.get("minRun"), "forbidSkip": item.get("forbidSkip"),
+            "targetedCommand": item.get("targetedCommand"),
+            "estimatedSeconds": item.get("estimatedSeconds"),
         } for item in items[:limit]],
         "acceptanceItemCount": len(items),
     }
