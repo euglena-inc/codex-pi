@@ -1132,13 +1132,21 @@ export default async function (pi: ExtensionAPI) {
 		label: "Check",
 		description:
 			"Run a verification command through the task's frozen pi_check helper and record an immutable receipt. " +
-			"Use this for every acceptance check. Returns exit code, test counts and, on failure, the log tail. " +
-			"Before spawning, the final effective window is computed from the requested/contract cap, the real round " +
-			"deadline minus a 60s wrap-up reserve, and a verifiable codemode outer deadline; a check is refused when " +
-			"the estimate (estimatedSeconds, else the declared cap) exceeds that window, and the admitted helper " +
-			"timeout is the window itself with fractional seconds kept. A command that matches a contract item with " +
-			"targetedCommand is a full acceptance check and requires final:true on a clean worktree. A refusal returns " +
-			"structured ok:false with receipt:null and never spawns or writes evidence.",
+			"Use this tool for every acceptance check. The receipt binds the actual command, exit code, log hash, " +
+			"candidate HEAD and dirty state. The tool returns the exit code, test counts and, on failure, the log " +
+			"tail. Failed checks keep their receipts; admission refusals return structured ok:false with " +
+			"receipt:null and never spawn or write evidence. The required " +
+			"duration is the larger of your call estimate and the estimate declared on the matching acceptance " +
+			"item(s), or the requested/contract cap when neither estimate exists. Before spawning, the effective " +
+			"window is limited " +
+			"by the requested/contract cap, the real round deadline minus a 60s wrap-up reserve, and a verifiable " +
+			"enclosing codemode deadline minus cleanup grace. A check is refused when the requirement exceeds that " +
+			"window; the refusal reports requiredSeconds and allowedSeconds, and the admitted helper timeout is " +
+			"that window itself with fractional seconds kept. A command that " +
+			"matches a contract item with targetedCommand is a full acceptance check and requires final:true on a " +
+			"clean worktree; targetedCommand is optional. A nested check needs a verifiable codemode deadline; " +
+			"without one, run the check directly. Never invent a smaller estimate and never expand authorization " +
+			"to fit the window.",
 		promptSnippet: "Run a recorded check (receipt-bound)",
 		parameters: {
 			type: "object",
@@ -1146,8 +1154,8 @@ export default async function (pi: ExtensionAPI) {
 				id: { type: "string", description: "Stable check id, letters, digits, '_' or '-'" },
 				command: { type: "string", description: "Command line, split like a POSIX shell without running a shell" },
 				timeoutSeconds: { type: "number", description: "Wrapper deadline in seconds (clamped to the task cap)" },
-				estimatedSeconds: { type: "number", description: "Finite positive planning estimate; never a completion guarantee" },
-				final: { type: "boolean", description: "Set true only for a full acceptance command with targetedCommand on a clean worktree" },
+				estimatedSeconds: { type: "number", description: "Finite positive planning estimate, not a completion guarantee; the larger of this and a matching contract item estimate must fit the effective window" },
+				final: { type: "boolean", description: "Set true only for a full acceptance command with targetedCommand on a clean worktree; other contract commands do not need it" },
 				watchPath: { type: "string", description: "Directory whose byte budget is guarded" },
 				maxBytes: { type: "number", description: "Byte budget for watchPath (required with it)" },
 			},
@@ -1345,7 +1353,7 @@ export default async function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "progress",
 		label: "Progress",
-		description: "Record a short structured progress report (self-report only; never acceptance, never queued).",
+		description: "Record a short structured self-report. Progress is self-reported; it is never acceptance and is never queued.",
 		promptSnippet: "Record structured progress",
 		parameters: {
 			type: "object",
@@ -1385,7 +1393,7 @@ export default async function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "readiness",
 		label: "Readiness",
-		description: "Mechanical delivery check of the phase contract against recorded receipts (read-only; never acceptance).",
+		description: "Read-only mechanical review of the phase contract against recorded receipts. Readiness is evidence review; it is never acceptance.",
 		promptSnippet: "Check delivery readiness",
 		parameters: { type: "object", properties: {}, additionalProperties: false } as never,
 		outputSchema: READINESS_OUTPUT_SCHEMA,

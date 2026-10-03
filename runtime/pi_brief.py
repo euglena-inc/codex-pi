@@ -23,10 +23,10 @@ from pi_phase import phase_path, read_phase_record, settle_quota_path
 
 
 FORBIDDEN_RULE_TEXT = ("Do not reference the repository's main checkout or another worktree of this "
-                       "repository in any tool call: the worker guard blocks such a call (rule "
-                       "forbidden-path). Use only your round worktree.")
+                       "repository in any tool call. The worker guard blocks such a call with rule "
+                       "`forbidden-path`. Use only your round worktree.")
 MUST_ASK_LINE = ("If the brief leaves a must-ask item open (see task packet), choose the conservative "
-                 "reading and report it as a spec gap.")
+                 "reading. Report the open item as a spec gap.")
 
 
 def compose_brief(task: dict, round_number: int, prompt: str, prior: dict | None) -> str:
@@ -37,21 +37,22 @@ def compose_brief(task: dict, round_number: int, prompt: str, prior: dict | None
     round_dir = task_dir / "rounds" / str(round_number)
     lines = ["---", "## Codex-Pi round header",
              f"task={task['task']} round={round_number}",
-             "The worker contract (model policy, tools, boundaries, phase contract) is the system "
-             f"prompt section codex_pi_worker, also in {round_dir / 'contract.md'}; it applies to "
-             "every round of this session."]
+             "The worker contract is the system prompt section codex_pi_worker. It covers model "
+             "policy, tools, boundaries and the phase contract. The same contract is also in "
+             f"{round_dir / 'contract.md'}. It applies to every round of this session."]
     if round_number > 1:
         lines.append(f"Round-1 brief: {task_dir / 'rounds' / '1' / 'brief.md'}")
-    lines += ["Use the native tools `check` (recorded checks), `progress`, `readiness` and "
-              "`codemode` (batch independent reads/checks; nested calls are guarded).",
-              f'Only "{tools_dir}" and "{round_dir / "round.checks"}" may be written '
-              "outside the worktree.",
+    lines += ["Use the native tools `check` for recorded checks, `progress` for self-reports, "
+              "`readiness` for the mechanical delivery check, and `codemode` to batch independent "
+              "reads and checks. Every nested call is guarded.",
+              f'You may write only "{tools_dir}" and "{round_dir / "round.checks"}" outside '
+              "the worktree.",
               FORBIDDEN_RULE_TEXT]
     if prior:
         lines.append(f"Previous round {prior.get('round')}: outcome={prior.get('state')} "
-                     f"exit={prior.get('exitCode')} head={prior.get('endHead')}; execution "
-                     "evidence only, read its summary before continuing.")
-    lines.append("End with a concise report; never claim acceptance PASS.")
+                     f"exit={prior.get('exitCode')} head={prior.get('endHead')}. That record is "
+                     "execution evidence only; read its summary before continuing.")
+    lines.append("End with a concise report. Never claim acceptance PASS.")
     return prompt.rstrip() + "\n\n" + "\n".join(lines) + "\n"
 
 
@@ -74,14 +75,14 @@ def compose_contract(task: dict) -> str:
     from pi_recovery import runtime_tools
     tools_dir = runtime_tools(task_dir)
     lines = ["## Codex-Pi worker contract",
-             "Do not execute the Codex CLI (`codex`), launch any Codex agent, or call an OpenAI "
-             "model through Codex. The Codex main session reviews outcomes; this Pi session "
-             "implements and reports.",
-             f"Model policy: this task is pinned to `{task['model']}`. Do not call, delegate to, "
-             "or spawn any nested agent/model on another provider or model, and do not fall back "
-             "automatically. If the pinned model is unavailable, stop and report it.",
-             f"Mode: {'read-only' if read_only else 'writable'}; allowed tools: {tools}. This is a "
-             "worker guard, not a security sandbox.",
+             "Do not execute the Codex CLI (`codex`). Do not launch any Codex agent. Do not "
+             "call an OpenAI model through Codex. The Codex main session reviews outcomes. "
+             "This Pi session implements and reports.",
+             f"Model policy: this task is pinned to `{task['model']}`. Do not call, delegate "
+             "to, or spawn any nested agent or model on another provider or model. Do not fall "
+             "back automatically. If the pinned model is unavailable, stop and report it.",
+             f"Mode: {'read-only' if read_only else 'writable'}. Allowed tools: {tools}. This "
+             "is a worker guard. It is not a security sandbox and not an OS sandbox.",
              "Applicable AGENTS.md files discovered from the worktree remain authoritative. "
              "Prompt templates, skills and project extensions are disabled."]
     constraints = task.get("constraints") or []
@@ -128,10 +129,11 @@ def compose_contract(task: dict) -> str:
             lines.append(f"    command: {item.get('command')}")
             if item.get("targetedCommand"):
                 lines.append(f"    targeted_command: {item.get('targetedCommand')} "
-                             "(local repair suggestion; never substitutes for the formal command)")
+                             "(optional local repair suggestion; a targeted check never "
+                             "substitutes for formal acceptance)")
             if item.get("estimatedSeconds") is not None:
                 lines.append(f"    estimated_seconds: {item.get('estimatedSeconds')} "
-                             "(planning estimate, not a completion guarantee)")
+                             "(planning estimate only; not a completion guarantee)")
             resources = item.get("checkResources")
             if resources:
                 parts = [f"parallel_safe={bool(resources.get('parallelSafe'))}"]
@@ -142,59 +144,75 @@ def compose_contract(task: dict) -> str:
                 if resources.get("exclusiveKeys"):
                     parts.append(f"exclusive_keys={','.join(resources.get('exclusiveKeys'))}")
                 lines.append("    resources: " + " ".join(parts)
-                             + " (soft pool estimate; undeclared or parallel_safe=false runs alone)")
+                             + " (soft pool estimate; a check with no declaration or "
+                               "parallel_safe=false runs alone)")
             lines.append(f"    pass_condition: {item.get('passCondition')}")
             lines.append(f"    evidence: {item.get('evidence')}")
         lines.append("autonomous_repair:")
         lines += [f"  - {entry}" for entry in contract.get("autonomousRepair") or []]
         lines.append("escalate_when:")
         lines += [f"  - {entry}" for entry in contract.get("escalateWhen") or []]
-        lines.append("Rules: stay inside the declared scope and the phase budget; run every "
-                     "acceptance check through the `check` tool with the item's exact command so "
-                     "the receipt binds the candidate. Run the item's targetedCommand for local "
-                     "repair first, commit the fixed candidate, and reserve time for the full "
-                     "acceptance command with final:true on the clean tree; a targeted run never "
-                     "replaces formal acceptance. When the round ends with only evidence "
-                     "missing you may be asked once to continue in this same session.")
+        lines.append("Rules: stay inside the declared scope and the phase budget. Run every "
+                     "acceptance check through the `check` tool with the item's exact command, "
+                     "so the receipt binds the candidate. If an item declares targetedCommand, "
+                     "run that command for local repair first, then commit the fixed candidate. "
+                     "The item's formal command then needs final:true on the clean tree. A "
+                     "targeted check never substitutes for formal acceptance. When the round "
+                     "ends with only evidence missing, you may be asked once to continue in "
+                     "this same session.")
     elif phase_problem not in (None, "absent"):
-        lines.append(f"Phase contract state is {phase_problem}; treat phase-wide readiness as "
-                     "unknown and report it instead of inventing coverage.")
+        lines.append(f"Phase contract state is {phase_problem}. Treat phase-wide readiness as "
+                     "unknown. Report that state instead of inventing coverage.")
     lines += [
         "## Native tools",
         "- check(id, command, timeoutSeconds?, estimatedSeconds?, final?, watchPath?, maxBytes?): "
-        "run a verification command through the task's frozen pi_check helper; receipts capture "
-        "the true exit, log hash, HEAD and dirty state. A failing check returns the log tail. "
-        "estimatedSeconds is a finite positive planning estimate, never a completion guarantee; "
-        "without one the requested/contract cap is the conservative requirement. The final "
-        "effective window is the requested/contract cap, the real round deadline minus a fixed "
-        "60s wrap-up reserve, and a verifiable codemode outer deadline minus a small cleanup "
-        "grace; the requirement must fit that window, otherwise the check is refused with a "
-        "structured ok:false (requiredSeconds/allowedSeconds) without spawning. The admitted "
-        "helper timeout is that window itself and keeps fractional seconds. A long check is "
-        "never admitted inside a shorter codemode script. "
-        "A command whose argv equals a contract item with targetedCommand is a full acceptance "
-        "check: it is refused unless final:true is passed on a clean worktree, and the response "
-        "names the targeted command. Run cheap targeted checks first; reserve time for the full "
-        "checks and wrap-up.",
+        "run a verification command through the task's frozen pi_check helper. The receipt "
+        "binds the actual command, exit code, log hash, candidate HEAD and dirty state. A "
+        "failing check keeps its receipt and returns the log tail. An admission refusal spawns "
+        "no helper and writes no receipt. It returns a structured ok:false with receipt:null.",
+        "- check budget: estimatedSeconds is a finite positive planning estimate; it is never a "
+        "completion guarantee. The required duration is the larger of your call estimate and "
+        "the matching acceptance item's estimate. When neither estimate exists, the required "
+        "duration is the requested/contract cap. The effective window is limited by the "
+        "requested/"
+        "contract cap, the real round deadline minus a fixed 60s wrap-up reserve, and a "
+        "verifiable enclosing codemode deadline minus a small cleanup grace. The requirement "
+        "must fit that window; otherwise the check is refused with structured requiredSeconds "
+        "and allowedSeconds. The admitted helper timeout is that window itself and keeps "
+        "fractional seconds. Never propose a smaller estimate or expanded authorization to "
+        "fit a check. A long check is never admitted inside a shorter codemode script. Without "
+        "a verifiable enclosing codemode deadline, run the check directly.",
+        "- check final:true: a command whose argv equals a contract item that declares "
+        "targetedCommand is a full acceptance check. It is refused unless final:true is "
+        "passed on a clean worktree, and the response names the targeted command. "
+        "targetedCommand is optional; commands matching other contract items do not need "
+        "final:true. A targeted check never substitutes for formal acceptance. Run cheap "
+        "targeted checks first and reserve time for the full checks and wrap-up.",
         "- progress(activity, step?, next?, blocker?, completedCriteria?, evidenceRefs?): "
-        "self-reported progress, never acceptance.",
-        "- readiness(): read-only delivery check of the contract against the receipts.",
-        "- codemode(code): run JavaScript in the QuickJS sandbox. `tools.<name>(args)` calls the "
-        "same guarded tools; every nested call passes the same guard and a blocked call rejects. "
-        "Use `Promise.allSettled` to batch independent reads and checks, filter large output before "
-        "it reaches you, and await every call. Inspect the structured result (for example a failed "
-        "check still fulfils with exit/timeout data); resolve is not success. Parallel checks need "
-        "independent resources and unique ids; serialize dependent writes and commits. Only a "
-        "successful script keeps its `store`/`load` values, and completed calls are not undone. "
-        "Codemode does not make the shell guard an OS sandbox.",
-        "Every bash call has a finite timeout (a default is filled in and a ceiling clamps larger "
-        "values). Close fixtures with try/finally; a catch-and-print is not verification.",
+        "record a short structured self-report. Progress is self-reported; it is never "
+        "acceptance.",
+        "- readiness(): read-only mechanical review of the contract against the recorded "
+        "receipts. Readiness is evidence review; it is never acceptance.",
+        "- codemode(code): run JavaScript in the QuickJS sandbox. A `tools.<name>(args)` call "
+        "goes through the same guarded tools. Every nested call passes the same guard, and a "
+        "blocked call rejects. Await every nested call. Batch only independent reads and "
+        "checks with `Promise.allSettled`, and filter large output before it reaches you. A "
+        "fulfilled Promise only means that the call resolved; inspect every structured "
+        "result. A failed check still resolves with exit/timeout data, and resolve is not "
+        "success. Parallel checks need independent resources and unique ids. Serialize "
+        "dependent writes and commits. Only a successful script keeps its `store`/`load` "
+        "values; completed calls are not undone. Codemode does not make the shell guard an OS "
+        "sandbox.",
+        "Every bash call has a finite timeout. The worker fills in a default, and a ceiling "
+        "clamps larger requested values. Close fixtures with try/finally. A catch-and-print is "
+        "not verification.",
         f'Only "{tools_dir}" and this round\'s checks directory may be written outside '
         "the worktree.",
         FORBIDDEN_RULE_TEXT,
         MUST_ASK_LINE,
-        "End with a concise report of changes and evidence. Never claim acceptance PASS; a zero "
-        "exit code only proves execution finished."]
+        "End with a concise report of changes and evidence. Missing, failed, skipped and "
+        "unknown evidence is not a pass. Never claim acceptance PASS. A zero exit code only "
+        "proves that execution finished."]
     return "\n".join(lines) + "\n"
 
 
