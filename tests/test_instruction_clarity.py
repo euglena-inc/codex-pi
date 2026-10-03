@@ -121,6 +121,15 @@ class InstructionClarityTests(unittest.TestCase):
         self.assertNotEqual(RUNNER.ts_token_normalize("const a = f(1);"),
                             RUNNER.ts_token_normalize("const a = f(2);"))
 
+    def test_shared_runtime_is_pinned_across_plugin_releases(self):
+        out = self.tmp / "pinned-runtime"
+        RUNNER.extract_arms(out, log=lambda *_args: None)
+        expected = RUNNER.git_show(RUNNER.SHARED_RUNTIME_REF, "runtime/VERSION")
+        for arm in ("old", "new"):
+            self.assertEqual((out / "arms" / arm / "tools" / "VERSION").read_bytes(), expected)
+            self.assertEqual((out / "arms" / arm / "tools" / "pi_core.py").read_bytes(),
+                             RUNNER.git_show(RUNNER.SHARED_RUNTIME_REF, "runtime/pi_core.py"))
+
     def test_ts_isolation_rejects_code_change(self):
         old = 'const a = "one"; function g() { return 1; }'
         new = 'const a = "two"; function g() { return 2; }'

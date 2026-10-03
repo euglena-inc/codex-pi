@@ -55,6 +55,9 @@ PI_DOUBLE = ROOT / "tests" / "doubles" / "pi_double.py"
 OLD_REF = "27830ece99287a7d568e571ccdb735288dff0a62"
 NEW_REF = "f2fe40f6f5438226077bcb7bae0cf40548dcce04"
 TREATMENT_FILES = ("runtime/pi_brief.py", "runtime/pi_worker.ts")
+# This pilot compares instruction text on the exact shared runtime it exercised.
+SHARED_RUNTIME_REF = "9428fed98088cb41b98f98da40e62e459cb13499"
+AUDITED_SCORER_REF = "1a6f35b3e37784fad49b32b61ab964623a4af565"
 
 MODEL = "newapi/deepseek-flash"
 THINKING = "max"
@@ -587,7 +590,7 @@ def extract_arms(out: Path, log=print) -> dict:
     if archive_path.exists():
         archive_path.unlink()
     with archive_path.open("wb") as stream:
-        subprocess.run(["git", "-C", str(ROOT), "archive", "HEAD", "runtime"],
+        subprocess.run(["git", "-C", str(ROOT), "archive", SHARED_RUNTIME_REF, "runtime"],
                        check=True, stdout=stream, stderr=subprocess.DEVNULL)
     arms = {}
     for arm, ref in (("old", OLD_REF), ("new", NEW_REF)):
@@ -2400,9 +2403,14 @@ def verify_evidence(out: Path, manifest: dict | None = None, baseline: dict | No
     if manifest.get("scheduleSha256") != schedule_hash():
         problems.append("manifest schedule hash does not match the frozen schedule")
     runner_path = ROOT / "scripts" / "validate_instruction_clarity.py"
-    if manifest.get("harnessSha256") != sha256_file(runner_path):
-        problems.append("manifest harness hash does not match the current runner; re-score the "
-                        "preserved evidence rather than editing the manifest")
+    # A release/version bump must not invalidate the already audited pilot.
+    # Compatibility is restricted to this exact reviewed scorer, not arbitrary
+    # historical harnesses. Every score is still recomputed from raw evidence.
+    compatible_scorers = {sha256_file(runner_path), sha256_bytes(git_show(
+        AUDITED_SCORER_REF, "scripts/validate_instruction_clarity.py"))}
+    if manifest.get("harnessSha256") not in compatible_scorers:
+        problems.append("manifest harness hash is neither the current runner nor the exact "
+                        "audited scorer; use a compatible scoring revision")
     if baseline is None:
         baseline = read_json(out / "baseline.json")
     if not isinstance(baseline, dict):

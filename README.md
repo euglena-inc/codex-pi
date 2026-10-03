@@ -7,7 +7,7 @@
 - worker 合同、工具说明和派工模板明确区分 Promise 完成与检查通过、执行失败与准入拒绝，以及定向检查与正式验收；保持原有权限、预算与验收语义。
 - 新增允许模型 `newapi/deepseek-flash`。模型由项目配置选择并按任务冻结，不自动换接口或回退。使用 NewAPI 时，应确认本机 Pi 配置能传递 `thinking: enabled` 和 `reasoning_effort: max`；插件不复制凭据，也不保证网关与官方转发完全等价。
 - 可选 `network.proxyUrl` 和 `network.diagnostics` 为新任务冻结显式代理策略与有界、脱敏的连接观察记录。诊断仅观察 supervisor 直接启动的 Pi 主进程，区分连接重置、代理 CONNECT 错误与正常流清理；不自动重试、不改变系统代理，也不承诺修复代理故障。旧任务继续使用原冻结策略和工具。
-- 新增可复核的真实 Pi 指令对照工具。36 会话观察到旧版完成 15/18、新版 17/18，但场景带明确提示且评分经过事后校正；不宣称通用能力、速度或费用收益。详见[实验报告](docs/validation/instruction-clarity-pilot-20261003.md)及[连接支持验证](docs/validation/connection-support-20261003.md)。
+- 新增可复核的真实 Pi 指令对照工具。实验运行时固定到原始提交，插件升版不改变旧证据的只读复核。36 会话观察到旧版完成 15/18、新版 17/18，但场景带明确提示且评分经过事后校正；不宣称通用能力、速度或费用收益。详见[实验报告](docs/validation/instruction-clarity-pilot-20261003.md)及[连接支持验证](docs/validation/connection-support-20261003.md)。
 
 升级通过正式插件安装流程完成。新版用于新会话和新任务；正在运行或保留的旧任务不自动改写模型、期限、会话和 helper 快照。桌面 Hook 信任仍由应用管理，Python 测试不能替代桌面验证。
 
