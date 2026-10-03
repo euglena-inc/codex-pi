@@ -2484,6 +2484,12 @@ def verify_evidence(out: Path, manifest: dict | None = None, baseline: dict | No
         if score.get("session_status") == "not_started":
             problems.append(f"{trial}: trial was never started")
             continue
+        if record != score:
+            problems.append(f"{trial}: manifest result record disagrees with the recorded score")
+            for field in ("session_status", "family_success", "report_status", "claims",
+                          "subscores", "violations", "guard_blocked", "first_action_stance"):
+                if record.get(field) != score.get(field):
+                    problems.append(f"{trial}: manifest {field} disagrees with the recorded score")
         if not isinstance(fixture, dict):
             problems.append(f"{trial}: fixture.json missing")
             continue
