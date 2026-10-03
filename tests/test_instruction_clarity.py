@@ -303,8 +303,8 @@ class InstructionClarityTests(unittest.TestCase):
             "scheduleSha256": "c" * 64, "treatment": {"files": {}},
         }
         report = RUNNER.build_report(manifest)
-        self.assertIn("/3 |", report)
-        self.assertNotIn("/6", report)
+        self.assertIn("| 3/3 |", report)
+        self.assertNotIn("Old success/6", report)
         self.assertIn("acceptance_claimed", report)
         self.assertIn("Reported cost was zero/absent", report)
 
