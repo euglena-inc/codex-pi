@@ -200,15 +200,18 @@ class SidecarReaderTest(unittest.TestCase):
     def test_missing_and_disabled(self):
         self.assertEqual(pi_core.read_network_sidecar(None)["status"], "missing")
         self.assertEqual(pi_core.read_network_sidecar(self.tmp / "none.jsonl")["status"], "missing")
+        self.assertFalse(pi_core.read_network_sidecar(None)["oversized"])
 
     def test_valid_records_are_counted_and_abort_cleanup_is_not_failure(self):
         path = self.tmp / "round.network.jsonl"
         records = [
             {"at": 0.0, "phase": "observer_ready", "scope": "round-1", "proc": "aaaa"},
-            {"at": 1.0, "phase": "request_error", "class": "connection_reset", "code": "ECONNRESET"},
-            {"at": 2.0, "phase": "request_error", "class": "abort_cleanup", "code": "ABORT_ERR"},
+            {"at": 1.0, "phase": "request_error", "class": "connection_reset", "code": "ECONNRESET",
+             "status": None, "hdr": False},
+            {"at": 2.0, "phase": "request_error", "class": "abort_cleanup", "code": "ABORT_ERR",
+             "status": None, "hdr": True},
             {"at": 3.0, "phase": "request_error", "class": "proxy_connect_failure",
-             "code": None, "status": 503},
+             "code": None, "status": 503, "hdr": False},
         ]
         path.write_text("\n".join(json.dumps(item) for item in records) + "\n", encoding="utf-8")
         summary = pi_core.read_network_sidecar(path)
@@ -216,6 +219,7 @@ class SidecarReaderTest(unittest.TestCase):
         self.assertEqual(summary["records"], 4)
         self.assertEqual(summary["failures"], 2)
         self.assertFalse(summary["truncated"])
+        self.assertFalse(summary["oversized"])
         self.assertEqual(summary["classes"]["connection_reset"], 1)
 
     def test_truncation_marker_and_corruption_are_explicit(self):
@@ -228,11 +232,80 @@ class SidecarReaderTest(unittest.TestCase):
         path.write_text("{not json\n", encoding="utf-8")
         self.assertEqual(pi_core.read_network_sidecar(path)["status"], "unreadable")
 
+    def test_forged_classification_and_long_strings_are_not_reflected(self):
+        path = self.tmp / "round.network.jsonl"
+        for index, line in enumerate((
+                {"phase": "request_error", "class": "synthetic-private-value"},
+                {"phase": "request_error", "class": "connection_reset", "code": "X" * 200},
+                {"phase": "request_error", "class": "connection_reset", "status": True},
+                {"phase": "request_error", "class": "connection_reset", "extra": "nope"},
+                {"phase": "not-a-phase", "class": "connection_reset"},
+                {"phase": "observer_ready", "class": "connection_reset"},
+        )):
+            with self.subTest(case=index):
+                path.write_text(json.dumps(line) + "\n", encoding="utf-8")
+                summary = pi_core.read_network_sidecar(path)
+                self.assertEqual(summary["status"], "unreadable")
+                self.assertEqual(summary["records"], 0)
+                self.assertEqual(summary["failures"], 0)
+                self.assertEqual(summary["classes"], {})
+                self.assertNotIn("synthetic-private-value", json.dumps(summary))
+                self.assertNotIn("X" * 10, json.dumps(summary))
+
+    def test_oversized_non_utf8_and_truncated_lines_are_unreadable(self):
+        path = self.tmp / "round.network.jsonl"
+        filler = json.dumps({"at": 0, "phase": "observer_ready", "scope": "round-1",
+                             "proc": "aaaa"}) + "\n"
+        path.write_text(filler * 1100, encoding="utf-8")
+        summary = pi_core.read_network_sidecar(path)
+        self.assertEqual(summary["status"], "unreadable")
+        self.assertTrue(summary["oversized"])
+        path.write_bytes((filler + "{").encode("utf-8"))
+        summary = pi_core.read_network_sidecar(path)
+        self.assertEqual(summary["status"], "unreadable")
+        self.assertTrue(summary["truncated"])
+        path.write_bytes(b"\xff\xfe" + filler.encode("utf-8"))
+        self.assertEqual(pi_core.read_network_sidecar(path)["status"], "unreadable")
+
+    def test_saturation_without_marker_is_reported_as_truncated_coverage(self):
+        path = self.tmp / "round.network.jsonl"
+        filler = json.dumps({"at": 0, "phase": "observer_ready", "scope": "round-1",
+                             "proc": "aaaa"}) + "\n"
+        path.write_text(filler * 895, encoding="utf-8")
+        self.assertGreaterEqual(path.stat().st_size, 65536 - 256)
+        summary = pi_core.read_network_sidecar(path)
+        self.assertEqual(summary["status"], "present")
+        self.assertTrue(summary["truncated"])
+
     def test_network_evidence_legacy_defaults(self):
         evidence = pi_task.network_evidence({}, self.tmp, 1, {})
         self.assertEqual(evidence["proxy"], {"mode": "inherited", "source": "legacy",
                                              "origin": None, "envProxyPresent": None})
         self.assertEqual(evidence["diagnostics"]["status"], "disabled")
+        self.assertFalse(evidence["diagnostics"]["oversized"])
+
+    def test_network_evidence_ignores_forged_state_and_file_path(self):
+        forged_origin = "".join(["http://", "user", ":", "pass", "@", "evil.invalid", ":1"])
+        forged = {"network": {
+            "proxy": {"mode": "evil", "source": "evil",
+                      "origin": forged_origin, "envProxyPresent": "yes"},
+            "diagnostics": {"enabled": True, "file": "/etc/hosts"},
+        }}
+        evidence = pi_task.network_evidence({}, self.tmp, 1, forged)
+        self.assertEqual(evidence["proxy"], {"mode": "inherited", "source": "legacy",
+                                             "origin": None, "envProxyPresent": None})
+        self.assertFalse(evidence["diagnostics"]["enabled"])
+        self.assertEqual(evidence["diagnostics"]["status"], "disabled")
+        task = {"network": {"proxyUrl": PROXY_A, "diagnostics": True}}
+        evidence = pi_task.network_evidence(task, self.tmp, 1, forged)
+        self.assertEqual(evidence["proxy"]["mode"], "explicit")
+        self.assertEqual(evidence["proxy"]["origin"], PROXY_A)
+        self.assertTrue(evidence["diagnostics"]["enabled"])
+        self.assertTrue(evidence["diagnostics"]["file"].endswith("rounds/1/round.network.jsonl"))
+        self.assertEqual(evidence["diagnostics"]["status"], "missing")
+        task = {"network": {"proxyUrl": PROXY_A, "diagnostics": False}}
+        evidence = pi_task.network_evidence(task, self.tmp, 1, forged)
+        self.assertFalse(evidence["diagnostics"]["enabled"])
 
 
 class FrozenPolicyIntegrationTest(unittest.TestCase):
@@ -339,6 +412,15 @@ class FrozenPolicyIntegrationTest(unittest.TestCase):
         self.assertEqual(status["network"]["diagnostics"]["status"], "present")
         self.assertEqual(status["network"]["diagnostics"]["records"], 1)
         self.assertEqual(status["network"]["diagnostics"]["failures"], 1)
+        # A forged classification in the sidecar must never reach public JSON.
+        sidecar.write_text(json.dumps({"phase": "request_error",
+                                       "class": "synthetic-private-value"}) + "\n",
+                           encoding="utf-8")
+        status = cli_json("status", "--repo", str(repo.root), "--task", "diag", env=env)
+        self.assertEqual(status["network"]["diagnostics"]["status"], "unreadable")
+        self.assertEqual(status["network"]["diagnostics"]["records"], 0)
+        self.assertEqual(status["network"]["diagnostics"]["classes"], {})
+        self.assertNotIn("synthetic-private-value", json.dumps(status))
 
     def test_path_with_spaces_and_existing_node_options_survive(self):
         repo, worktree = self.make(network={"proxyUrl": PROXY_A, "diagnostics": True},
@@ -417,18 +499,108 @@ class PreloadMechanismTest(unittest.TestCase):
         for record in records:
             self.assertFalse(set(record) - ALLOWED_RECORD_KEYS,
                              f"non-allowlisted keys: {sorted(set(record) - ALLOWED_RECORD_KEYS)}")
-        classes = {record.get("class") for record in records if record.get("class")}
-        self.assertEqual(classes, {"connection_reset", "abort_cleanup", "proxy_connect_failure",
-                                   "dns_failure", "timeout", "connection_refused", "tls_failure",
-                                   "post_header_error", "transport_error", "unknown"})
-        self.assertTrue(any(record.get("status") == 503 for record in records))
-        abort = [record for record in records if record.get("class") == "abort_cleanup"]
-        self.assertTrue(abort)
-        self.assertTrue(all(record.get("status") is None for record in abort))
+        observed = [record["class"] for record in records if record.get("class")]
+        expected = [
+            "connection_reset",
+            "abort_cleanup",
+            "proxy_connect_failure",
+            "proxy_connect_failure",
+            "dns_failure",
+            "timeout",
+            "connection_refused",
+            "tls_failure",
+            "post_header_error",
+            "unknown",
+            "transport_error",
+            # review repro 1: a code-only ECONNRESET must not become proxy
+            "connection_reset",
+            # oversized proxy text is never proxy evidence
+            "connection_reset",
+            # review repro 2: proxy evidence in a bounded cause wins over abort
+            "proxy_connect_failure",
+            # ambiguous abort codes alone never prove normal cleanup
+            "transport_error",
+            "post_header_error",
+            "abort_cleanup",
+            "unknown",
+        ]
+        self.assertEqual(observed, expected)
+        statuses = [record.get("status") for record in records if record.get("class")]
+        self.assertEqual(statuses[2], 503)
+        self.assertEqual(statuses[13], 503)
+        self.assertEqual([item for item in statuses if item == 503], [503, 503])
+        # pre/post-header differentiation for the ambiguous abort codes
+        ambiguous = [record for record in records
+                     if record.get("code") == "UND_ERR_ABORTED"
+                     and record.get("class") in ("transport_error", "post_header_error")]
+        self.assertEqual(len(ambiguous), 2)
+        self.assertFalse(ambiguous[0]["hdr"])
+        self.assertEqual(ambiguous[0]["class"], "transport_error")
+        self.assertTrue(ambiguous[1]["hdr"])
+        self.assertEqual(ambiguous[1]["class"], "post_header_error")
+        # only abort_cleanup records are excluded from the failure count
+        summary = pi_core.read_network_sidecar(sidecar)
+        self.assertEqual(summary["failures"], len(expected) - 2)
+        self.assertEqual(summary["classes"]["abort_cleanup"], 2)
         raw = sidecar.read_text(encoding="utf-8")
         for part in ("alice", "s3cr3t", "private.invalid", "ZZTOKENZZ", "Proxy response",
-                     "socket hang up", "getaddrinfo", "ECONNRESET://"):
+                     "socket hang up", "getaddrinfo", "Connection error"):
             self.assertNotIn(part, raw, f"sidecar leaked {part!r}")
+
+    def assert_sidecar_bounded(self, sidecar: Path) -> list:
+        self.assertLessEqual(sidecar.stat().st_size, 65536)
+        lines = [line for line in sidecar.read_text(encoding="utf-8").splitlines() if line]
+        for line in lines:
+            json.loads(line)  # no interleaved or corrupted line may appear
+        self.assertTrue(any(json.loads(line).get("phase") == "truncated" for line in lines)
+                        or pi_core.read_network_sidecar(sidecar)["truncated"],
+                        "dropped events need an explicit truncation signal")
+        return lines
+
+    def test_sequential_primary_runs_share_one_byte_bound(self):
+        sidecar = self.tmp / "round.network.jsonl"
+        for _ in range(4):
+            self.run_probe("flood", sidecar)
+        self.assert_sidecar_bounded(sidecar)
+
+    def test_concurrent_inherited_children_cannot_append(self):
+        sidecar = self.tmp / "round.network.jsonl"
+        self.run_probe("flood", sidecar)
+        before_size = sidecar.stat().st_size
+        before_text = sidecar.read_text(encoding="utf-8")
+        child_env = self.probe_env(sidecar)
+        # Not the parent of these children: they are inherited tool processes.
+        child_env["CODEX_PI_NETWORK_DIAG_SUPERVISOR"] = "1"
+        children = [subprocess.Popen([NODE, str(PROBE), "flood"], env=child_env, cwd=str(ROOT),
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    for _ in range(4)]
+        for child in children:
+            _out, err = child.communicate(timeout=120)
+            self.assertEqual(child.returncode, 0, err[-300:])
+        self.assertEqual(sidecar.stat().st_size, before_size)
+        self.assertEqual(sidecar.read_text(encoding="utf-8"), before_text)
+        self.assertTrue(all(json.loads(line).get("primary") is True
+                            for line in before_text.splitlines() if line
+                            and json.loads(line).get("phase") == "request_error"))
+
+    def test_preload_without_supervisor_identity_stays_silent(self):
+        sidecar = self.tmp / "silent.jsonl"
+        env = self.probe_env(sidecar)
+        env.pop("CODEX_PI_NETWORK_DIAG_SUPERVISOR", None)
+        proc = subprocess.run([NODE, "-e", "console.log('ok')"], env=env, cwd=str(ROOT),
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-200:])
+        self.assertFalse(sidecar.exists())
+
+    def test_near_limit_existing_file_stays_bounded_and_signals_coverage(self):
+        sidecar = self.tmp / "round.network.jsonl"
+        filler = json.dumps({"at": 0, "phase": "observer_ready", "scope": "round-1",
+                             "proc": "aaaa"}) + "\n"
+        sidecar.write_text(filler * 850, encoding="utf-8")
+        self.run_probe("flood", sidecar)
+        self.assert_sidecar_bounded(sidecar)
+        summary = pi_core.read_network_sidecar(sidecar)
+        self.assertTrue(summary["truncated"])
 
     def test_real_socket_reset_is_classified_and_success_is_silent(self):
         sidecar = self.tmp / "round.network.jsonl"

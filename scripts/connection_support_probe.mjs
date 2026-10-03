@@ -39,75 +39,68 @@ function failure(message, code) {
 
 function synthetic() {
 	let published = 0;
-	// Pre-header ECONNRESET.
-	{
+	const emitCase = (error, headers) => {
 		const request = createRequest();
 		diagnosticsChannel.channel("undici:request:create").publish({ request });
-		publishError(request, failure("socket hang up", "ECONNRESET"));
+		if (headers) {
+			diagnosticsChannel.channel("undici:request:headers").publish(
+				{ request, response: { statusCode: 200 } });
+		}
+		publishError(request, error);
 		published += 1;
-	}
-	// Ordinary response-stream cleanup abort after headers: never a failure.
-	{
-		const request = createRequest();
-		diagnosticsChannel.channel("undici:request:create").publish({ request });
-		diagnosticsChannel.channel("undici:request:headers").publish(
-			{ request, response: { statusCode: 200 } });
+	};
+	const abortError = () => {
 		const abort = new Error("The operation was aborted");
 		abort.name = "AbortError";
 		abort.code = "ABORT_ERR";
-		publishError(request, abort);
-		published += 1;
-	}
-	// Proxy CONNECT rejection with a numeric tunnel status.
+		return abort;
+	};
+	// 1 pre-header reset with text
+	emitCase(failure("socket hang up", "ECONNRESET"), false);
+	// 2 ordinary response-stream cleanup abort after headers: never a failure
+	emitCase(abortError(), true);
+	// 3 proxy CONNECT rejection with a numeric tunnel status
+	emitCase(failure("Proxy response (503) !== 200 when HTTP Tunneling"), false);
+	// 4 proxy tunnel failure without a numeric status
+	emitCase(failure("Proxy CONNECT tunnel rejected"), false);
+	// 5-8 DNS, timeout, refused and TLS codes
+	emitCase(failure("getaddrinfo ENOTFOUND", "ENOTFOUND"), false);
+	emitCase(failure("headers timeout", "UND_ERR_HEADERS_TIMEOUT"), false);
+	emitCase(failure("connect ECONNREFUSED", "ECONNREFUSED"), false);
+	emitCase(failure("certificate has expired", "CERT_HAS_EXPIRED"), false);
+	// 9 genuine post-header error with no code
+	emitCase(failure("terminated after response start"), true);
+	// 10 adversarial secret-bearing message assembled at runtime
 	{
-		const request = createRequest();
-		diagnosticsChannel.channel("undici:request:create").publish({ request });
-		publishError(request, failure("Proxy response (503) !== 200 when HTTP Tunneling"));
-		published += 1;
-	}
-	// Proxy tunnel failure without a numeric status.
-	{
-		const request = createRequest();
-		diagnosticsChannel.channel("undici:request:create").publish({ request });
-		publishError(request, failure("Proxy CONNECT tunnel rejected"));
-		published += 1;
-	}
-	// DNS failure, timeout, refused and TLS codes.
-	for (const [message, code] of [["getaddrinfo ENOTFOUND", "ENOTFOUND"],
-		["headers timeout", "UND_ERR_HEADERS_TIMEOUT"],
-		["connect ECONNREFUSED", "ECONNREFUSED"],
-		["certificate has expired", "CERT_HAS_EXPIRED"]]) {
-		const request = createRequest();
-		diagnosticsChannel.channel("undici:request:create").publish({ request });
-		publishError(request, failure(message, code));
-		published += 1;
-	}
-	// Genuine post-header error with no code.
-	{
-		const request = createRequest();
-		diagnosticsChannel.channel("undici:request:create").publish({ request });
-		diagnosticsChannel.channel("undici:request:headers").publish(
-			{ request, response: { statusCode: 200 } });
-		publishError(request, failure("terminated after response start"));
-		published += 1;
-	}
-	// Adversarial secret-bearing message assembled at runtime so no credential
-	// URL pattern exists in this tracked source file.
-	{
-		const request = createRequest();
-		diagnosticsChannel.channel("undici:request:create").publish({ request });
 		const secret = ["https://", "alice", ":", "s3cr3t", "@", "private.invalid",
 			"/api?token=", "ZZTOKENZZ"].join("");
-		publishError(request, failure(`request failed: ${secret}`, "ESOMETHING"));
-		published += 1;
+		emitCase(failure(`request failed: ${secret}`, "ESOMETHING"), false);
 	}
-	// Unknown allowlisted transport code.
+	// 11 unknown-to-classifier allowlisted socket code
+	emitCase(failure("socket closed", "UND_ERR_SOCKET"), false);
+	// 12 review repro 1: code only, no message, must stay connection_reset
+	emitCase(failure("", "ECONNRESET"), false);
+	// 13 review negative: oversized message is never proxy evidence
+	emitCase(failure(`Proxy response (503) when HTTP Tunneling ${"x".repeat(5000)}`,
+		"ECONNRESET"), false);
+	// 14 review repro 2: explicit proxy evidence in a bounded cause outranks
+	// the outer ambiguous abort code
 	{
-		const request = createRequest();
-		diagnosticsChannel.channel("undici:request:create").publish({ request });
-		publishError(request, failure("socket closed", "UND_ERR_SOCKET"));
-		published += 1;
+		const inner = failure("Proxy response (503) !== 200 when HTTP Tunneling");
+		inner.name = "AbortError";
+		inner.code = "UND_ERR_ABORTED";
+		const outer = failure("Connection error.");
+		outer.code = "UND_ERR_ABORTED";
+		outer.cause = inner;
+		emitCase(outer, false);
 	}
+	// 15-16 ambiguous abort codes alone never prove normal cleanup
+	emitCase(failure("aborted", "UND_ERR_ABORTED"), false);
+	emitCase(failure("aborted", "UND_ERR_ABORTED"), true);
+	// 17 a real AbortError name before headers is still ordinary cleanup
+	emitCase(abortError(), false);
+	// 18 no usable evidence at all stays unknown
+	emitCase(failure("", "ESOMETHING"), false);
 	console.log(JSON.stringify({ mode, published, exit: 0 }));
 }
 

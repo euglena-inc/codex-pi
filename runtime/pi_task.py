@@ -58,6 +58,7 @@ from pi_core import (
     lock_fd,
     lock_is_held,
     network_policy_for_task,
+    normalize_proxy_url,
     primary_root,
     read_json,
     read_network_sidecar,
@@ -698,41 +699,67 @@ def evidence_paths(task_dir: Path, round_number: int | None) -> dict:
 def network_evidence(task: dict, task_dir: Path, round_number: int, state: dict | None) -> dict:
     """Compact redacted proxy policy plus the bounded sidecar projection.
 
-    The proxy origin is canonical and credential-free by construction; raw
-    config text, environment values and diagnostic records never appear here.
+    Recorded state and the sidecar are treated as untrusted observational data:
+    the proxy origin is revalidated (or replaced by the frozen policy), and only
+    the round's canonical sidecar path is read. Forged mode/source/origin/file
+    values are replaced instead of echoed, and an unreadable sidecar yields no
+    classification counts.
     """
     try:
         policy = network_policy_for_task(task)
     except ValueError:
         policy = {"proxyUrl": None, "diagnostics": False, "source": "invalid"}
+    fallback_proxy = {"mode": "explicit" if policy["proxyUrl"] else "inherited",
+                      "source": policy.get("source", "legacy"), "origin": policy["proxyUrl"],
+                      "envProxyPresent": None}
     recorded = state.get("network") if isinstance(state, dict) else None
     proxy = None
     diagnostics = None
     if isinstance(recorded, dict):
-        if isinstance(recorded.get("proxy"), dict):
-            proxy = {key: recorded["proxy"].get(key) for key in
-                     ("mode", "source", "origin", "envProxyPresent")}
+        raw_proxy = recorded.get("proxy")
+        if isinstance(raw_proxy, dict):
+            mode = raw_proxy.get("mode") \
+                if raw_proxy.get("mode") in ("explicit", "inherited") else None
+            source = raw_proxy.get("source") \
+                if raw_proxy.get("source") in ("frozen", "legacy", "invalid") else None
+            origin = raw_proxy.get("origin")
+            if origin is not None:
+                try:
+                    origin = normalize_proxy_url(origin)
+                except ValueError:
+                    mode = source = origin = None
+            present = raw_proxy.get("envProxyPresent")
+            if mode and source and (present is None or isinstance(present, bool)):
+                proxy = {"mode": mode, "source": source, "origin": origin,
+                         "envProxyPresent": present}
         if isinstance(recorded.get("diagnostics"), dict):
             diagnostics = recorded["diagnostics"]
     if not isinstance(proxy, dict):
-        proxy = {"mode": "explicit" if policy["proxyUrl"] else "inherited",
-                 "source": policy.get("source", "legacy"), "origin": policy["proxyUrl"],
-                 "envProxyPresent": None}
-    enabled = bool(diagnostics.get("enabled")) if isinstance(diagnostics, dict) \
-        else bool(policy["diagnostics"])
-    file = diagnostics.get("file") if isinstance(diagnostics, dict) \
-        and isinstance(diagnostics.get("file"), str) else None
+        proxy = fallback_proxy
+    # Diagnostics activation is a frozen policy decision; recorded state can only
+    # point at the canonical sidecar, never enable diagnostics on its own.
+    enabled = bool(policy["diagnostics"])
+    default_file = task_dir / "rounds" / str(round_number) / NETWORK_FILE
+    file = default_file
+    recorded_file = diagnostics.get("file") if isinstance(diagnostics, dict) else None
+    if isinstance(recorded_file, str):
+        try:
+            candidate = Path(recorded_file)
+            if candidate.resolve() == default_file.resolve():
+                file = candidate
+        except OSError:
+            file = default_file
     if not enabled:
         return {"proxy": proxy,
                 "diagnostics": {"enabled": False, "file": None, "status": "disabled",
-                                "records": 0, "failures": 0, "truncated": False}}
-    if not file:
-        file = str(task_dir / "rounds" / str(round_number) / NETWORK_FILE)
+                                "records": 0, "failures": 0, "truncated": False,
+                                "oversized": False}}
     summary = read_network_sidecar(file)
     return {"proxy": proxy,
-            "diagnostics": {"enabled": True, "file": file, "status": summary["status"],
+            "diagnostics": {"enabled": True, "file": str(file), "status": summary["status"],
                             "records": summary["records"], "failures": summary["failures"],
-                            "truncated": summary["truncated"], "classes": summary["classes"]}}
+                            "truncated": summary["truncated"], "oversized": summary["oversized"],
+                            "classes": summary["classes"]}}
 
 
 def effective_state(state: dict | None, task_held: bool, supervisor_alive: bool,

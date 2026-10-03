@@ -179,8 +179,32 @@ def probe_checks(core, node: str, tmp: Path) -> dict:
     bad_env = probe_env(core, failure_dir, "write-failure")
     bad_env["CODEX_PI_NETWORK_DIAG_FILE"] = str(failure_dir)
     run_probe(node, bad_env, "write-failure")
+
+    # One primary writer per round; inherited children must not append.
+    cross_dir = tmp / "cross"
+    cross_dir.mkdir()
+    cross_sidecar = cross_dir / "round.network.jsonl"
+    run_probe(node, probe_env(core, cross_sidecar, "cross"), "flood")
+    check(cross_sidecar.stat().st_size <= 65536,
+          f"cross-process sidecar exceeded its bound: {cross_sidecar.stat().st_size}")
+    cross_records = read_sidecar(cross_sidecar)
+    check(any(record.get("phase") == "truncated" for record in cross_records)
+          or core.read_network_sidecar(cross_sidecar)["truncated"],
+          "cross-process dropped events lack a truncation signal")
+    before_size = cross_sidecar.stat().st_size
+    child_env = probe_env(core, cross_sidecar, "cross")
+    child_env["CODEX_PI_NETWORK_DIAG_SUPERVISOR"] = "1"
+    children = [subprocess.Popen([node, str(PROBE), "flood"], env=child_env, cwd=str(ROOT),
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                for _ in range(4)]
+    for child in children:
+        _out, err = child.communicate(timeout=120)
+        check(child.returncode == 0, f"inherited flood failed: {err[-200:]}")
+    check(cross_sidecar.stat().st_size == before_size,
+          "inherited children appended to the primary sidecar")
     return {"syntheticRecords": len(records), "floodRecords": len(flood_records),
-            "realRecords": len(real_records)}
+            "realRecords": len(real_records), "crossRecords": len(cross_records),
+            "crossBytes": cross_sidecar.stat().st_size}
 
 
 def integration() -> dict:

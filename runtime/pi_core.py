@@ -49,6 +49,16 @@ NETWORK_PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_prox
                           "ALL_PROXY", "all_proxy")
 NETWORK_FILE = "round.network.jsonl"
 _MAX_NETWORK_FILE_BYTES = 65536
+_NETWORK_SATURATION_MARGIN = 256
+NETWORK_PHASES = ("observer_ready", "request_error", "truncated", "oversized")
+NETWORK_CLASSES = ("connection_reset", "connection_refused", "timeout", "dns_failure",
+                   "tls_failure", "proxy_connect_failure", "post_header_error",
+                   "transport_error", "abort_cleanup", "unknown")
+_NETWORK_RECORD_KEYS = frozenset(("at", "dur", "phase", "class", "code", "status", "hdr",
+                                  "scope", "proc", "primary"))
+_NETWORK_CODE_RE = re.compile(r"[A-Za-z0-9_]{1,64}\Z")
+_NETWORK_SCOPE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}\Z")
+_NETWORK_PROC_RE = re.compile(r"[0-9a-f]{1,16}\Z")
 REFERENCE_EXTENSIONS = ("md", "markdown", "txt", "json", "sh", "bash", "zsh", "py",
                         "js", "mjs", "cjs", "ts", "tsx", "yaml", "yml", "toml", "cfg", "ini")
 
@@ -399,45 +409,118 @@ def apply_network_policy(env: dict, policy: dict, diagnostics_file=None, scope: 
     return result, record
 
 
+def _network_number(value, low: float, high: float) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and low <= value <= high)
+
+
+def _valid_network_record(record) -> bool:
+    """Strict allowlist validation for one sidecar record.
+
+    The sidecar is written by the observed Pi process, so it is untrusted
+    observational data: unknown keys, forged classifications, long strings and
+    wrong types make the whole projection unreadable instead of being echoed.
+    """
+    if not isinstance(record, dict) or set(record) - _NETWORK_RECORD_KEYS:
+        return False
+    phase = record.get("phase")
+    if not isinstance(phase, str) or phase not in NETWORK_PHASES:
+        return False
+    if "at" in record and record["at"] is not None \
+            and not _network_number(record["at"], 0, 86400):
+        return False
+    if "dur" in record and record["dur"] is not None \
+            and not _network_number(record["dur"], 0, 3600000):
+        return False
+    if "code" in record and record["code"] is not None \
+            and (not isinstance(record["code"], str)
+                 or not _NETWORK_CODE_RE.fullmatch(record["code"])):
+        return False
+    if "status" in record and record["status"] is not None \
+            and (isinstance(record["status"], bool) or not isinstance(record["status"], int)
+                 or not 100 <= record["status"] <= 599):
+        return False
+    for key in ("hdr", "primary"):
+        if key in record and record[key] is not None \
+                and not isinstance(record[key], bool):
+            return False
+    if "scope" in record and record["scope"] is not None \
+            and (not isinstance(record["scope"], str)
+                 or not _NETWORK_SCOPE_RE.fullmatch(record["scope"])):
+        return False
+    if "proc" in record and record["proc"] is not None \
+            and (not isinstance(record["proc"], str)
+                 or not _NETWORK_PROC_RE.fullmatch(record["proc"])):
+        return False
+    classification = record.get("class")
+    if phase == "request_error":
+        return isinstance(classification, str) and classification in NETWORK_CLASSES
+    return classification is None
+
+
 def read_network_sidecar(path) -> dict:
-    """Bounded observational summary of one round sidecar; never raises."""
+    """Bounded observational summary of one round sidecar; never raises.
+
+    Only complete, allowlist-valid records in a bounded UTF-8 prefix are
+    trusted. Missing, oversized, truncated, non-UTF-8 or forged content yields
+    ``status='unreadable'`` with empty counts, so untrusted values never reach
+    the public status/result projection and never look healthy.
+    """
     result = {"status": "missing", "records": 0, "failures": 0, "truncated": False,
-              "classes": {}}
+              "oversized": False, "classes": {}}
     if path is None:
         return result
     path = Path(path)
     try:
         if not path.is_file():
             return result
-        raw = path.read_bytes()[:_MAX_NETWORK_FILE_BYTES]
+        size = path.stat().st_size
+        with path.open("rb") as stream:
+            raw = stream.read(_MAX_NETWORK_FILE_BYTES + 1)
     except OSError:
         result["status"] = "unreadable"
         return result
-    invalid = False
+
+    def unreadable(truncated: bool = False, oversized: bool = False) -> dict:
+        result["status"] = "unreadable"
+        result["truncated"] = bool(truncated)
+        result["oversized"] = bool(oversized)
+        return result
+
+    if len(raw) > _MAX_NETWORK_FILE_BYTES:
+        return unreadable(oversized=True)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return unreadable()
+    partial = bool(text) and not text.endswith("\n")
+    truncated = size >= _MAX_NETWORK_FILE_BYTES - _NETWORK_SATURATION_MARGIN
+    if partial:
+        return unreadable(truncated=True)
     classes = {}
-    for line in raw.splitlines():
-        line = line.strip()
+    for line in text.splitlines():
         if not line:
             continue
         try:
             record = json.loads(line)
         except ValueError:
-            invalid = True
-            continue
-        if not isinstance(record, dict):
-            invalid = True
-            continue
-        if record.get("phase") == "truncated":
-            result["truncated"] = True
+            return unreadable(truncated=truncated)
+        if not _valid_network_record(record):
+            return unreadable(truncated=truncated)
+        if record["phase"] == "truncated":
+            truncated = True
             continue
         result["records"] += 1
-        kind = record.get("class")
-        if isinstance(kind, str):
-            classes[kind] = classes.get(kind, 0) + 1
-            if kind != "abort_cleanup":
+        if record["phase"] != "request_error":
+            continue
+        classification = record.get("class")
+        if isinstance(classification, str):
+            classes[classification] = classes.get(classification, 0) + 1
+            if classification != "abort_cleanup":
                 result["failures"] += 1
     result["classes"] = dict(sorted(classes.items(), key=lambda item: (-item[1], item[0]))[:8])
-    result["status"] = "unreadable" if invalid else "present"
+    result["truncated"] = truncated
+    result["status"] = "present"
     return result
 
 

@@ -7,26 +7,36 @@
  * headers, URLs or prompts, and every write is best effort: any failure is
  * swallowed so diagnostics can never break the model call.
  *
- * The sidecar is a bounded append-only JSONL file. Each record stores only
- * allowlisted fields: a relative timestamp/duration, the event phase, a safe
- * classification, an allowlisted error code, a numeric proxy CONNECT status and
- * a process-local identity. Raw exception text, URLs, hostnames, headers,
- * bodies, prompts and credentials are never written.
+ * The sidecar is a bounded append-only JSONL file. Only the supervisor's direct
+ * Pi child process (``process.ppid === CODEX_PI_NETWORK_DIAG_SUPERVISOR``) is a
+ * writer: inherited tool children keep the proxy policy but never append, so
+ * exactly one process owns the per-round scope and the aggregate byte bound
+ * holds. Any dropped event is followed by one ``truncated`` marker (best
+ * effort); each append is a single O_APPEND write of at most 512 bytes, so
+ * lines never interleave even if a manual run reuses the same file.
+ *
+ * Each record stores only allowlisted fields: a relative timestamp/duration, the
+ * event phase, a safe classification, an allowlisted error code, a numeric proxy
+ * CONNECT status and a bounded process identity. Raw exception text, URLs,
+ * hostnames, headers, bodies, prompts and credentials are never written.
  *
  * Environment (set only for the Pi child process):
  *   CODEX_PI_NETWORK_DIAG_FILE        absolute sidecar path
  *   CODEX_PI_NETWORK_DIAG_SCOPE       short round scope, never user content
  *   CODEX_PI_NETWORK_DIAG_SUPERVISOR  supervisor pid (for primary attribution)
  */
-import { openSync, writeSync } from "node:fs";
+import { fstatSync, openSync, writeSync } from "node:fs";
 import { subscribe } from "node:diagnostics_channel";
 
 const MAX_RECORDS = 256;
 const MAX_BYTES = 65536;
 const MARKER_RESERVE = 128;
+const RECORD_BUDGET = MAX_BYTES - 2 * MARKER_RESERVE;
 const MAX_LINE_BYTES = 512;
 const MAX_AGE_SECONDS = 86400;
 const MAX_DURATION_MS = 3600000;
+const CAUSE_DEPTH = 3;
+const PROXY_TEXT_LIMIT = 4096;
 
 const FILE = typeof process.env.CODEX_PI_NETWORK_DIAG_FILE === "string"
 	? process.env.CODEX_PI_NETWORK_DIAG_FILE.trim() : "";
@@ -34,6 +44,8 @@ const RAW_SCOPE = typeof process.env.CODEX_PI_NETWORK_DIAG_SCOPE === "string"
 	? process.env.CODEX_PI_NETWORK_DIAG_SCOPE : "";
 const SCOPE = /^[A-Za-z0-9_-]{1,32}$/.test(RAW_SCOPE) ? RAW_SCOPE : "unknown";
 const SUPERVISOR_PID = Number.parseInt(process.env.CODEX_PI_NETWORK_DIAG_SUPERVISOR || "", 10);
+const PRIMARY = Number.isInteger(SUPERVISOR_PID) && SUPERVISOR_PID > 0
+	&& process.ppid === SUPERVISOR_PID;
 const PROC = Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, "0");
 const START = Date.now();
 
@@ -49,15 +61,18 @@ const ERROR_CODES = new Set([
 const TIMEOUT_CODES = new Set(["ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT",
 	"UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"]);
 const DNS_CODES = new Set(["ENOTFOUND", "EAI_AGAIN", "EAI_FAIL", "EAI_NONAME", "ESERVFAIL"]);
-const ABORT_CODES = new Set(["ABORT_ERR", "UND_ERR_ABORTED", "UND_ERR_DESTROYED", "UND_ERR_CLOSED"]);
 const TLS_CODES = new Set(["CERT_HAS_EXPIRED", "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
 	"SELF_SIGNED_CERT_IN_CHAIN", "ERR_TLS_CERT_ALTNAME_INVALID", "DEPTH_ZERO_SELF_SIGNED_CERT"]);
+// Concrete socket failures; ABORT/DESTROYED/CLOSED stay separate because the code
+// alone never proves that an abort was ordinary response-stream cleanup.
+const SOCKET_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "ECONNABORTED", "EPIPE",
+	"ENETDOWN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_SOCKET"]);
 
 let fd = null;
 let stopped = false;
 let failed = false;
+let markerWritten = false;
 let records = 0;
-let bytes = 0;
 
 function relativeSeconds() {
 	try {
@@ -68,89 +83,113 @@ function relativeSeconds() {
 	}
 }
 
-function safeCode(error) {
-	for (const candidate of [error, error?.cause, error?.cause?.cause]) {
-		if (candidate && typeof candidate === "object" && typeof candidate.code === "string"
-				&& ERROR_CODES.has(candidate.code)) {
-			return candidate.code;
+/** Bounded error/cause chain; never follows cycles or more than CAUSE_DEPTH levels. */
+function chain(error) {
+	const levels = [];
+	let current = error;
+	for (let depth = 0; depth < CAUSE_DEPTH; depth += 1) {
+		if (!current || (typeof current !== "object" && typeof current !== "function")) {
+			break;
 		}
+		if (levels.includes(current)) {
+			break;
+		}
+		levels.push(current);
+		current = current.cause;
 	}
-	return null;
+	return levels;
 }
 
-function safeName(error) {
-	for (const candidate of [error, error?.cause, error?.cause?.cause]) {
-		if (candidate && typeof candidate === "object" && typeof candidate.name === "string"
-				&& candidate.name.length <= 64) {
-			return candidate.name;
+function codes(error) {
+	const found = [];
+	for (const level of chain(error)) {
+		if (typeof level.code === "string" && ERROR_CODES.has(level.code)
+				&& !found.includes(level.code)) {
+			found.push(level.code);
 		}
 	}
-	return "";
+	return found;
 }
 
-function rawMessage(error) {
-	for (const candidate of [error, error?.cause, error?.cause?.cause]) {
-		if (candidate && typeof candidate === "object" && typeof candidate.message === "string") {
-			return candidate.message;
+function names(error) {
+	const found = [];
+	for (const level of chain(error)) {
+		if (typeof level.name === "string" && level.name.length <= 64
+				&& !found.includes(level.name)) {
+			found.push(level.name);
 		}
 	}
-	return "";
+	return found;
 }
 
-function proxyStatus(error) {
-	const text = rawMessage(error);
-	if (!text || text.length > 4096) {
-		return null;
-	}
-	const explicit = /proxy response \((\d{3})\)/i.exec(text);
-	if (explicit) {
-		const status = Number.parseInt(explicit[1], 10);
-		return status >= 100 && status <= 599 ? status : null;
-	}
-	if (/http tunneling/i.test(text) || (/\bproxy\b/i.test(text) && /\bconnect\b/i.test(text))) {
-		const number = /(\d{3})/.exec(text);
-		if (number) {
-			const status = Number.parseInt(number[1], 10);
-			return status >= 100 && status <= 599 ? status : null;
+/** Proxy evidence from any bounded level; undefined when no usable text exists. */
+function proxyEvidence(error) {
+	let mention = undefined;
+	for (const level of chain(error)) {
+		const text = typeof level.message === "string" ? level.message : "";
+		if (!text || text.length > PROXY_TEXT_LIMIT) {
+			// A missing or oversized message is never proxy evidence.
+			continue;
 		}
-		return null;
+		const explicit = /proxy response \((\d{3})\)/i.exec(text);
+		if (explicit) {
+			const status = Number.parseInt(explicit[1], 10);
+			if (status >= 100 && status <= 599) {
+				return status;
+			}
+		}
+		if (/http tunneling/i.test(text)
+				|| (/\bproxy\b/i.test(text) && /\bconnect\b/i.test(text))) {
+			const number = /(\d{3})/.exec(text);
+			const status = number ? Number.parseInt(number[1], 10) : null;
+			if (status !== null && status >= 100 && status <= 599) {
+				return status;
+			}
+			mention = null;
+		}
 	}
-	return undefined;
+	return mention;
 }
 
+/** Classify one error conservatively; evidence outranks ambiguous abort codes. */
 function classify(error, headersSeen) {
-	const proxy = proxyStatus(error);
+	const known = codes(error);
+	const errorNames = names(error);
+	const proxy = proxyEvidence(error);
 	if (proxy !== undefined) {
-		return { "class": "proxy_connect_failure", status: proxy };
+		return { "class": "proxy_connect_failure", status: proxy,
+			code: known.length ? known[0] : null };
 	}
-	const code = safeCode(error);
-	const name = safeName(error);
-	if (TIMEOUT_CODES.has(code) || /timeout/i.test(name)) {
-		return { "class": "timeout", status: null };
+	if (known.some((code) => TIMEOUT_CODES.has(code)) || errorNames.some((name) => /timeout/i.test(name))) {
+		return { "class": "timeout", status: null, code: known.length ? known[0] : null };
 	}
-	if (ABORT_CODES.has(code) || name === "AbortError") {
-		// Ordinary response-stream cleanup cancellation is never a failure.
-		return { "class": "abort_cleanup", status: null };
+	if (known.some((code) => DNS_CODES.has(code))) {
+		return { "class": "dns_failure", status: null, code: known[0] };
 	}
-	if (DNS_CODES.has(code)) {
-		return { "class": "dns_failure", status: null };
+	if (known.includes("ECONNRESET")) {
+		return { "class": "connection_reset", status: null, code: "ECONNRESET" };
 	}
-	if (code === "ECONNRESET") {
-		return { "class": "connection_reset", status: null };
+	if (known.includes("ECONNREFUSED")) {
+		return { "class": "connection_refused", status: null, code: "ECONNREFUSED" };
 	}
-	if (code === "ECONNREFUSED") {
-		return { "class": "connection_refused", status: null };
+	if (known.some((code) => TLS_CODES.has(code))) {
+		return { "class": "tls_failure", status: null, code: known[0] };
 	}
-	if (TLS_CODES.has(code) || /cert|tls|ssl/i.test(name)) {
-		return { "class": "tls_failure", status: null };
+	if (known.some((code) => SOCKET_CODES.has(code))) {
+		return { "class": "transport_error", status: null, code: known[0] };
+	}
+	// An AbortError name is the explicit cleanup signal; ambiguous abort codes
+	// without it must not be reported as healthy cleanup.
+	if (errorNames.includes("AbortError")) {
+		return { "class": "abort_cleanup", status: null, code: known.length ? known[0] : null };
 	}
 	if (headersSeen) {
-		return { "class": "post_header_error", status: null };
+		return { "class": "post_header_error", status: null, code: known.length ? known[0] : null };
 	}
-	if (code) {
-		return { "class": "transport_error", status: null };
+	if (known.length) {
+		return { "class": "transport_error", status: null, code: known[0] };
 	}
-	return { "class": "unknown", status: null };
+	return { "class": "unknown", status: null, code: null };
 }
 
 function ensureFile() {
@@ -174,36 +213,31 @@ function emit(record) {
 		return;
 	}
 	try {
+		if (!ensureFile()) {
+			return;
+		}
 		let line = JSON.stringify(record);
 		if (Buffer.byteLength(line, "utf8") > MAX_LINE_BYTES) {
 			line = JSON.stringify({ at: record.at, phase: "oversized", scope: SCOPE, proc: PROC });
 		}
-		if (records >= MAX_RECORDS || bytes + line.length + 1 > MAX_BYTES - MARKER_RESERVE) {
-			if (records <= MAX_RECORDS) {
+		const size = fstatSync(fd).size;
+		if (records >= MAX_RECORDS || size + line.length + 1 > RECORD_BUDGET) {
+			if (!markerWritten) {
+				markerWritten = true;
 				const marker = JSON.stringify({ at: relativeSeconds(), phase: "truncated",
 					scope: SCOPE, proc: PROC });
-				if (bytes + marker.length + 1 > MAX_BYTES) {
-					stopped = true;
-					return;
-				}
-				if (ensureFile()) {
-					try {
+				try {
+					if (fstatSync(fd).size + marker.length + 1 <= MAX_BYTES) {
 						writeSync(fd, marker + "\n");
-						bytes += marker.length + 1;
-						records += 1;
-					} catch {
-						failed = true;
 					}
+				} catch {
+					failed = true;
 				}
 			}
 			stopped = true;
 			return;
 		}
-		if (!ensureFile()) {
-			return;
-		}
 		writeSync(fd, line + "\n");
-		bytes += line.length + 1;
 		records += 1;
 	} catch {
 		// Diagnostics write failure must never break the model call.
@@ -223,15 +257,14 @@ function boundedDuration(startedAt) {
 }
 
 function safeIdentity() {
-	let primary = null;
-	if (Number.isInteger(SUPERVISOR_PID) && SUPERVISOR_PID > 0) {
-		primary = process.ppid === SUPERVISOR_PID;
-	}
-	return { scope: SCOPE, proc: PROC, primary: primary };
+	return { scope: SCOPE, proc: PROC, primary: true };
 }
 
 function install() {
-	if (typeof FILE !== "string" || FILE.length === 0) {
+	// Single-writer scope: inherited tool children keep the proxy policy but are
+	// never diagnostic writers, and a manual run without the supervisor identity
+	// stays silent instead of sharing an unbounded file.
+	if (typeof FILE !== "string" || FILE.length === 0 || !PRIMARY) {
 		return;
 	}
 	emit({ at: 0, phase: "observer_ready", scope: SCOPE, proc: PROC });
@@ -265,8 +298,8 @@ function install() {
 				? started.get(request) : undefined;
 			const classified = classify(message?.error, request ? withHeaders.has(request) : false);
 			emit({ at: relativeSeconds(), dur: boundedDuration(startedAt), phase: "request_error",
-				"class": classified["class"], code: safeCode(message?.error),
-				status: classified.status, hdr: request ? withHeaders.has(request) : false,
+				"class": classified["class"], code: classified.code, status: classified.status,
+				hdr: request ? withHeaders.has(request) : false,
 				scope: identity.scope, proc: identity.proc, primary: identity.primary });
 		} catch {
 			// never propagate observer errors
