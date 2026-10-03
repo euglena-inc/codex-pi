@@ -115,6 +115,7 @@ async function createSession(sessionManager) {
 		thinkingLevel: "off",
 	});
 	await created.session.bindExtensions({});
+	report.model = `${created.session.model?.provider}/${created.session.model?.id}`;
 	return created.session;
 }
 
@@ -293,7 +294,10 @@ async function main() {
 }
 
 try {
-	await main();
+	if (process.env.PI_PROBE_CONCURRENCY === "1") {
+        const {runConcurrency} = await import('./concurrency_probe.mjs');
+        await runConcurrency({createSession,attach,runCase,report,workerConfig,workdir,paths});
+    } else await main();
 	fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
 	process.exit(0);
 } catch (error) {

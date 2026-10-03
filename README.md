@@ -99,3 +99,9 @@ codex plugin add codex-pi@codex-pi
 ## 开发与隐私
 
 在独立插件仓库中开发；项目约束由使用方维护。发布前运行 `python3 scripts/check_public_privacy.py --history`。公开仓库只保留脱敏的验证说明，原始会话、任务看板、回执和运行日志保存在本地私有目录。详见 [隐私维护](docs/privacy.md)。
+
+### 检查并发（0.7.1）
+
+新worker默认逐个执行`check`。合同可声明`checkExecution`（`maxConcurrent`最多4、`cpuSlots`、`memoryMiB`），并为独立验收命令声明`checkResources`（`parallelSafe`、CPU/内存估算、`exclusiveKeys`）。只有资源声明完整且系统压力可验证的独立检查能并行；共享键、未知检查或未知压力独占。排队消耗原预算，出队后重验deadline和最终候选；取消释放许可。
+
+这是每worker的软准入，不是全机内存隔离，也不控制任意bash/其他应用。真实Pi合成对照：`python3 scripts/validate_codemode.py --concurrency`。CPU密集或容器任务先测1/2路，不按逻辑核数直接开满。

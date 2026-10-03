@@ -106,6 +106,18 @@ def compose_contract(task: dict) -> str:
                   f"scope={', '.join(contract.get('scope') or [])}"]
         if contract.get("commandTimeoutSeconds"):
             lines.append(f"command_timeout_seconds={contract.get('commandTimeoutSeconds')}")
+        if contract.get("checkExecution"):
+            execution = contract["checkExecution"]
+            parts = []
+            if execution.get("maxConcurrent") is not None:
+                parts.append(f"max_concurrent={execution.get('maxConcurrent')}")
+            if execution.get("cpuSlots") is not None:
+                parts.append(f"cpu_slots={execution.get('cpuSlots')}")
+            if execution.get("memoryMiB") is not None:
+                parts.append(f"memory_mib={execution.get('memoryMiB')}")
+            lines.append("check_execution: " + " ".join(parts)
+                         + " (per-worker in-process permit pool; soft admission estimates, "
+                           "not an OS hard limit)")
         for limit in contract.get("resourceLimits") or []:
             lines.append(f"resource_limit: path={limit.get('path')} max_bytes={limit.get('maxBytes')}")
         lines.append("acceptance_items:")
@@ -120,6 +132,17 @@ def compose_contract(task: dict) -> str:
             if item.get("estimatedSeconds") is not None:
                 lines.append(f"    estimated_seconds: {item.get('estimatedSeconds')} "
                              "(planning estimate, not a completion guarantee)")
+            resources = item.get("checkResources")
+            if resources:
+                parts = [f"parallel_safe={bool(resources.get('parallelSafe'))}"]
+                if resources.get("cpuSlots") is not None:
+                    parts.append(f"cpu_slots={resources.get('cpuSlots')}")
+                if resources.get("memoryMiB") is not None:
+                    parts.append(f"memory_mib={resources.get('memoryMiB')}")
+                if resources.get("exclusiveKeys"):
+                    parts.append(f"exclusive_keys={','.join(resources.get('exclusiveKeys'))}")
+                lines.append("    resources: " + " ".join(parts)
+                             + " (soft pool estimate; undeclared or parallel_safe=false runs alone)")
             lines.append(f"    pass_condition: {item.get('passCondition')}")
             lines.append(f"    evidence: {item.get('evidence')}")
         lines.append("autonomous_repair:")
@@ -221,6 +244,12 @@ def write_worker_config(task_dir: Path, round_number: int, task: dict, contract_
         "deadlinePath": str(round_dir / "round.state.json"),
         "acceptanceItems": acceptance_items(phase_record),
     }
+    # Present only when the phase declared it, so an older worker.json shape and
+    # its hash stay unchanged; an absent pool means one check at a time.
+    check_execution = (phase_record.get("contract") or {}).get("checkExecution") \
+        if isinstance(phase_record, dict) else None
+    if check_execution:
+        config["checkExecution"] = dict(check_execution)
     path = round_dir / WORKER_CONFIG_FILE
     atomic(path, config)
     return path
@@ -237,6 +266,12 @@ def acceptance_items(phase_record) -> list:
                 entry["targetedCommand"] = item["targetedCommand"]
             if item.get("estimatedSeconds") is not None:
                 entry["estimatedSeconds"] = float(item["estimatedSeconds"])
+            resources = item.get("checkResources")
+            if isinstance(resources, dict):
+                compact = dict(resources)
+                if isinstance(compact.get("exclusiveKeys"), list):
+                    compact["exclusiveKeys"] = list(compact["exclusiveKeys"])
+                entry["checkResources"] = compact
             items.append(entry)
     return items
 

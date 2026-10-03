@@ -150,3 +150,9 @@ Tests use the offline Pi double in `tests/doubles/`, which plays the extension's
 ## Reviews and takeover
 
 Every task allows two complete Pi deliveries; the first reviewed quality failure requires the same Codex main session to complete the whole-task analysis (see the Skill) before the second delivery, and the second failure transfers implementation to that session. Counting is task-scoped since the last accepted outcome: one exact main decision per distinct round on a `review_required`/`phase_blocked` event (`changes_requested`/`reject`, `failure-kind quality`); duplicate events, checks, progress, the in-round settle continuation and explicitly external blockers do not count. A reached takeover is latched for that task; the board persists `codex_takeover_required` and `continue` and the worker refuse Pi. The runtime counts exact decisions and controls ownership; it cannot prove analysis quality and never starts Codex.
+
+## Check resource admission (0.7.1)
+
+The worker owns one in-memory FIFO permit pool; there is no second persistent scheduler. Optional phase `checkExecution` and item `checkResources` reach the worker through the frozen config. Missing declarations/pressure use exclusive admission. Explicit independent checks share bounded count/CPU/memory estimates and disjoint resource keys. A waiting caller may expire or abort without spawning. Permits are released in finally, and pressure, candidate cleanliness and the original round/codemode deadline are revalidated after waiting.
+
+macOS reads the kernel VM pressure level; Linux uses bounded MemAvailable/MemTotal reads and labelled availability headroom. These are admission snapshots, not RSS enforcement or a host-wide guarantee. Existing directory-byte resourceLimits remain disk limits. Tests use real helper subprocess intervals and the native Pi/QuickJS scripted provider; production identity/session/evidence ownership is unchanged.

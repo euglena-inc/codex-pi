@@ -71,3 +71,11 @@ python3 .../pi_board.py decide --repo REPO --task TASK --event-id EVENT --decisi
 ```
 
 `--failure-kind external` requires a note naming the unlock condition. Counting rules are in the Skill.
+
+## Bounded check concurrency
+
+`checkExecution` is an optional phase-level object: `maxConcurrent` (1..4), `cpuSlots`, `memoryMiB`. Per-item `checkResources` may declare `parallelSafe`, `cpuSlots`, `memoryMiB`, and `exclusiveKeys`. Metadata follows normalized command argv, not the call's id. Conflicting declarations are refused.
+
+New workers serialize checks by default. Parallel admission requires complete CPU/memory estimates and a configured memory pool; unknown commands or pressure run exclusively. FIFO waiting consumes the original deadline; final cleanliness, pressure and budget are checked again before spawn. Results include `queueSeconds`, `resourceMode`, `pressureState`, `pressureSynthetic` and a pool snapshot. Oversized requirements refuse without a child/receipt. CPU slots and memory estimates are soft per-worker bounds, not host-wide hard limits; other applications, arbitrary bash and detached processes remain outside them.
+
+Use native codemode `Promise.allSettled` only for declared independent checks; do not change `maxWorkers` to speed local checks. Validate 1/2 lanes before 4. `CODEX_PI_PRESSURE_SNAPSHOT` is a synthetic probe override, marked in results; ordinary production checks should not set it.

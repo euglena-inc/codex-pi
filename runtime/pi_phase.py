@@ -64,9 +64,20 @@ CONTRACT_KEYS = (
     "schemaVersion", "phaseId", "goal", "result", "baseline", "scope", "designRef",
     "designSha256", "acceptanceItems", "budgetSeconds", "commandTimeoutSeconds",
     "resourceLimits", "autonomousRepair", "escalateWhen", "preconditions", "nextPhaseRef",
+    "checkExecution",
 )
 ITEM_KEYS = ("id", "description", "checkId", "command", "passCondition", "evidence",
-             "minRun", "forbidSkip", "targetedCommand", "estimatedSeconds")
+             "minRun", "forbidSkip", "targetedCommand", "estimatedSeconds",
+             "checkResources")
+# Optional per-phase bound on how many Pi checks one worker may admit at once.
+# These are planning declarations for a small in-process permit pool, never an
+# OS hard limit: maxConcurrent is bounded small by design and cpuSlots may not
+# exceed the CPUs currently visible to this process.
+CHECK_EXECUTION_KEYS = ("maxConcurrent", "cpuSlots", "memoryMiB")
+CHECK_RESOURCE_KEYS = ("parallelSafe", "cpuSlots", "memoryMiB", "exclusiveKeys")
+MAX_CONCURRENT_CHECKS = 4
+MAX_EXCLUSIVE_KEYS = 16
+MAX_EXCLUSIVE_KEY_TEXT = 64
 
 
 def _text(value, limit: int, label: str, required: bool = True) -> str:
@@ -129,6 +140,97 @@ def design_digest(root: Path, ref: str) -> str:
     if size > MAX_DESIGN_BYTES:
         raise ValueError(f"phase contract designRef exceeds {MAX_DESIGN_BYTES} bytes: {candidate}")
     return hashlib.sha256(candidate.read_bytes()).hexdigest()
+
+
+def _positive_int(value, label: str, cap: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"phase contract {label} must be a positive integer")
+    if cap is not None and value > cap:
+        raise ValueError(f"phase contract {label} must be at most {cap}")
+    return value
+
+
+def _positive_mib(value, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) \
+            or not math.isfinite(float(value)) or float(value) <= 0:
+        raise ValueError(f"phase contract {label} must be a finite positive number")
+    return float(value)
+
+
+def normalize_check_execution(value):
+    """Validate the optional phase ``checkExecution`` pool declaration.
+
+    Everything is optional, but the object itself is not: an empty declaration
+    would only add ambiguity, and ``cpuSlots`` is capped by the CPUs visible to
+    this process instead of being guessed or written down as a fixed machine
+    profile. Returns ``None`` when undeclared so older contract hashes stay flat.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("phase contract checkExecution must be an object")
+    unknown = sorted(set(value) - set(CHECK_EXECUTION_KEYS))
+    if unknown:
+        raise ValueError(f"phase contract checkExecution has unsupported keys {unknown}; "
+                         f"allowed: {list(CHECK_EXECUTION_KEYS)}")
+    if not value:
+        raise ValueError("phase contract checkExecution must declare at least one bound")
+    normalized = {}
+    if "maxConcurrent" in value:
+        normalized["maxConcurrent"] = _positive_int(
+            value["maxConcurrent"], "checkExecution.maxConcurrent", MAX_CONCURRENT_CHECKS)
+    if "cpuSlots" in value:
+        normalized["cpuSlots"] = _positive_int(
+            value["cpuSlots"], "checkExecution.cpuSlots", max(1, os.cpu_count() or 1))
+    if "memoryMiB" in value:
+        normalized["memoryMiB"] = _positive_mib(value["memoryMiB"], "checkExecution.memoryMiB")
+    return normalized
+
+
+def normalize_check_resources(value):
+    """Validate one optional acceptance item ``checkResources`` declaration.
+
+    A declaration never lowers another declaration: the worker matches metadata
+    by normalized argv and refuses contradictory entries at contract time. The
+    returned copy drops absent fields so undeclared metadata does not drift the
+    canonical hash of older contracts.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("phase contract checkResources must be an object")
+    unknown = sorted(set(value) - set(CHECK_RESOURCE_KEYS))
+    if unknown:
+        raise ValueError(f"phase contract checkResources has unsupported keys {unknown}; "
+                         f"allowed: {list(CHECK_RESOURCE_KEYS)}")
+    if not value:
+        raise ValueError("phase contract checkResources must declare at least one bound")
+    normalized = {}
+    if "parallelSafe" in value:
+        if not isinstance(value["parallelSafe"], bool):
+            raise ValueError("phase contract checkResources.parallelSafe must be a boolean")
+        normalized["parallelSafe"] = value["parallelSafe"]
+    if "cpuSlots" in value:
+        normalized["cpuSlots"] = _positive_int(value["cpuSlots"], "checkResources.cpuSlots")
+    if "memoryMiB" in value:
+        normalized["memoryMiB"] = _positive_mib(value["memoryMiB"], "checkResources.memoryMiB")
+    if "exclusiveKeys" in value:
+        keys = value["exclusiveKeys"]
+        if not isinstance(keys, list) or len(keys) > MAX_EXCLUSIVE_KEYS:
+            raise ValueError("phase contract checkResources.exclusiveKeys must be a list of at "
+                             f"most {MAX_EXCLUSIVE_KEYS} short non-empty strings")
+        cleaned = []
+        for key in keys:
+            if not isinstance(key, str) or not key.strip() or len(key.strip()) > MAX_EXCLUSIVE_KEY_TEXT:
+                raise ValueError("phase contract checkResources.exclusiveKeys entries must be "
+                                 f"non-empty strings of at most {MAX_EXCLUSIVE_KEY_TEXT} characters")
+            cleaned.append(key.strip())
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("phase contract checkResources.exclusiveKeys entries must be unique")
+        normalized["exclusiveKeys"] = sorted(cleaned)
+    if not normalized:
+        raise ValueError("phase contract checkResources must declare at least one bound")
+    return normalized
 
 
 def validate_contract(data, root, check_design: bool = True) -> dict:
@@ -211,6 +313,7 @@ def validate_contract(data, root, check_design: bool = True) -> dict:
                                  "a finite positive number at most "
                                  f"{int(MAX_COMMAND_TIMEOUT_SECONDS)}")
             estimate = float(estimate)
+        resources = normalize_check_resources(item.get("checkResources"))
         normalized = {
             "id": item_id,
             "checkId": check_id,
@@ -231,6 +334,8 @@ def validate_contract(data, root, check_design: bool = True) -> dict:
             normalized["targetedCommand"] = targeted
         if estimate is not None:
             normalized["estimatedSeconds"] = estimate
+        if resources is not None:
+            normalized["checkResources"] = resources
         normalized_items.append(normalized)
     # One normalized argv must never carry contradictory budget/targeted advice:
     # the check path matches commands by argv, not by id, so ambiguity is rejected
@@ -241,12 +346,14 @@ def validate_contract(data, root, check_design: bool = True) -> dict:
             argv = tuple(shlex.split(item["command"], posix=True))
         except ValueError:
             continue
-        metadata = (item.get("targetedCommand"), item.get("estimatedSeconds"))
+        resources_json = (json.dumps(item.get("checkResources"), ensure_ascii=False,
+                                      sort_keys=True) if item.get("checkResources") is not None else None)
+        metadata = (item.get("targetedCommand"), item.get("estimatedSeconds"), resources_json)
         previous = canonical_argv.get(argv)
         if previous is not None and previous[1] != metadata:
             raise ValueError(f"phase contract acceptanceItems[{previous[0]}] and "
                              f"acceptanceItems[{index}] normalize to the same command with "
-                             "contradictory targetedCommand/estimatedSeconds metadata")
+                             "contradictory targetedCommand/estimatedSeconds/checkResources metadata")
         canonical_argv[argv] = (index, metadata)
     budget = data.get("budgetSeconds")
     if isinstance(budget, bool) or not isinstance(budget, (int, float)) \
@@ -259,6 +366,7 @@ def validate_contract(data, root, check_design: bool = True) -> dict:
             or not 0 < float(command_timeout) <= MAX_COMMAND_TIMEOUT_SECONDS:
         raise ValueError("phase contract commandTimeoutSeconds must be present, positive and at "
                          f"most {int(MAX_COMMAND_TIMEOUT_SECONDS)}")
+    check_execution = normalize_check_execution(data.get("checkExecution"))
     limits = data.get("resourceLimits")
     if not isinstance(limits, list) or len(limits) > MAX_LIMITS:
         raise ValueError(f"phase contract resourceLimits must be declared as a list of at most "
@@ -278,7 +386,7 @@ def validate_contract(data, root, check_design: bool = True) -> dict:
     if next_phase is not None:
         if not isinstance(next_phase, str) or not PHASE_ID_RE.fullmatch(next_phase):
             raise ValueError("phase contract nextPhaseRef must be a safe phase id")
-    return {
+    normalized_contract = {
         "schemaVersion": PHASE_SCHEMA_VERSION,
         "phaseId": phase_id,
         "goal": goal,
@@ -296,6 +404,11 @@ def validate_contract(data, root, check_design: bool = True) -> dict:
         "preconditions": _text_list(data.get("preconditions"), "preconditions", required=False),
         "nextPhaseRef": next_phase,
     }
+    # Optional fields stay absent when undeclared so an older contract's canonical
+    # hash is unchanged by a runtime that learned about concurrency metadata.
+    if check_execution is not None:
+        normalized_contract["checkExecution"] = check_execution
+    return normalized_contract
 
 
 def canonical_json(value) -> bytes:
@@ -348,6 +461,7 @@ def contract_view(contract: dict, limit: int = 20) -> dict:
             "minRun": item.get("minRun"), "forbidSkip": item.get("forbidSkip"),
             "targetedCommand": item.get("targetedCommand"),
             "estimatedSeconds": item.get("estimatedSeconds"),
+            "checkResources": item.get("checkResources"),
         } for item in items[:limit]],
         "acceptanceItemCount": len(items),
     }

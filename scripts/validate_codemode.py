@@ -17,6 +17,7 @@ success. A zero exit only proves execution finished, not acceptance.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -307,6 +308,13 @@ class CodemodeIntegrationTest(unittest.TestCase):
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--concurrency', action='store_true')
+    args = parser.parse_args()
+    if args.concurrency:
+        os.environ['PI_PROBE_CONCURRENCY'] = '1'
+    else:
+        os.environ.pop('PI_PROBE_CONCURRENCY', None)
     try:
         pi_bin, package_root, entry, pi_version = resolve_pi(os.environ.get("PI_BIN", "pi"))
         if shutil.which("node") is None:
@@ -323,13 +331,20 @@ def main() -> int:
         report = run_probe_layout(layout["root"], package_root, entry, pi_version)
         print(f"probe: pi={pi_version} node={report.get('node')} "
               f"model={report.get('model')} cases={len(report.get('cases', {}))}")
-        CodemodeIntegrationTest.report = report
-        CodemodeIntegrationTest.layout = layout
-        suite = unittest.TestLoader().loadTestsFromTestCase(CodemodeIntegrationTest)
+        test_class = CodemodeIntegrationTest
+        if args.concurrency:
+            from concurrency_probe import ConcurrencyIntegrationTest
+            test_class = ConcurrencyIntegrationTest
+        test_class.report = report
+        test_class.layout = layout
+        suite = unittest.TestLoader().loadTestsFromTestCase(test_class)
         result = unittest.TextTestRunner(verbosity=2).run(suite)
         if result.wasSuccessful():
-            print("probe properties: native=ok models-absent=ok structured=ok nested-guard=ok "
-                  "deadline=ok cancel=ok store=ok")
+            if args.concurrency:
+                print(json.dumps(test_class.measurements(), separators=(',', ':')))
+            else:
+                print("probe properties: native=ok models-absent=ok structured=ok nested-guard=ok "
+                      "deadline=ok cancel=ok store=ok")
         else:
             failed = ",".join(test.id() for test, _ in result.failures + result.errors)
             print(f"probe properties: failed={failed}")

@@ -26,12 +26,28 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+/** Optional per-item resource declaration; absent always means exclusive. */
+interface CheckResources {
+	parallelSafe?: boolean;
+	cpuSlots?: number;
+	memoryMiB?: number;
+	exclusiveKeys?: string[];
+}
+
+/** Optional per-phase permit-pool declaration; absent means one check at a time. */
+interface CheckExecution {
+	maxConcurrent?: number;
+	cpuSlots?: number;
+	memoryMiB?: number;
+}
+
 interface ContractItem {
 	id: string;
 	checkId?: string;
 	command: string;
 	targetedCommand?: string;
 	estimatedSeconds?: number;
+	checkResources?: CheckResources;
 }
 
 interface WorkerConfig {
@@ -55,6 +71,8 @@ interface WorkerConfig {
 	deadlinePath?: string;
 	/** Acceptance item metadata for targeted repair and full-check admission. */
 	acceptanceItems?: ContractItem[];
+	/** Optional per-worker check concurrency/resource bounds. */
+	checkExecution?: CheckExecution;
 }
 
 interface Verdict {
@@ -115,6 +133,63 @@ export function loadConfig(file: string | undefined): WorkerConfig {
 					|| entry.estimatedSeconds <= 0)) {
 				throw new Error("worker config acceptanceItems estimatedSeconds is invalid");
 			}
+			if (entry.checkResources !== undefined) {
+				const resources = entry.checkResources;
+				if (typeof resources !== "object" || resources === null || Array.isArray(resources)) {
+					throw new Error("worker config acceptanceItems checkResources is invalid");
+				}
+				for (const key of Object.keys(resources)) {
+					if (!["parallelSafe", "cpuSlots", "memoryMiB", "exclusiveKeys"].includes(key)) {
+						throw new Error(`worker config acceptanceItems checkResources has unsupported key ${key}`);
+					}
+				}
+				if (Object.keys(resources).length === 0) {
+					throw new Error("worker config acceptanceItems checkResources must declare at least one bound");
+				}
+				if (resources.parallelSafe !== undefined && typeof resources.parallelSafe !== "boolean") {
+					throw new Error("worker config acceptanceItems checkResources parallelSafe is invalid");
+				}
+				if (resources.cpuSlots !== undefined
+					&& (!Number.isSafeInteger(resources.cpuSlots) || resources.cpuSlots <= 0)) {
+					throw new Error("worker config acceptanceItems checkResources cpuSlots is invalid");
+				}
+				if (resources.memoryMiB !== undefined && positiveFinite(resources.memoryMiB) === null) {
+					throw new Error("worker config acceptanceItems checkResources memoryMiB is invalid");
+				}
+				if (resources.exclusiveKeys !== undefined) {
+					if (!Array.isArray(resources.exclusiveKeys) || resources.exclusiveKeys.length > 16
+						|| resources.exclusiveKeys.some((key: unknown) => typeof key !== "string"
+							|| key.trim() === "" || key.length > 64)) {
+						throw new Error("worker config acceptanceItems checkResources exclusiveKeys is invalid");
+					}
+				}
+			}
+		}
+	}
+	if (data.checkExecution !== undefined) {
+		const execution = data.checkExecution;
+		if (typeof execution !== "object" || execution === null || Array.isArray(execution)) {
+			throw new Error("worker config checkExecution is invalid");
+		}
+		for (const key of Object.keys(execution)) {
+			if (!["maxConcurrent", "cpuSlots", "memoryMiB"].includes(key)) {
+				throw new Error(`worker config checkExecution has unsupported key ${key}`);
+			}
+		}
+		if (Object.keys(execution).length === 0) {
+			throw new Error("worker config checkExecution must declare at least one bound");
+		}
+		if (execution.maxConcurrent !== undefined
+			&& (!Number.isSafeInteger(execution.maxConcurrent) || execution.maxConcurrent <= 0
+				|| execution.maxConcurrent > 4)) {
+			throw new Error("worker config checkExecution maxConcurrent is invalid (1..4)");
+		}
+		if (execution.cpuSlots !== undefined
+			&& (!Number.isSafeInteger(execution.cpuSlots) || execution.cpuSlots <= 0)) {
+			throw new Error("worker config checkExecution cpuSlots is invalid");
+		}
+		if (execution.memoryMiB !== undefined && positiveFinite(execution.memoryMiB) === null) {
+			throw new Error("worker config checkExecution memoryMiB is invalid");
 		}
 	}
 	return data as WorkerConfig;
@@ -491,6 +566,30 @@ function readBudgetState(cfg: WorkerConfig): { ok: true; remainingSeconds: numbe
 	return { ok: true, remainingSeconds: Math.max(0, deadlineAt - Date.now() / 1000) };
 }
 
+/** Shared admission calculation, used before queueing and again after all waits. */
+function checkWindow(cfg: WorkerConfig, requested: number, required: number,
+    outerDeadline: number | null, estimateSource: string) {
+    let remaining: number | null = null;
+    let latestStart = Date.now() + requested * 1000;
+    if (cfg.deadlinePath) {
+        const state = readBudgetState(cfg);
+        if (!state.ok) return {timeout:0, latestStart:0, patch:{}, reason:state.reason};
+        remaining = state.remainingSeconds;
+        latestStart = Date.now() + (remaining - CHECK_RESERVE_SECONDS - required) * 1000;
+    }
+    const outer = outerDeadline === null ? null : Math.max(0, (outerDeadline-Date.now())/1000);
+    if (outerDeadline !== null) latestStart = Math.min(latestStart, outerDeadline - (CODEMODE_GRACE_SECONDS+required)*1000);
+    const window = Math.min(requested, remaining === null ? Infinity : remaining-CHECK_RESERVE_SECONDS,
+        outer === null ? Infinity : outer-CODEMODE_GRACE_SECONDS);
+    const patch: Record<string, unknown> = cfg.deadlinePath ? {remainingSeconds:roundSeconds(remaining!),
+        requiredSeconds:required, reserveSeconds:CHECK_RESERVE_SECONDS, allowedSeconds:Math.max(0,floorSeconds(window)), estimateSource} : {};
+    if (outer !== null) patch.codemodeRemainingSeconds = roundSeconds(outer);
+    const reason = required <= window ? null : requested < required ? "timeout_below_estimate: effective command cap is below estimate; adjust timeoutSeconds only within the authorized cap to cover a trusted estimate, or correct the estimate only when evidence supports it"
+        : remaining !== null && remaining-CHECK_RESERVE_SECONDS < required ? "insufficient_budget: round reserve leaves too little time"
+        : "codemode_deadline_too_short: run this check directly or use a sufficient script deadline";
+    return {timeout:window, latestStart, patch, reason};
+}
+
 async function worktreeClean(cfg: WorkerConfig, signal?: AbortSignal): Promise<{ ok: boolean; reason?: string }> {
 	const result = await run("git", ["status", "--porcelain"], cfg.worktree, signal, CLEAN_STATUS_TIMEOUT_MS);
 	if (result.timedOut || result.code === null || result.code !== 0) {
@@ -504,6 +603,7 @@ async function worktreeClean(cfg: WorkerConfig, signal?: AbortSignal): Promise<{
 
 function run(cmd: string, args: string[], cwd: string, signal?: AbortSignal, limitMs = 0): Promise<RunResult> {
 	return new Promise((resolve) => {
+		if (signal?.aborted) { resolve({code:null, stdout:"", stderr:"cancelled", timedOut:false}); return; }
 		let stdout = "";
 		let stderr = "";
 		let timedOut = false;
@@ -523,6 +623,332 @@ function run(cmd: string, args: string[], cwd: string, signal?: AbortSignal, lim
 			resolve({ code, stdout, stderr, timedOut });
 		});
 	});
+}
+
+/** Soft in-process permit pool shared by every check of this worker process.
+ *
+ * It never persists, never touches the board and never coordinates across
+ * worker processes. A permit is accounting for declared estimates only: CPU
+ * slots are a concurrency estimate and memoryMiB is an admission estimate, not
+ * an OS affinity or a hard memory cap. Unknown or undeclared checks are
+ * exclusive; parallel admission requires an explicit ``parallelSafe``
+ * declaration plus a free count/CPU/memory/shared-key combination. The queue
+ * is strictly FIFO so a waiting exclusive check cannot be starved by later
+ * parallel work, and any cancellation releases the permit it holds.
+ */
+interface CheckRequirement {
+	parallelSafe: boolean;
+	cpuSlots: number;
+	memoryMiB: number;
+	exclusiveKeys: string[];
+	declaration: CheckResources | null;
+}
+
+interface PoolLimits {
+	maxConcurrent: number;
+	cpuSlots: number;
+	memoryMiB: number | null;
+}
+
+interface AcquireResult {
+	granted: boolean;
+	cancelled: boolean;
+	expired?: boolean;
+	queueSeconds: number;
+}
+
+function poolLimits(cfg: WorkerConfig): PoolLimits {
+	const execution = cfg.checkExecution;
+	const maxConcurrent = execution?.maxConcurrent ?? 1;
+	return { maxConcurrent, cpuSlots: Math.min(execution?.cpuSlots ?? os.availableParallelism(), os.availableParallelism()),
+		memoryMiB: execution?.memoryMiB ?? null };
+}
+
+/** An undeclared or non-parallel-safe check holds the whole pool: one at a time. */
+function exclusiveRequirement(cfg: WorkerConfig, declaration: CheckResources | null): CheckRequirement {
+	const limits = poolLimits(cfg);
+	return { parallelSafe: false, cpuSlots: limits.cpuSlots, memoryMiB: limits.memoryMiB ?? 0,
+		exclusiveKeys: declaration?.exclusiveKeys ?? [],
+		declaration };
+}
+
+/**
+ * Resolve the frozen resource declaration for one normalized argv. Contract
+ * validation already rejects contradictory same-argv metadata; if a run-time
+ * config still carries a contradiction the check is refused instead of guessed.
+ * The tool call itself cannot add or lower requirements.
+ */
+function resolveCheckRequirement(cfg: WorkerConfig, matches: ContractItem[]):
+	{ req: CheckRequirement; problem: string | null } {
+	const declarations = matches.map((item) => item.checkResources)
+		.filter((entry): entry is CheckResources => entry !== undefined);
+	if (declarations.length === 0) {
+		return { req: exclusiveRequirement(cfg, null), problem: null };
+	}
+	if (declarations.length !== matches.length) {
+		return { req: exclusiveRequirement(cfg, null),
+			problem: "some matching acceptance items declare checkResources and others do not" };
+	}
+	if (new Set(declarations.map((entry) => JSON.stringify(entry))).size > 1) {
+		return { req: exclusiveRequirement(cfg, null),
+			problem: "matching acceptance items declare contradictory checkResources" };
+	}
+	const declaration = declarations[0];
+	if (declaration.parallelSafe !== true || declaration.cpuSlots === undefined
+		|| declaration.memoryMiB === undefined || poolLimits(cfg).memoryMiB === null) {
+		return { req: exclusiveRequirement(cfg, declaration), problem: null };
+	}
+	const cpuSlots = declaration.cpuSlots ?? 1;
+	const memoryMiB = declaration.memoryMiB ?? 0;
+	const exclusiveKeys = declaration.exclusiveKeys ?? [];
+	return { req: { parallelSafe: true, cpuSlots, memoryMiB, exclusiveKeys,
+		declaration }, problem: null };
+}
+
+/** Immediate structured refusal when declared needs cannot ever fit the pool. */
+function resourceCapacityProblem(cfg: WorkerConfig, declaration: CheckResources | null): string | null {
+	if (declaration === null) return null;
+	const limits = poolLimits(cfg);
+	if (declaration.cpuSlots !== undefined && declaration.cpuSlots > limits.cpuSlots) {
+		return `resource_exceeds_pool: declared cpuSlots ${declaration.cpuSlots} exceed the pool capacity `
+			+ `${limits.cpuSlots}; this check would never be admitted`;
+	}
+	if (declaration.memoryMiB !== undefined && limits.memoryMiB !== null
+		&& declaration.memoryMiB > limits.memoryMiB) {
+		return `resource_exceeds_pool: declared memoryMiB ${declaration.memoryMiB} exceed the pool budget `
+			+ `${limits.memoryMiB}; this check would never be admitted`;
+	}
+	return null;
+}
+
+interface PoolWaiter {
+	req: CheckRequirement;
+	resolve: (result: AcquireResult) => void;
+	granted: boolean;
+	cancelled: boolean;
+	enqueuedAt: number;
+	removeAbort: (() => void) | null;
+	timer: ReturnType<typeof setTimeout> | null;
+}
+
+class CheckPool {
+	private readonly limits: PoolLimits;
+	private readonly running: CheckRequirement[] = [];
+	private readonly waiters: PoolWaiter[] = [];
+	private usedCpu = 0;
+	private usedMemory = 0;
+	private readonly keys = new Map<string, number>();
+
+	constructor(limits: PoolLimits) {
+		this.limits = limits;
+	}
+
+	snapshot(): Record<string, unknown> {
+		return {
+			maxConcurrent: this.limits.maxConcurrent,
+			cpuSlots: this.limits.cpuSlots,
+			memoryMiB: this.limits.memoryMiB,
+			running: this.running.length,
+			queued: this.waiters.length,
+			usedCpu: this.usedCpu,
+			usedMemory: this.usedMemory,
+		};
+	}
+
+	acquire(req: CheckRequirement, signal: AbortSignal | undefined, latestStart: number): Promise<AcquireResult> {
+		if (Date.now() >= latestStart) return Promise.resolve({granted:false, cancelled:false, expired:true, queueSeconds:0});
+		if (signal?.aborted) {
+			return Promise.resolve({ granted: false, cancelled: true, queueSeconds: 0 });
+		}
+		if (this.waiters.length === 0 && this.canGrant(req)) {
+			this.startRunning(req);
+			return Promise.resolve({ granted: true, cancelled: false, queueSeconds: 0 });
+		}
+		return new Promise<AcquireResult>((resolve) => {
+			const waiter: PoolWaiter = { req, resolve, granted: false, cancelled: false,
+				enqueuedAt: Date.now(), removeAbort: null, timer: null };
+			if (signal) {
+				const onAbort = () => {
+					waiter.cancelled = true;
+					if (waiter.granted) return; // already admitted; run() stops the owned child
+					this.finish(waiter, { granted: false, cancelled: true,
+						queueSeconds: roundSeconds((Date.now() - waiter.enqueuedAt) / 1000) });
+				};
+				signal.addEventListener("abort", onAbort, { once: true });
+				waiter.removeAbort = () => signal.removeEventListener("abort", onAbort);
+			}
+			waiter.timer = setTimeout(() => this.finish(waiter, {granted:false, cancelled:false, expired:true,
+				queueSeconds: roundSeconds((Date.now() - waiter.enqueuedAt)/1000)}), Math.min(latestStart-Date.now(), CODEMODE_MAX_TIMEOUT_MS));
+			this.waiters.push(waiter);
+			this.pump();
+		});
+	}
+
+	release(req: CheckRequirement): void {
+		const index = this.running.indexOf(req);
+		if (index < 0) return;
+		this.running.splice(index, 1);
+		this.usedCpu -= req.cpuSlots;
+		this.usedMemory -= req.memoryMiB;
+		for (const key of req.exclusiveKeys) {
+			const left = (this.keys.get(key) ?? 0) - 1;
+			if (left > 0) this.keys.set(key, left);
+			else this.keys.delete(key);
+		}
+		this.pump();
+	}
+
+	private canGrant(req: CheckRequirement): boolean {
+		if (!req.parallelSafe) return this.running.length === 0;
+		if (this.running.some((item) => !item.parallelSafe) || this.running.length >= this.limits.maxConcurrent) return false;
+		if (this.usedCpu + req.cpuSlots > this.limits.cpuSlots) return false;
+		if (this.limits.memoryMiB !== null
+			&& this.usedMemory + req.memoryMiB > this.limits.memoryMiB) return false;
+		return !req.exclusiveKeys.some((key) => (this.keys.get(key) ?? 0) > 0);
+	}
+
+	private startRunning(req: CheckRequirement): void {
+		this.running.push(req);
+		this.usedCpu += req.cpuSlots;
+		this.usedMemory += req.memoryMiB;
+		for (const key of req.exclusiveKeys) this.keys.set(key, (this.keys.get(key) ?? 0) + 1);
+	}
+
+	private finish(waiter: PoolWaiter, result: AcquireResult): void {
+		if (waiter.timer) clearTimeout(waiter.timer);
+		waiter.removeAbort?.();
+		waiter.removeAbort = null;
+		const index = this.waiters.indexOf(waiter);
+		if (index >= 0) this.waiters.splice(index, 1);
+		waiter.resolve(result);
+		this.pump();
+	}
+
+	/** Strict FIFO: only the head is considered, so an exclusive check never starves. */
+	private pump(): void {
+		while (this.waiters.length > 0) {
+			const waiter = this.waiters[0];
+			if (waiter.cancelled) {
+				this.waiters.shift();
+				continue;
+			}
+			if (!this.canGrant(waiter.req)) break;
+			this.waiters.shift();
+			waiter.granted = true;
+			if (waiter.timer) clearTimeout(waiter.timer);
+			waiter.removeAbort?.();
+			waiter.removeAbort = null;
+			this.startRunning(waiter.req);
+			waiter.resolve({ granted: true, cancelled: false,
+				queueSeconds: roundSeconds((Date.now() - waiter.enqueuedAt) / 1000) });
+		}
+	}
+}
+
+// -- memory pressure sampling -------------------------------------------------
+// The probe is a short read-only observation at the admission boundary only.
+// macOS uses the kernel pressure level; Linux uses MemAvailable/MemTotal and is
+// explicitly labelled as an availability estimate, not the same classification.
+// A failed or unknown probe degrades to exclusive serial admission instead of
+// claiming the machine has headroom. It never changes system or Docker settings.
+type PressureState = "normal" | "high" | "low" | "unknown";
+
+interface PressureSnapshot {
+	state: PressureState;
+	platform: string;
+	source: string;
+	metric: string;
+	value: string | null;
+	availableMiB: number | null;
+	totalMiB: number | null;
+	thresholdMiB: number | null;
+	synthetic: boolean;
+	error: string | null;
+}
+
+const PRESSURE_SNAPSHOT_ENV = "CODEX_PI_PRESSURE_SNAPSHOT";
+const MAX_PRESSURE_SNAPSHOT_BYTES = 65_536;
+const MAX_MEMINFO_BYTES = 65_536;
+const PRESSURE_PROBE_LIMIT_MS = 2_000;
+const LINUX_MIN_AVAILABLE_MIB = 256;
+const LINUX_MIN_AVAILABLE_FRACTION = 0.05;
+
+function pressureOverride(base: PressureSnapshot): PressureSnapshot | null {
+	const file = process.env[PRESSURE_SNAPSHOT_ENV];
+	if (!file) return null;
+	try {
+		const stat = fs.statSync(file);
+		if (!stat.isFile() || stat.size > MAX_PRESSURE_SNAPSHOT_BYTES) {
+			throw new Error("snapshot is not a bounded regular file");
+		}
+		const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+		const state = parsed.state;
+		if (state !== "normal" && state !== "high" && state !== "low" && state !== "unknown") {
+			throw new Error("snapshot state must be normal/high/low/unknown");
+		}
+		return { ...base, state, synthetic: true, source: file,
+			metric: typeof parsed.metric === "string" ? parsed.metric : "injected test snapshot",
+			availableMiB: positiveFinite(parsed.availableMiB), thresholdMiB: positiveFinite(parsed.thresholdMiB),
+			value: typeof parsed.value === "string" ? parsed.value : null,
+			error: typeof parsed.error === "string" ? parsed.error : null };
+	} catch (error) {
+		return { ...base, state: "unknown", synthetic: true, source: file,
+			error: `invalid pressure snapshot: ${String(error)}` };
+	}
+}
+
+async function samplePressure(): Promise<PressureSnapshot> {
+	const base: PressureSnapshot = { state: "unknown", platform: process.platform,
+		source: "none", metric: "none", value: null, availableMiB: null, totalMiB: null,
+		thresholdMiB: null, synthetic: false, error: null };
+	const injected = pressureOverride(base);
+	if (injected) return injected;
+	if (process.platform === "darwin") {
+		const result = await run("/usr/sbin/sysctl", ["-n", "kern.memorystatus_vm_pressure_level"],
+			process.cwd(), undefined, PRESSURE_PROBE_LIMIT_MS);
+		const raw = result.stdout.trim();
+		const level = /^\d+$/.test(raw) ? Number(raw) : NaN;
+		return { ...base, source: "sysctl kern.memorystatus_vm_pressure_level",
+			metric: "read-only kernel vm pressure level (1 normal, >=2 elevated)", value: raw || null,
+			state: result.code !== 0 || result.timedOut ? "unknown"
+				: level === 1 ? "normal" : Number.isFinite(level) && level >= 2 ? "high" : "unknown",
+			error: result.timedOut ? "probe timed out" : result.code === 0 ? null : `probe exit ${result.code}` };
+	}
+	if (process.platform === "linux") {
+		try {
+			const fd = fs.openSync("/proc/meminfo", "r");
+			let raw: string;
+			try {
+				const buffer = Buffer.alloc(MAX_MEMINFO_BYTES);
+				const read = fs.readSync(fd, buffer, 0, buffer.length, 0);
+				raw = buffer.subarray(0, read).toString("utf8");
+			} finally {
+				fs.closeSync(fd);
+			}
+			const total = /^MemTotal:\s+(\d+) kB$/m.exec(raw);
+			const available = /^MemAvailable:\s+(\d+) kB$/m.exec(raw);
+			if (!total || !available) {
+				return { ...base, source: "/proc/meminfo", metric: "MemAvailable/MemTotal",
+					error: "MemTotal or MemAvailable is missing" };
+			}
+			const totalMiB = Number(total[1]) / 1024;
+			const availableMiB = Number(available[1]) / 1024;
+			if (!Number.isFinite(totalMiB) || !Number.isFinite(availableMiB) || totalMiB <= 0 || availableMiB < 0 || availableMiB > totalMiB) return {...base,error:"invalid memory availability"};
+			const thresholdMiB = Math.max(LINUX_MIN_AVAILABLE_MIB,
+				totalMiB * LINUX_MIN_AVAILABLE_FRACTION);
+			return { ...base, source: "/proc/meminfo",
+				metric: "MemAvailable availability estimate (not macOS-style pressure)",
+				value: `${Math.round(availableMiB)} MiB available`,
+				availableMiB: Math.round(availableMiB), totalMiB: Math.round(totalMiB),
+				thresholdMiB: Math.round(thresholdMiB),
+				state: availableMiB < thresholdMiB ? "low" : "normal" };
+		} catch (error) {
+			return { ...base, source: "/proc/meminfo", metric: "MemAvailable/MemTotal",
+				error: String(error) };
+		}
+	}
+	return { ...base, source: process.platform, metric: "no supported probe",
+		error: "unsupported platform" };
 }
 
 function lastJson(text: string): Record<string, any> | null {
@@ -545,7 +971,8 @@ function textResult(text: string, details: unknown, structured: unknown, isError
 
 function checkStructured(id: string, ok: boolean, patch: Record<string, unknown> = {}) {
 	return { id, ok, exit_code: null, timed_out: false, cancelled: false, receipt: null,
-		test_counts: null, log_tail: null, error: null, ...patch };
+		test_counts: null, log_tail: null, error: null, queueSeconds: null, resourceMode: null,
+		resourceDeclaration: null, pressureState: null, pressureSynthetic: null, pool: null, ...patch };
 }
 
 /** Structured refusal: no child, no receipt, no fake success evidence. */
@@ -571,6 +998,12 @@ const CHECK_OUTPUT_SCHEMA = {
 		estimateSource: { type: ["string", "null"] },
 		targetedCommand: { type: ["string", "null"] },
 		codemodeRemainingSeconds: { type: ["number", "null"] },
+		queueSeconds: { type: ["number", "null"] },
+		resourceMode: { type: ["string", "null"] },
+		resourceDeclaration: { type: ["object", "null"] },
+		pressureState: { type: ["string", "null"] },
+		pressureSynthetic: { type: ["boolean", "null"] },
+		pool: { type: ["object", "null"] },
 	},
 	required: ["id", "ok", "exit_code", "timed_out", "cancelled"],
 } as never;
@@ -608,11 +1041,13 @@ function writeReady(cfg: WorkerConfig, version: string): void {
 
 export default async function (pi: ExtensionAPI) {
 	let cfg: WorkerConfig | null = null;
+	let pool: CheckPool | null = null;
 	const codemodeDeadlines = new Map<string, number>();
 	try {
 		// The load proof is written only after the native codemode tool registered: a Pi without
 		// the public export, or a failing registration, must not let the round claim it loaded.
 		cfg = loadConfig(process.env.CODEX_PI_WORKER_CONFIG);
+		pool = new CheckPool(poolLimits(cfg));
 		const host = await import("@earendil-works/pi-coding-agent");
 		host.createCodemodeExtension({ models: false, mode: "on" })(pi);
 		writeReady(cfg, typeof host.VERSION === "string" ? host.VERSION : "unknown");
@@ -721,7 +1156,7 @@ export default async function (pi: ExtensionAPI) {
 		} as never,
 		outputSchema: CHECK_OUTPUT_SCHEMA,
 		async execute(toolCallId: string, params: any, signal: AbortSignal | undefined) {
-			if (!cfg) {
+			if (!cfg || !pool) {
 				const error = "worker configuration is unavailable";
 				return textResult(error, {}, checkStructured("", false, { error }), true);
 			}
@@ -759,86 +1194,107 @@ export default async function (pi: ExtensionAPI) {
 			if (advice.problem !== null) {
 				return refuseCheck(checkId, `contract_metadata: ${advice.problem}`);
 			}
-			if (advice.targeted !== null) {
-				if (params.final !== true) {
-					return refuseCheck(checkId,
-						`final_required: this is a full acceptance command; run the targeted check first (${advice.targeted}) ` +
-						"and pass final:true only on the clean final candidate",
-						{ targetedCommand: advice.targeted });
-				}
-				const clean = await worktreeClean(cfg, signal);
-				if (!clean.ok) {
-					return refuseCheck(checkId, `dirty_final: ${clean.reason}`,
-						{ targetedCommand: advice.targeted });
-				}
+			if (advice.targeted !== null && params.final !== true) {
+				return refuseCheck(checkId,
+					`final_required: this is a full acceptance command; run the targeted check first (${advice.targeted}) ` +
+					"and pass final:true only on the clean final candidate",
+					{ targetedCommand: advice.targeted });
 			}
-			let timeout = requested;
-			let budgetPatch: Record<string, unknown> = {};
-			if (typeof cfg.deadlinePath === "string") {
-				const state = readBudgetState(cfg);
-				if (!state.ok) return refuseCheck(checkId, state.reason);
-				const remainingSeconds = state.remainingSeconds;
-				const available = remainingSeconds - CHECK_RESERVE_SECONDS;
-				const estimate = contractEstimate(matches);
-				if (estimate.problem !== null) {
-					return refuseCheck(checkId, `invalid_estimate: the contract estimate for ` +
-						`${estimate.problem} is not a finite positive number`);
-				}
-				const values = [callEstimate, estimate.value].filter((value): value is number => value !== null);
-				// Without an estimate the effective requested/contract cap is the conservative
-				// requirement; phase remaining is a constraint, never an expected duration.
-				const requiredSeconds = values.length > 0 ? Math.max(...values) : requested;
-				const estimateSource = callEstimate !== null && estimate.value !== null ? "contract+call"
-					: callEstimate !== null ? "call" : estimate.value !== null ? "contract" : "timeout";
-				// One final effective execution window: the requested/contract cap, the phase
-				// remaining minus the fixed wrap-up reserve, and a verifiable codemode outer
-				// deadline minus its cleanup grace. The estimate must fit this window, and the
-				// admitted helper timeout is the window itself: a fractional window is never
-				// rounded down below the requirement.
-				let windowSeconds = Math.min(requested, available);
-				let outerRemaining: number | null = null;
-				const separator = toolCallId.indexOf("/");
-				if (separator > 0) {
-					// A nested check runs inside the codemode script's outer deadline, which the
-					// native context does not expose directly. This extension recorded its own
-					// normalized timeout at the parent tool_call; without that record the envelope
-					// is unverifiable and the check must run directly instead.
-					const outerDeadline = codemodeDeadlines.get(toolCallId.slice(0, separator));
-					if (outerDeadline === undefined) {
-						return refuseCheck(checkId,
-							"codemode_deadline_unknown: a check from codemode has no verifiable outer deadline; " +
-							"run it directly with the check tool",
-							{ requiredSeconds: roundSeconds(requiredSeconds), reserveSeconds: CHECK_RESERVE_SECONDS });
-					}
-					outerRemaining = Math.max(0, (outerDeadline - Date.now()) / 1000);
-					windowSeconds = Math.min(windowSeconds, outerRemaining - CODEMODE_GRACE_SECONDS);
-				}
-				const allowedSeconds = Math.max(0, floorSeconds(windowSeconds));
-				if (requiredSeconds > windowSeconds) {
-					const patch = { remainingSeconds: roundSeconds(remainingSeconds),
-						requiredSeconds: roundSeconds(requiredSeconds),
-						reserveSeconds: CHECK_RESERVE_SECONDS, allowedSeconds };
-					if (requested < requiredSeconds) {
-						return refuseCheck(checkId,
-							`timeout_below_estimate: the requested or contract window ` +
-							`${roundSeconds(requested)}s is below the required ${roundSeconds(requiredSeconds)}s; ` +
-							"adjust timeoutSeconds only within the authorized cap to cover a trusted estimate, " +
-							"or correct the estimate only when evidence supports it", patch);
-					}
-					if (available < requiredSeconds) {
-						return refuseCheck(checkId,
-							`insufficient_budget: ${roundSeconds(remainingSeconds)}s remain minus a ` +
-							`${CHECK_RESERVE_SECONDS}s reserve, below the required ${roundSeconds(requiredSeconds)}s`,
-							patch);
-					}
-					return refuseCheck(checkId,
-						`codemode_deadline_too_short: ${roundSeconds(outerRemaining ?? 0)}s remain in the codemode ` +
-						`script but ${roundSeconds(requiredSeconds)}s are required; run it directly with the check tool`,
-						{ ...patch, codemodeRemainingSeconds: roundSeconds(outerRemaining ?? 0) });
-				}
-				timeout = windowSeconds;
-				budgetPatch = { requiredSeconds: roundSeconds(requiredSeconds), estimateSource, allowedSeconds };
+			const estimate = contractEstimate(matches);
+			if (estimate.problem !== null) {
+				return refuseCheck(checkId, `invalid_estimate: the contract estimate for ` +
+					`${estimate.problem} is not a finite positive number`);
 			}
+			const values = [callEstimate, estimate.value].filter((value): value is number => value !== null);
+			// Without an estimate the effective requested/contract cap is the conservative
+			// requirement; phase remaining is a constraint, never an expected duration.
+			const requiredSeconds = values.length > 0 ? Math.max(...values) : requested;
+			const estimateSource = callEstimate !== null && estimate.value !== null ? "contract+call"
+				: callEstimate !== null ? "call" : estimate.value !== null ? "contract" : "timeout";
+			const resolved = resolveCheckRequirement(cfg, matches);
+			const resourceObservations: Record<string, unknown> = {
+				resourceMode: resolved.req.parallelSafe ? "parallel" : "exclusive",
+				resourceDeclaration: resolved.req.declaration,
+				pool: pool.snapshot(),
+			};
+			if (resolved.problem !== null) {
+				return refuseCheck(checkId, `contract_metadata: ${resolved.problem}; refusing to guess`,
+					{ ...resourceObservations, requiredSeconds: roundSeconds(requiredSeconds) });
+			}
+			const capacityProblem = resourceCapacityProblem(cfg, resolved.req.declaration);
+			if (capacityProblem !== null) {
+				return refuseCheck(checkId, capacityProblem,
+					{ ...resourceObservations, requiredSeconds: roundSeconds(requiredSeconds) });
+			}
+			// A nested check runs inside the codemode script's outer deadline, which the
+			// native context does not expose directly. This extension recorded its own
+			// normalized timeout at the parent tool_call; without that record the envelope
+			// is unverifiable and the check must run directly instead. The deadline is
+			// re-read after any queue wait, never trusted from enqueue time.
+			let outerDeadline: number | null = null;
+			const separator = toolCallId.indexOf("/");
+			if (separator > 0) {
+				const recorded = codemodeDeadlines.get(toolCallId.slice(0, separator));
+				if (recorded === undefined) {
+					return refuseCheck(checkId,
+						"codemode_deadline_unknown: a check from codemode has no verifiable outer deadline; " +
+						"run it directly with the check tool",
+						{ ...resourceObservations, requiredSeconds: roundSeconds(requiredSeconds),
+							reserveSeconds: CHECK_RESERVE_SECONDS });
+				}
+				outerDeadline = recorded;
+			}
+            // One acquisition loop; pressure becoming unknown can only downgrade
+            // once to an exclusive permit. Every await consumes the original budget.
+            const queueStarted = Date.now();
+            let req = resolved.req;
+            let pressure = await samplePressure();
+            let held = false;
+            let pressurePatch: Record<string, unknown> = {};
+            let queueObservations: Record<string, unknown> = {};
+            try {
+                for (;;) {
+                    if (signal?.aborted) return refuseCheck(checkId, "cancelled_before_spawn", {cancelled:true});
+                    if (pressure.state === "high" || pressure.state === "low") {
+                        return refuseCheck(checkId, "memory_pressure: refusing new check", {pressureState:pressure.state, pressureSynthetic:pressure.synthetic});
+                    }
+                    if (pressure.state === "unknown") req = exclusiveRequirement(cfg, resolved.req.declaration);
+                    if (pressure.availableMiB !== null && pressure.availableMiB < req.memoryMiB + (pressure.thresholdMiB ?? 0)) {
+                        return refuseCheck(checkId, "memory_pressure: available memory below declared requirement plus headroom",
+                            {pressureState:pressure.state, availableMiB:pressure.availableMiB, requiredMiB:req.memoryMiB});
+                    }
+                    const admission = checkWindow(cfg, requested, requiredSeconds, outerDeadline, estimateSource);
+                    if (admission.reason) return refuseCheck(checkId, admission.reason, admission.patch);
+                    const acquired = await pool.acquire(req, signal, admission.latestStart);
+                    queueObservations = {...resourceObservations, resourceMode:req.parallelSafe ? "parallel" : "exclusive",
+                        queueSeconds:roundSeconds((Date.now()-queueStarted)/1000), pool:pool.snapshot()};
+                    if (!acquired.granted) return refuseCheck(checkId,
+                        acquired.cancelled ? "cancelled_while_waiting" : "insufficient_budget_while_waiting",
+                        {...queueObservations, cancelled:acquired.cancelled, requiredSeconds});
+                    held = true;
+                    if (advice.targeted !== null) {
+                        const clean = await worktreeClean(cfg, signal);
+                        if (!clean.ok) return refuseCheck(checkId, `dirty_final: ${clean.reason}`,
+                            {...queueObservations, targetedCommand:advice.targeted});
+                    }
+                    pressure = await samplePressure();
+                    if (pressure.state === "unknown" && req.parallelSafe) {
+                        pool.release(req); held = false;
+                        req = exclusiveRequirement(cfg, resolved.req.declaration);
+                        continue;
+                    }
+                    break;
+                }
+                pressurePatch = {pressureState:pressure.state, pressureSynthetic:pressure.synthetic, pressureMetric:pressure.metric};
+                if (pressure.state === "high" || pressure.state === "low" || (pressure.availableMiB !== null
+                    && pressure.availableMiB < req.memoryMiB + (pressure.thresholdMiB ?? 0))) {
+                    return refuseCheck(checkId, "memory_pressure: insufficient headroom after queue wait", {...queueObservations,...pressurePatch});
+                }
+                if (signal?.aborted) return refuseCheck(checkId, "cancelled_before_spawn", {...queueObservations,cancelled:true});
+            const admission = checkWindow(cfg, requested, requiredSeconds, outerDeadline, estimateSource);
+            if (admission.reason) return refuseCheck(checkId, admission.reason, {...queueObservations,...pressurePatch,...admission.patch});
+            const timeout = admission.timeout;
+            const budgetPatch = admission.patch;
 			const args = [path.join(cfg.toolsDir, "pi_check.py"), "--output-dir", cfg.checksDir, "--id", checkId,
 				"--timeout-seconds", String(timeout)];
 			if (params.watchPath !== undefined || params.maxBytes !== undefined) {
@@ -856,7 +1312,8 @@ export default async function (pi: ExtensionAPI) {
 			if (!summary) {
 				const error = `pi_check produced no receipt summary (exit ${result.code}): ${result.stderr.slice(-500)}`;
 				return textResult(error, { code: result.code },
-					checkStructured(checkId, false, { exit_code: result.code, error, elapsedSeconds }), true);
+					checkStructured(checkId, false, { exit_code: result.code, error, elapsedSeconds,
+						...queueObservations, ...pressurePatch }), true);
 			}
 			const failed = summary.exit_code !== 0 || summary.timed_out === true || summary.cancelled === true;
 			const structured = checkStructured(checkId, !failed, {
@@ -868,13 +1325,19 @@ export default async function (pi: ExtensionAPI) {
 				error: failed ? (summary.timed_out ? "timed_out" : summary.cancelled ? "cancelled" : `exit ${summary.exit_code}`) : null,
 				elapsedSeconds,
 				...budgetPatch,
+				...queueObservations,
+				...pressurePatch,
 			});
 			const counts = summary.test_counts && typeof summary.test_counts === "object"
 				? ` counts=${JSON.stringify(summary.test_counts)}` : "";
 			const lines = [`check ${params.id}: exit=${summary.exit_code}${summary.timed_out ? " TIMED_OUT" : ""}${summary.cancelled ? " CANCELLED" : ""}${counts} elapsed=${elapsedSeconds}s`,
+				`queue=${queueObservations.queueSeconds}s resources=${structured.resourceMode}`,
 				`receipt=${summary.receipt}`];
 			if (typeof summary.log_tail === "string") lines.push("log_tail:", summary.log_tail);
 			return textResult(lines.join("\n"), summary, structured, failed);
+			} finally {
+				if (held) pool.release(req);
+			}
 		},
 	});
 
