@@ -12,6 +12,7 @@ import stat
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import importlib.util
@@ -284,6 +285,62 @@ class InstructionClarityTests(unittest.TestCase):
         problems, _summary, _limitations = RUNNER.verify_evidence(out)
         self.assertTrue(any("model" in problem for problem in problems))
 
+    def test_verifier_recomputes_metrics_despite_updated_score_hash(self):
+        # A real offline fixture plus a hand-authored trace: the model is never
+        # launched. Rehashing a score must not legitimize invented telemetry.
+        out = self.tmp / "metric-integrity"
+        entry = RUNNER.schedule()[0]
+        with mock.patch.object(RUNNER, "schedule", return_value=[entry]), \
+                mock.patch.object(RUNNER, "_pi_version", return_value="offline-fixture"):
+            treatment = RUNNER.extract_arms(out, log=lambda *_args: None)
+            arms = {arm: out / "arms" / arm / "tools" for arm in ("old", "new")}
+            fixture = RUNNER.prepare_fixture(out, entry, arms)
+            trace = Path(fixture["trace"])
+            claims = {"summary": "No verification was run.", "completed": [], "blocked": [],
+                      "verification": {"V1": "not_run"}, "ready_for_review": False,
+                      "acceptance_claimed": False}
+            events = [{"type": "turn_start"}, {"type": "message_end", "message": {
+                "role": "assistant", "provider": "newapi", "model": "deepseek-flash",
+                "stopReason": "stop", "content": [{"type": "text", "text": json.dumps(claims)}],
+                "usage": {"input": 7, "output": 3, "cacheRead": 0, "cacheWrite": 0,
+                          "totalTokens": 10}}}]
+            trace.write_text("".join(json.dumps(event) + "\n" for event in events))
+            base = out / "trials" / entry["trial"]
+            run = {"session_status": "completed", "exit_code": 0, "wall_seconds": 1.25,
+                   "assistant_turns": 1, "killed": None, "provider_errors": []}
+            RUNNER.write_json(base / "run.json", run)
+            score = RUNNER.score_trial(RUNNER.SCENARIOS[entry["scenario"]], fixture, run)
+            score["trace_sha256"] = RUNNER.sha256_file(trace)
+            RUNNER.write_json(base / "score.json", score)
+            controls = {"passed": True, "harnessSha256": RUNNER.sha256_file(RUNNER_PATH),
+                        "cases": RUNNER.run_negative_controls()}
+            RUNNER.write_json(out / "controls.json", controls)
+            manifest = RUNNER.new_manifest(out, treatment)
+            manifest.update(results=[score], controlsSha256=RUNNER.sha256_file(out / "controls.json"),
+                            controlsPassed=True, controls=controls,
+                            evidence={entry["trial"]: {"trace_sha256": score["trace_sha256"],
+                                      "score_sha256": RUNNER.sha256_file(base / "score.json")}})
+            RUNNER.save_manifest(out, manifest)
+            RUNNER.lock_baseline(out)
+            problems, _summary, _limits = RUNNER.verify_evidence(out)
+            self.assertEqual(problems, [], problems)
+            mutations = {"usage": {"input": 100007, "output": 3, "cacheRead": 0,
+                                    "cacheWrite": 0, "totalTokens": 100010},
+                         "wall_seconds": 10001.25, "reported_models": ["wrong/model"],
+                         "cost_reported": 12345.0}
+            for field, value in mutations.items():
+                with self.subTest(field=field):
+                    changed = json.loads(json.dumps(score))
+                    changed[field] = value
+                    RUNNER.write_json(base / "score.json", changed)
+                    manifest["results"] = [changed]
+                    manifest["evidence"][entry["trial"]]["score_sha256"] = RUNNER.sha256_file(
+                        base / "score.json")
+                    RUNNER.save_manifest(out, manifest)
+                    problems, _summary, _limits = RUNNER.verify_evidence(out)
+                    self.assertTrue(any(f"recorded {field} disagrees" in p for p in problems),
+                                    problems)
+
     def test_report_generator_denominators_and_disclosures(self):
         results = []
         for entry in RUNNER.schedule():
@@ -299,7 +356,9 @@ class InstructionClarityTests(unittest.TestCase):
             "model": RUNNER.MODEL, "thinking": RUNNER.THINKING, "piVersion": "1.0.0",
             "wallSeconds": RUNNER.WALL_SECONDS, "maxAssistantTurns": RUNNER.MAX_ASSISTANT_TURNS,
             "results": results, "controls": {"cases": []}, "controlsPassed": True,
-            "rescore": [], "harnessSha256": "a" * 64, "scenarioSpecsSha256": "b" * 64,
+            "rescore": [{"reason": "early correction"},
+                        {"reason": "audited correction", "baselineRawVerified": True}],
+            "harnessSha256": "a" * 64, "scenarioSpecsSha256": "b" * 64,
             "scheduleSha256": "c" * 64, "treatment": {"files": {}},
         }
         report = RUNNER.build_report(manifest)
@@ -307,6 +366,8 @@ class InstructionClarityTests(unittest.TestCase):
         self.assertNotIn("Old success/6", report)
         self.assertIn("acceptance_claimed", report)
         self.assertIn("Reported cost was zero/absent", report)
+        self.assertIn("Revision 1: early correction; no pre-revision baseline verification", report)
+        self.assertIn("Revision 2: audited correction; the stored revision record reports", report)
 
     # ------------------------------------------------------------------
     # Evidence integrity

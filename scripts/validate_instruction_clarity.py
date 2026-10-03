@@ -2565,11 +2565,13 @@ def verify_evidence(out: Path, manifest: dict | None = None, baseline: dict | No
         model_evidence_counts[verdict] = model_evidence_counts.get(verdict, 0) + 1
         problems.extend(f"{trial}: {problem}" for problem in model_problems)
         recomputed = score_trial(SCENARIOS[entry["scenario"]], fixture, run_meta)
-        for field in ("session_status", "exit_code", "assistant_turns", "turn_start_count",
-                      "family_success", "subscores", "violations", "claims", "claims_present",
-                      "report_status", "first_relevant_action", "first_action_correct",
-                      "first_action_stance", "guard_blocked", "receipts"):
-            if score.get(field) != recomputed.get(field):
+        # Bind every reported field, including usage, wall time and model metadata.
+        # Updating a score hash cannot authorize changing facts derived from raw files.
+        recomputed["trace_sha256"] = sha256_file(trace) if trace.is_file() else None
+        if set(score) != set(recomputed):
+            problems.append(f"{trial}: score fields differ from the recomputed schema")
+        for field in sorted(recomputed):
+            if field not in score or score[field] != recomputed[field]:
                 problems.append(f"{trial}: recorded {field} disagrees with recomputation "
                                 "from raw evidence")
     summary = {
@@ -2716,10 +2718,40 @@ def build_report(manifest: dict, baseline: dict | None = None) -> str:
     lines += [
         "",
         f"Audited completion counts under the current rules: old {total_old}/18, new {total_new}/18. "
-        "The +2 difference is one `insufficient_budget` session (old 2/3, new 3/3) and one "
-        "`estimate_correction` session (old 1/3, new 2/3); the other four families tie. Three "
-        "repetitions per family cannot establish broad significance; this is an observation, not proof "
-        "of improvement or capability equivalence.",
+        "The family table identifies where counts differ. Three repetitions per family cannot "
+        "establish broad significance; this is an observation, not proof of improvement or "
+        "capability equivalence.",
+        "",
+        "## Whole-arm observations",
+        "",
+        "| Arm | Session wall s | Uncached input | Cache read | Output | Reported total tokens |",
+        "|---|---|---|---|---|---|",
+    ]
+    for arm in ("old", "new"):
+        group = [r for r in results if r.get("arm") == arm]
+        wall = sum(r.get("wall_seconds") or 0 for r in group)
+        usage = {key: sum((r.get("usage") or {}).get(key) or 0 for r in group)
+                 for key in ("input", "cacheRead", "output", "totalTokens")}
+        lines.append(f"| {arm} | {wall:.1f} | {usage['input']} | {usage['cacheRead']} | "
+                     f"{usage['output']} | {usage['totalTokens']} |")
+    outcomes = {(r.get("scenario"), r.get("rep"), r.get("arm")): r.get("family_success")
+                for r in results}
+    new_only = old_only = ties = 0
+    for scenario in range(1, 7):
+        for rep in range(1, 4):
+            old = outcomes.get((scenario, rep, "old"))
+            new = outcomes.get((scenario, rep, "new"))
+            if isinstance(old, bool) and isinstance(new, bool):
+                new_only += int(new and not old)
+                old_only += int(old and not new)
+                ties += int(old == new)
+    lines += [
+        "",
+        f"Paired completion outcomes: new-only {new_only}, old-only {old_only}, ties {ties}.",
+        "These wall times include failed or turn-limited sessions. Reported token totals cover "
+        "observed final usage records; an interrupted request may have unreported consumption. "
+        "Prompt caching and cancellation make these observations unsuitable as proof of a "
+        "speed or billing advantage.",
         "",
         "## Failures, guard interceptions and violations",
         "",
@@ -2828,14 +2860,21 @@ def build_report(manifest: dict, baseline: dict | None = None) -> str:
     if not rescore:
         lines.append("- No offline scoring revisions were applied.")
     for index, event in enumerate(rescore, start=1):
-        lines.append(f"- Revision {index}: {event.get('reason')}; raw traces unchanged and verified "
-                     f"against the baseline before the revision.")
+        verification = (
+            "the stored revision record reports baseline verification before this revision"
+            if event.get("baselineRawVerified") is True
+            else "no pre-revision baseline verification was recorded; the preserved traces "
+                 "were checked retrospectively during review"
+        )
+        lines.append(f"- Revision {index}: {event.get('reason')}; {verification}.")
     lines += [
         "",
         "The round-4 revisions (1-2) are exploratory scoring corrections applied after execution; "
-        "they are not a pre-registered strict score. Revisions 3-5 are round-6 verifier/report "
-        "repairs: revision 4 changed only a diagnostic argument, and revisions 3-5 did not change "
-        "any trial's completion count. All re-scores reuse the same raw traces; the semantic changes "
+        "they are not a pre-registered strict score. Later revisions repair the verifier or report "
+        "without changing any trial's completion count. The final main-session repair compares "
+        "every score field, including token usage and wall time, with raw-file recomputation and "
+        "corrects the baseline-verification chronology. All re-scores reuse the same raw traces; "
+        "the semantic changes "
         "are the stricter receipt/claim/binding checks and the explicit guard-versus-proactive "
         "first-action split.",
         "",

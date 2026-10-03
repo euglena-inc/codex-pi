@@ -61,7 +61,17 @@
 | readiness_progress_vs_acceptance | 3/3 | 3/3 | 3/3 | 70.4 | 75.7 | 170812 | 184462 |
 | targeted_present_absent | 3/3 | 3/3 | 3/3 | 69.9 | 88.3 | 218178 | 309028 |
 
-Audited completion counts under the current rules: old 15/18, new 17/18. The +2 difference is one `insufficient_budget` session (old 2/3, new 3/3) and one `estimate_correction` session (old 1/3, new 2/3); the other four families tie. Three repetitions per family cannot establish broad significance; this is an observation, not proof of improvement or capability equivalence.
+Audited completion counts under the current rules: old 15/18, new 17/18. The family table identifies where counts differ. Three repetitions per family cannot establish broad significance; this is an observation, not proof of improvement or capability equivalence.
+
+## Whole-arm observations
+
+| Arm | Session wall s | Uncached input | Cache read | Output | Reported total tokens |
+|---|---|---|---|---|---|
+| old | 927.5 | 358129 | 1309056 | 183041 | 1850226 |
+| new | 901.9 | 372361 | 1333760 | 177955 | 1884076 |
+
+Paired completion outcomes: new-only 3, old-only 1, ties 14.
+These wall times include failed or turn-limited sessions. Reported token totals cover observed final usage records; an interrupted request may have unreported consumption. Prompt caching and cancellation make these observations unsuitable as proof of a speed or billing advantage.
 
 ## Failures, guard interceptions and violations
 
@@ -119,18 +129,19 @@ Scenario 3 and 5 have no independent first-step ground truth and report `unknown
 
 ## Post-hoc scoring revisions
 
-- Revision 1: completed-claims matcher correction: word-boundary containment of acceptance ids in descriptive entries; raw traces unchanged and verified against the baseline before the revision.
-- Revision 2: verification-only claim semantics; completed list is recorded context, not a pass signal; raw traces unchanged and verified against the baseline before the revision.
-- Revision 3: round-6 review repairs: recompute from raw evidence, strict receipt/claim/candidate checks, guard-versus-proactive first-action split; raw traces unchanged and verified against the baseline before the revision.
-- Revision 4: diagnostic-only negative-verify plumbing fix; scores unchanged; raw traces unchanged and verified against the baseline before the revision.
-- Revision 5: verifier-only: compare manifest result records with recorded score files; raw traces unchanged and verified against the baseline before the revision.
-- Revision 6: report-only accuracy repair: guard interceptions per scenario, revision scope; scores unchanged; raw traces unchanged and verified against the baseline before the revision.
+- Revision 1: completed-claims matcher correction: word-boundary containment of acceptance ids in descriptive entries; no pre-revision baseline verification was recorded; the preserved traces were checked retrospectively during review.
+- Revision 2: verification-only claim semantics; completed list is recorded context, not a pass signal; no pre-revision baseline verification was recorded; the preserved traces were checked retrospectively during review.
+- Revision 3: round-6 review repairs: recompute from raw evidence, strict receipt/claim/candidate checks, guard-versus-proactive first-action split; the stored revision record reports baseline verification before this revision.
+- Revision 4: diagnostic-only negative-verify plumbing fix; scores unchanged; the stored revision record reports baseline verification before this revision.
+- Revision 5: verifier-only: compare manifest result records with recorded score files; the stored revision record reports baseline verification before this revision.
+- Revision 6: report-only accuracy repair: guard interceptions per scenario, revision scope; scores unchanged; the stored revision record reports baseline verification before this revision.
+- Revision 7: Main takeover: verify every recomputed score field including usage/wall/model, correct retrospective baseline chronology, and report whole-arm observations without fixed outcome claims; the stored revision record reports baseline verification before this revision.
 
-The round-4 revisions (1-2) are exploratory scoring corrections applied after execution; they are not a pre-registered strict score. Revisions 3-5 are round-6 verifier/report repairs: revision 4 changed only a diagnostic argument, and revisions 3-5 did not change any trial's completion count. All re-scores reuse the same raw traces; the semantic changes are the stricter receipt/claim/binding checks and the explicit guard-versus-proactive first-action split.
+The round-4 revisions (1-2) are exploratory scoring corrections applied after execution; they are not a pre-registered strict score. Later revisions repair the verifier or report without changing any trial's completion count. The final main-session repair compares every score field, including token usage and wall time, with raw-file recomputation and corrects the baseline-verification chronology. All re-scores reuse the same raw traces; the semantic changes are the stricter receipt/claim/binding checks and the explicit guard-versus-proactive first-action split.
 
 ## Evidence anchors
 
-- Harness (runner) sha256: `cf671362cf9cd990e8fe2f22009bbbb5d60f901734222da3453233df0faedd19`.
+- Harness (runner) sha256: `bd56435173add38c136554d2858fb9dc3b51dbc3c33a4ae46d0ea2e71e043d4f`.
 - Scenario-specs sha256: `e188a6b4fd90bfc5a155d9a3410814ea2c8574cd1deb803a228e09c3382f4381`.
 - Schedule sha256: `0f1851adaf4abda93ae1600737e6ae67b23c3ec86c6540b437a52ed16e0d5f9e`.
 - Treatment `pi_brief.py` old/new: `9dfaaff63a4dbde7748822740ede550a6cfa379c37b1b7ef4dba17aa5564f40c` / `23714473a222896a84c64133e24ced2b0646354173f395e5b2a55c7edd979bb0`.
