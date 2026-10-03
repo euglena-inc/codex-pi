@@ -2721,7 +2721,7 @@ def build_report(manifest: dict, baseline: dict | None = None) -> str:
         "repetitions per family cannot establish broad significance; this is an observation, not proof "
         "of improvement or capability equivalence.",
         "",
-        "## Failures and guard fallbacks",
+        "## Failures, guard interceptions and violations",
         "",
     ]
     failures = [r for r in results if r.get("family_success") is not True]
@@ -2731,12 +2731,25 @@ def build_report(manifest: dict, baseline: dict | None = None) -> str:
         reasons = "; ".join(result.get("claims_problems") or []) or "no final structured report (turn limit)"
         lines.append(f"- {result['trial']} ({result.get('family')}, {result.get('arm')}, "
                      f"{result.get('session_status')}): {reasons}")
+    budget_trials = [r for r in results if r.get("scenario") == 2]
+    budget_blocked = [r for r in budget_trials if r.get("guard_blocked")]
+    lines.append(f"- Insufficient-budget family: {len(budget_blocked)}/{len(budget_trials)} sessions "
+                 "attempted the check and were guard-refused with `model_avoided=false`; none "
+                 "proactively withheld the attempt from budget reasoning.")
     for result in results:
         blocked = result.get("guard_blocked") or []
-        if blocked:
-            reasons = "; ".join(sorted({str(entry.get("reason")) for entry in blocked}))
-            lines.append(f"- {result['trial']}: guard-refused check attempt(s), not proactive model "
-                         f"avoidance ({reasons})")
+        if blocked and result.get("scenario") != 2:
+            reasons = "; ".join(sorted({str(entry.get("reason"))[:80] for entry in blocked}))
+            lines.append(f"- {result['trial']} ({result.get('family')}): observable guard refusal(s) "
+                         f"during the scenario flow: {reasons}")
+    violations = [r for r in results if r.get("violations")]
+    if not violations:
+        lines.append("- No trial recorded a critical violation (receipt integrity, candidate binding "
+                     "or acceptance claim).")
+    else:
+        for result in violations:
+            lines.append(f"- {result['trial']} ({result.get('family')}): "
+                         + "; ".join(result.get("violations") or []))
     lines += ["", "## First-action metrics", "",
               "| Family | Stances (old) | Stances (new) | Correct first actions |", "|---|---|---|---|"]
     for family in families:
@@ -2819,11 +2832,12 @@ def build_report(manifest: dict, baseline: dict | None = None) -> str:
                      f"against the baseline before the revision.")
     lines += [
         "",
-        "The two round-4 revisions are exploratory scoring corrections applied after execution; they "
-        "are not a pre-registered strict score. The audited re-scores use the same raw traces and the "
-        "same completion counts as the original passes for every trial; the semantic changes are the "
-        "stricter receipt/claim/binding checks and the explicit guard-versus-proactive first-action "
-        "split.",
+        "The round-4 revisions (1-2) are exploratory scoring corrections applied after execution; "
+        "they are not a pre-registered strict score. Revisions 3-5 are round-6 verifier/report "
+        "repairs: revision 4 changed only a diagnostic argument, and revisions 3-5 did not change "
+        "any trial's completion count. All re-scores reuse the same raw traces; the semantic changes "
+        "are the stricter receipt/claim/binding checks and the explicit guard-versus-proactive "
+        "first-action split.",
         "",
         "## Evidence anchors",
         "",
