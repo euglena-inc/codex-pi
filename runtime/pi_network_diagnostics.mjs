@@ -23,6 +23,7 @@ import { subscribe } from "node:diagnostics_channel";
 
 const MAX_RECORDS = 256;
 const MAX_BYTES = 65536;
+const MARKER_RESERVE = 128;
 const MAX_LINE_BYTES = 512;
 const MAX_AGE_SECONDS = 86400;
 const MAX_DURATION_MS = 3600000;
@@ -177,7 +178,7 @@ function emit(record) {
 		if (Buffer.byteLength(line, "utf8") > MAX_LINE_BYTES) {
 			line = JSON.stringify({ at: record.at, phase: "oversized", scope: SCOPE, proc: PROC });
 		}
-		if (records >= MAX_RECORDS || bytes + line.length + 1 > MAX_BYTES) {
+		if (records >= MAX_RECORDS || bytes + line.length + 1 > MAX_BYTES - MARKER_RESERVE) {
 			if (records <= MAX_RECORDS) {
 				const marker = JSON.stringify({ at: relativeSeconds(), phase: "truncated",
 					scope: SCOPE, proc: PROC });
