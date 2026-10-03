@@ -6,7 +6,7 @@
 
 本轮只修改 codex-pi 插件、它的测试/验证程序及协作指引。消费项目的49个子检查、业务测试去重、产品fixture/Docker配置和其他聊天活动worker不在写入范围；其耗时仅作为需求依据。Rust重写、新服务、新数据库、通用DAG调度器、自动缓存PASS、推送/发布/重装均不在本轮。
 
-当前：检查预算与局部修复已完成并通过同task/session的新runtime自用验收，见 [验证记录](../validation/check-budget-0.7.1-20261003.md)。325项完整回归、10项真实Pi探针通过；下一步为路线B，准确设计见 [runtime-observability.md](runtime-observability.md)。路线C/D尚未实施。旧brief/helper/合同不改写，后续接口和可执行验收均基于前驱实际接受候选冻结。
+当前：检查预算与局部修复已完成并通过同task/session的新runtime自用验收，见 [验证记录](../validation/check-budget-0.7.1-20261003.md)。325项完整回归、10项真实Pi探针通过；路线B也已通过主会话接管修复和完整验收，见 [流式与统计验证](../validation/runtime-efficiency-0.7.1-20261003.md)。下一步为路线C，准确设计见 [check-concurrency.md](check-concurrency.md)；路线C/D尚未实施。旧brief/helper/合同不改写，后续接口和可执行验收均基于前驱实际接受候选冻结。
 
 ## 架构决定
 
