@@ -343,8 +343,8 @@ class TimingMetricsTest(TimingCase):
         ])
         timing = self.summarize()["metrics"]["timing"]
         self.assertEqual(timing["status"], "partial")
-        self.assertEqual(timing["toolSeconds"]["value"], 0.0,
-                         "the measured part stays visible")
+        self.assertIsNone(timing["toolSeconds"]["value"],
+                          "no measured tool interval must not become a known zero")
         self.assertFalse(timing["toolSeconds"]["complete"],
                          "an unmatched tool result means a tool was never measured")
         self.assertEqual(timing["toolSeconds"]["orphanResults"], 1)
@@ -456,12 +456,12 @@ class TimingMetricsTest(TimingCase):
 class UsageMetricsTest(TimingCase):
     def test_unique_final_usage_reasoning_subitem_and_cache_ratio(self):
         first = {"role": "assistant", "provider": "p", "model": "m", "timestamp": 1000,
-                 "stopReason": "toolUse",
+                 "stopReason": "toolUse", "responseId": "first",
                  "usage": {"input": 10, "cacheRead": 90, "cacheWrite": 5, "output": 20,
                            "reasoning": 7, "totalTokens": 125, "cost": {"total": 0.1}},
                  "content": []}
         second = {"role": "assistant", "provider": "p", "model": "m", "timestamp": 2000,
-                  "stopReason": "stop",
+                  "stopReason": "stop", "responseId": "second",
                   "usage": {"input": 3, "cacheRead": 7, "cacheWrite": 0, "output": 5,
                             "reasoning": 2, "totalTokens": 15, "cost": {"total": 0.2}},
                   "content": [{"type": "text", "text": "done"}]}
@@ -485,8 +485,8 @@ class UsageMetricsTest(TimingCase):
         self.assertEqual(usage["cacheRatio"]["label"], "exact")
         self.assertEqual(usage["messages"], 2)
         self.assertEqual(usage["duplicateMessages"], 1)
-        self.assertFalse(data["usage_complete"],
-                         "a duplicated delivery keeps the aggregate conservative")
+        self.assertTrue(data["usage_complete"],
+                        "explicit duplicate delivery does not remove usage coverage")
         context = data["metrics"]["context"]
         self.assertEqual(context["first"]["value"], 105.0)
         self.assertEqual(context["last"]["value"], 10.0)
@@ -495,7 +495,7 @@ class UsageMetricsTest(TimingCase):
 
     def test_unique_usage_identity_and_unified_unique_count(self):
         first = {"role": "assistant", "provider": "p", "model": "m", "timestamp": 1000,
-                 "stopReason": "stop",
+                 "stopReason": "stop", "responseId": "first",
                  "usage": {"input": 1, "cacheRead": 0, "output": 1, "totalTokens": 2},
                  "content": []}
         second = {"role": "assistant", "provider": "p", "model": "m", "timestamp": 2000,
@@ -509,8 +509,8 @@ class UsageMetricsTest(TimingCase):
         self.assertEqual(usage["messages"], 3,
                          "a message with no identity is still counted exactly once")
         self.assertEqual(usage["duplicateMessages"], 1)
-        self.assertEqual(usage["heuristicDuplicates"], 1)
-        self.assertEqual(usage["identity"], "timestamp_usage")
+        self.assertEqual(usage["heuristicDuplicates"], 0)
+        self.assertEqual(usage["identity"], "unavailable")
         self.assertFalse(usage["identityReliable"])
         self.assertEqual(usage["uncachedInput"]["value"], 5)
         self.assertTrue(usage["uncachedInput"]["complete"])
@@ -541,14 +541,25 @@ class UsageMetricsTest(TimingCase):
         usage = distinct["metrics"]["usage"]
         self.assertEqual(usage["messages"], 2)
         self.assertEqual(usage["duplicateMessages"], 0)
-        # An indistinguishable pair is only a heuristic duplicate and is never
-        # reported as fully reliable.
+        # Even indistinguishable records are not merged without response identity.
         merged = self.summarize([{"type": "message_end", "message": assistant_with(1)},
                                  {"type": "message_end", "message": assistant_with(1)}])
         usage = merged["metrics"]["usage"]
-        self.assertEqual(usage["messages"], 1)
-        self.assertEqual(usage["heuristicDuplicates"], 1)
+        self.assertEqual(usage["messages"], 2)
+        self.assertEqual(usage["uncachedInput"]["value"], 2)
+        self.assertEqual(usage["heuristicDuplicates"], 0)
         self.assertFalse(usage["identityReliable"])
+
+    def test_same_timestamp_and_usage_with_different_text_are_both_counted(self):
+        messages = [{"role": "assistant", "provider": "p", "model": "m", "timestamp": 1000,
+                     "stopReason": "stop", "usage": {"input": 10, "cacheRead": 0,
+                     "cacheWrite": 0, "output": 1, "totalTokens": 11},
+                     "content": [{"type": "text", "text": text}]}
+                    for text in ("first answer", "different answer")]
+        data = self.summarize([{"type": "message_end", "message": m} for m in messages])
+        self.assertEqual(data["usage"]["input"], 20)
+        self.assertEqual(data["metrics"]["usage"]["messages"], 2)
+        self.assertEqual(data["metrics"]["usage"]["duplicateMessages"], 0)
 
     def test_reasoning_and_context_unknown_when_usage_missing(self):
         events = [{"type": "message_end", "message": {

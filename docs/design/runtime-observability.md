@@ -24,3 +24,7 @@ pi_check在子进程结束后整文件read_bytes、decode、regex多遍读取，
 本阶段先跑必要定向测试，最终提交后用新check执行：定向test_runtime_efficiency、benchmark（REF见合同）、完整Python回归、真实Pi/QuickJS探针、隐私检查。完整回归声明targetedCommand并用final:true，预计480秒、timeout900秒；先跑便宜前提，测试过程中固定candidate，无必要不重复全量。不得把benchmark合成速度当整个业务任务提速。
 
 交付完整候选、逐项真实回执、旧新内存/时间对照、指标定义/未知边界和实际全量次数。原始证据私有，公开仅合成和脱敏结论。提交前隐私检查。主会话审查整合后才冻结路线C的多核/内存准入，不把其接口设计留在本阶段扩大实施。
+
+## 主会话接管审查补充
+
+第二次完整交付仍按timestamp+usage猜测响应身份，独立反例中两条不同正文被合并，输入20误报10且complete=true。确认writer锁和记录进程组释放后由同主会话接手，原候选/失败计数/证据保留。只修此统计共同边界：仅显式provider responseId/message id去重（带provider/model命名空间），无可靠身份的最终记录不猜测合并；去重后的实际记录数统一用于usage覆盖。补独立不同正文和同timestamp同usage反例，以及真实重复响应ID正例。原始无身份记录的身份不确定性保留在指标中。流式实现和其余已核修复复用，定向验证后固定候选，执行必要最终回归/探针/对照/隐私检查；不回派本成果给Pi。完成后另行推进独立并发阶段。

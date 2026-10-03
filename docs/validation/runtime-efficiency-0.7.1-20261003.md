@@ -35,7 +35,7 @@
 - 工具区间：assistant 条目写入时间到匹配 `toolCallId` 的 toolResult 内部时间；重叠、并发与父子区间取并集，不与模型区间相加。未闭合工具与无法匹配的 toolResult 使 `toolSeconds.complete=false`，未闭合时长的 coverage 也按区间并集计算。
 - 未归因余量：仅当模型与工具都完整时给出；否则 null，不给出会下游误用的部分值。
 - check 已完成耗时：仅累计退出码已知且未中断/取消回执的 `ended_at - started_at`；零次检查是已知的 0。缺时间或 unknown 退出时保留已知和但 `complete=false`，board 把该轮列入 incomplete。
-- usage：只累计唯一 assistant 最终 `message_end`；`reasoning` 属于 `output` 子项，不重复相加；`agent_end`/`turn_end`/`message_update` 不累计；`usage_complete` 仍用去重前的 assistant 消息数比较。
+- usage：只累计唯一 assistant 最终 `message_end`；`reasoning` 属于 `output` 子项，不重复相加；`agent_end`/`turn_end`/`message_update` 不累计；仅按带provider/model命名空间的明确responseId或message id去重，`usage_complete`使用实际去重后记录数。无可靠身份的记录逐条计入并标明identity不可靠，绝不依据时间戳/用量猜测合并。
 - 缺 session、缺窗口、session 无本轮条目、header 不匹配/歧义、非法或超长记录：新指标为 `null` + label/reason，不输出假 0；旧 summary 缺 `metrics` 或 `complete` 时看板按 unknown/incomplete 处理且不改写原证据。
 - 看板周期刷新只读已有状态、回执和 summary，不扫描会话；精确日志 hash 只在 check 回执路径生成。
 - 超长单行超过硬上限时整个计数保持 unknown，丢弃的前缀不会被重新锚定为新行；原始日志仍完整落盘。
@@ -44,3 +44,5 @@
 
 - 峰值 RSS 与 wall 是单一 macOS 主机、合成日志的一次顺序对照，不是普遍保证；Linux 单位由 benchmark 换算为字节并在结果中标注。
 - 本记录不构成验收 PASS；正式定向、回归、benchmark、原生 codemode 探针与隐私扫描的回执见主会话审查时引用的私有证据。
+
+主会话接管修复：独立反例确认同timestamp/usage的不同响应不得合并；修复后两条输入各10的记录合计20，明确响应ID的重复仍只计一次。孤立toolResult没有可测区间时返回null而不是0。原始Pi候选及两次质量拒绝记录保留。

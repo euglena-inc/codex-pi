@@ -301,9 +301,10 @@ def derive_timing(session_dir, session_id, window):
     timing["modelResponseSeconds"] = _leaf(
         model_value, "estimated" if model_value is not None else "unknown",
         samples=len(model_intervals), complete=model_complete, reason=model_reason)
-    tool_value = tool_union if (tool_intervals or parse_clean) else None
+    tool_value = tool_union if (tool_intervals or tool_complete) else None
     if tool_value is None:
-        tool_reason = "session_parse_incomplete"
+        tool_reason = ("session_parse_incomplete" if not parse_clean else
+                       "open_tool_intervals_excluded" if open_tools else "tool_results_without_call")
     elif tool_complete:
         tool_reason = None
     elif not parse_clean:
@@ -457,6 +458,12 @@ def receipts(directory: Path) -> list[dict]:
     return result
 
 
+def _round_lines(log: Path):
+    if log.exists():
+        with log.open() as stream:
+            yield from stream
+
+
 def summarize(log: Path, worktree: Path, run_dir: Path | None = None,
               expected_model: str | None = None, checks_dir: Path | None = None,
               session_dir: Path | None = None, session_id: str | None = None,
@@ -476,7 +483,7 @@ def summarize(log: Path, worktree: Path, run_dir: Path | None = None,
     context_samples: list[float] = []
     seen_usage: set = set()
     final, cost, cost_samples = "", 0.0, 0
-    for line_no, raw in enumerate(log.open() if log.exists() else (), 1):
+    for line_no, raw in enumerate(_round_lines(log), 1):
         try:
             event = json.loads(raw)
             if not isinstance(event, dict):
@@ -518,31 +525,24 @@ def summarize(log: Path, worktree: Path, run_dir: Path | None = None,
             if message.get("errorMessage"):
                 errors.append(str(message["errorMessage"])[:300])
             usage = message.get("usage") or {}
-            # Only unique assistant final usage counts; repeated agent_end or
-            # duplicated message_end delivery never accumulates twice. A stable
-            # provider response id is the preferred identity; timestamp+usage is
-            # only a heuristic and is reported as such, and a message without
-            # any identity stays unique rather than being merged on a guess.
-            response_id = message.get("responseId") or message.get("id")
-            stamp = message.get("timestamp")
+            # Deduplicate only explicit identities. Equal timestamps, usage or
+            # even bodies do not prove two provider responses are the same.
+            response_id = message.get("responseId")
+            message_id = message.get("id")
             identity, mode = None, "none"
             if isinstance(response_id, str) and response_id:
-                identity = ("response_id", response_id)
+                identity = ("response_id", message.get("provider"), message.get("model"), response_id)
                 mode = "response_id"
-            elif isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
-                identity = ("timestamp_usage", stamp, message.get("provider"), message.get("model"),
-                            usage.get("input"), usage.get("cacheRead"), usage.get("cacheWrite"),
-                            usage.get("output"), message.get("stopReason"))
-                mode = "timestamp_usage"
-            if mode == "none":
+            elif isinstance(message_id, str) and message_id:
+                identity = ("message_id", message.get("provider"), message.get("model"), message_id)
+                mode = "message_id"
+            if identity is None:
                 no_identity_messages += 1
             else:
                 identity_modes.add(mode)
             duplicate = identity is not None and identity in seen_usage
             if duplicate:
                 duplicate_usage += 1
-                if mode == "timestamp_usage":
-                    heuristic_duplicates += 1
             else:
                 if identity is not None:
                     seen_usage.add(identity)
@@ -572,7 +572,7 @@ def summarize(log: Path, worktree: Path, run_dir: Path | None = None,
     if models and expected_model:
         model_check = "matched" if set(models) == {expected_model} else "mismatch"
     usage = {key: totals[key] if usage_samples[key] else None for key in USAGE_KEYS}
-    full_usage = bool(assistant_messages) and all(usage_samples[k] == assistant_messages
+    full_usage = bool(unique_usage_messages) and all(usage_samples[k] == unique_usage_messages
                                                 for k in USAGE_KEYS[:-1])
     check_dir = checks_dir or (run_dir / (log.stem.replace("round-", "checks-") if log.stem.startswith("round-") else "checks"))
     check_receipts = receipts(check_dir)
@@ -584,7 +584,6 @@ def summarize(log: Path, worktree: Path, run_dir: Path | None = None,
                                       "response_id" if (identity_modes == {"response_id"}
                                                         and no_identity_messages == 0
                                                         and assistant_messages)
-                                      else "timestamp_usage" if "timestamp_usage" in identity_modes
                                       else "unavailable" if identity_modes or no_identity_messages
                                       else "none",
                                       heuristic_duplicates),
