@@ -37,6 +37,16 @@ mode = os.environ.get("STUB_PI_MODE", "turns")
 if mode == "hang":
     print(json.dumps({"type": "turn_start"}), flush=True)
     time.sleep(120)
+elif mode == "twelve":
+    for index in range(12):
+        print(json.dumps({"type": "turn_start"}), flush=True)
+        print(json.dumps({"type": "message_end", "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "turn %d" % index}],
+            "stopReason": "stop",
+            "usage": {"input": 1, "output": 1}},
+        }), flush=True)
+        time.sleep(0.02)
 else:
     for index in range(20):
         print(json.dumps({"type": "turn_start"}), flush=True)
@@ -122,7 +132,7 @@ class InstructionClarityTests(unittest.TestCase):
     def test_negative_controls_all_pass(self):
         cases = RUNNER.run_negative_controls()
         failures = [case for case in cases if not case["ok"]]
-        self.assertGreaterEqual(len(cases), 13)
+        self.assertGreaterEqual(len(cases), 18)
         self.assertEqual(failures, [], f"control failures: {failures}")
 
     def test_missing_trace_is_not_a_pass(self):
@@ -201,6 +211,103 @@ class InstructionClarityTests(unittest.TestCase):
         self.assertEqual(result["killed"], "wall_timeout")
         self.assertLess(elapsed, 12)
 
+    def test_normal_completion_within_turn_limit(self):
+        bin_dir = make_stub_bin(self.tmp)
+        fixture = make_session_fixture(self.tmp)
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = str(bin_dir) + os.pathsep + old_path
+        os.environ["STUB_PI_MODE"] = "twelve"
+        try:
+            result = RUNNER.run_session(fixture, wall_seconds=60)
+        finally:
+            os.environ["PATH"] = old_path
+            os.environ.pop("STUB_PI_MODE", None)
+        self.assertIsNone(result["killed"])
+        self.assertEqual(result["session_status"], "completed")
+        self.assertEqual(result["assistant_turns"], 12)
+
+    def test_count_progress_buffers_cross_chunk_lines(self):
+        trace = self.tmp / "trace.jsonl"
+        partial = '{"type": "turn_start"}'
+        trace.write_bytes(partial.encode())
+        starts, messages, offset, residual = RUNNER._count_progress(trace, 0)
+        self.assertEqual((starts, messages), (0, 0))
+        self.assertTrue(residual)
+        with trace.open("ab") as stream:
+            stream.write(b"\n")
+        starts, messages, offset, residual = RUNNER._count_progress(trace, offset, residual)
+        self.assertEqual(starts, 1)
+        self.assertEqual(residual, b"")
+
+    def test_guard_refusal_is_not_proactive(self):
+        spec, fixture = RUNNER._control_trial(
+            self.tmp, 2,
+            [RUNNER._tool_call("c1", "check", {"id": "E1", "command": RUNNER.SCENARIOS[2]["items"][0]["command"],
+                                                 "estimatedSeconds": 300}),
+             RUNNER._refused("c1", "E1", "insufficient_budget")],
+            [], [], {"summary": "budget refused", "completed": [],
+                      "verification": {"E1": "refused"},
+                      "ready_for_review": False, "acceptance_claimed": False})
+        record = RUNNER.score_trial(spec, fixture, {"session_status": "completed", "exit_code": 0})
+        self.assertTrue(record["family_success"])
+        self.assertFalse(record["first_action_correct"])
+        self.assertEqual(record["first_action_stance"], "guard_blocked")
+        self.assertFalse(record["subscores"]["model_avoided"])
+        self.assertTrue(record["subscores"]["guard_refused"])
+
+    def test_check_baseline_detects_tamper_and_missing(self):
+        root = self.tmp / "baseline-root"
+        root.mkdir()
+        (root / "raw.bin").write_bytes(b"original")
+        baseline = {"evidence": {"raw.bin": {"sha256": RUNNER.sha256_bytes(b"original")}}}
+        self.assertEqual(RUNNER.check_baseline(root, baseline), [])
+        (root / "raw.bin").write_bytes(b"tampered")
+        problems = RUNNER.check_baseline(root, baseline)
+        self.assertTrue(any("hash mismatch" in problem for problem in problems))
+        (root / "raw.bin").unlink()
+        problems = RUNNER.check_baseline(root, baseline)
+        self.assertTrue(any("missing" in problem for problem in problems))
+
+    def test_ast_confinement_allows_scoring_only(self):
+        locked = "MODEL = 'x'\ndef prepare_fixture():\n    return 1\ndef score_trial():\n    return 1\n"
+        scoring = "MODEL = 'x'\ndef prepare_fixture():\n    return 1\ndef score_trial():\n    return 2\n"
+        self.assertTrue(RUNNER.ast_confinement(locked, scoring)["ok"])
+        scenario_change = "MODEL = 'y'\ndef prepare_fixture():\n    return 1\ndef score_trial():\n    return 2\n"
+        self.assertFalse(RUNNER.ast_confinement(locked, scenario_change)["ok"])
+        fixture_change = "MODEL = 'x'\ndef prepare_fixture():\n    return 9\ndef score_trial():\n    return 2\n"
+        self.assertFalse(RUNNER.ast_confinement(locked, fixture_change)["ok"])
+
+    def test_verify_evidence_rejects_wrong_model_manifest(self):
+        out = self.tmp / "wrong-model"
+        out.mkdir()
+        RUNNER.write_json(out / "manifest.json", {"schemaVersion": 1, "model": "wrong/model"})
+        problems, _summary, _limitations = RUNNER.verify_evidence(out)
+        self.assertTrue(any("model" in problem for problem in problems))
+
+    def test_report_generator_denominators_and_disclosures(self):
+        results = []
+        for entry in RUNNER.schedule():
+            results.append({
+                "trial": entry["trial"], "scenario": entry["scenario"],
+                "family": entry["family"], "arm": entry["arm"], "rep": entry["rep"],
+                "session_status": "completed", "family_success": True, "report_status": "complete",
+                "first_action_stance": "proactive", "assistant_turns": 1, "wall_seconds": 1.0,
+                "turn_start_count": 1, "usage": {"totalTokens": 10}, "guard_blocked": [],
+                "claims_problems": [],
+            })
+        manifest = {
+            "model": RUNNER.MODEL, "thinking": RUNNER.THINKING, "piVersion": "1.0.0",
+            "wallSeconds": RUNNER.WALL_SECONDS, "maxAssistantTurns": RUNNER.MAX_ASSISTANT_TURNS,
+            "results": results, "controls": {"cases": []}, "controlsPassed": True,
+            "rescore": [], "harnessSha256": "a" * 64, "scenarioSpecsSha256": "b" * 64,
+            "scheduleSha256": "c" * 64, "treatment": {"files": {}},
+        }
+        report = RUNNER.build_report(manifest)
+        self.assertIn("/3 |", report)
+        self.assertNotIn("/6", report)
+        self.assertIn("acceptance_claimed", report)
+        self.assertIn("Reported cost was zero/absent", report)
+
     # ------------------------------------------------------------------
     # Evidence integrity
     # ------------------------------------------------------------------
@@ -210,12 +317,12 @@ class InstructionClarityTests(unittest.TestCase):
         treatment = RUNNER.extract_arms(out)
         manifest = RUNNER.new_manifest(out, treatment)
         RUNNER.save_manifest(out, manifest)
-        problems, _summary = RUNNER.verify_evidence(out)
+        problems, _summary, _limitations = RUNNER.verify_evidence(out)
         self.assertTrue(any("36-trial" in problem for problem in problems))
 
         manifest["harnessSha256"] = "0" * 64
         RUNNER.save_manifest(out, manifest)
-        problems, _summary = RUNNER.verify_evidence(out)
+        problems, _summary, _limitations = RUNNER.verify_evidence(out)
         self.assertTrue(any("harness hash" in problem for problem in problems))
 
     def test_verify_rejects_tampered_treatment(self):
@@ -226,7 +333,7 @@ class InstructionClarityTests(unittest.TestCase):
         treatment["refs"]["old"] = "0" * 40
         manifest["treatment"] = treatment
         RUNNER.save_manifest(out, manifest)
-        problems, _summary = RUNNER.verify_evidence(out)
+        problems, _summary, _limitations = RUNNER.verify_evidence(out)
         self.assertTrue(any("treatment refs" in problem for problem in problems))
 
 
