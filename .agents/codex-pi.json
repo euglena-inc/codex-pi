@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "model": "newapi/deepseek-flash",
+  "model": "deepseek/deepseek-flash",
   "thinking": "max",
   "constraints": [
     "skills/collaborate/SKILL.md"
