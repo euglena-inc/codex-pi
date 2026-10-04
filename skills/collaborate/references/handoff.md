@@ -8,6 +8,6 @@ Eligible new tasks: early ownership handoff via `pi_board.py takeover` with curr
 
 Pause stops dispatch, not Pi; prompts/progress never resume it; a queued card never overrides a later pause. An uncertain send may have arrived: keep the claim, inspect, recover only if needed; `rearm` may duplicate (no queue idempotency key), never a live inflight send, never steal locks; hooks check only pause/recovery; a dead supervisor cannot report itself.
 
-Install only via the formal mechanism; never edit managed caches, hook trust or app queue DBs (hook review = user app action); a running task keeps its frozen helpers; 0.5.x tasks finish with them; registering a terminal task may enqueue a review event.
+Install via the formal mechanism only (hook review is the user's app action); a running task keeps its frozen helpers and 0.5.x tasks finish with them; registering a terminal task may enqueue a review event at once.
 
 Unit tests don't prove desktop delivery: one real tiny bounded Pi task (fixed bytes, ten-second check, commit, exit; ≤3 min) must show completion, supervisor, same desktop task, visible reply; `register` reports `routePaused` with exact `resume` command; an interrupted idle desktop task keeps its card until reopened. [cli-queue](../../../docs/validation/cli-queue-20260926.md), [desktop](../../../docs/validation/desktop-0.6.0-20261002.md).

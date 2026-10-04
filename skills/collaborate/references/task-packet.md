@@ -5,6 +5,7 @@ For the main session preparing a dispatch or whole-outcome repair. Rules: [Skill
 ## Artifacts
 
 - **Specification**: goal/design/facts/scope/acceptance; reference the project design; `task.md` only when no design exists.
+- **Minimal work package** (what the brief+spec must name so Pi need not guess): one complete result, current source and facts, settled invariants/interfaces, real feedback and check entrypoints, remaining assumptions, resource limits, escalation. Read source and original evidence on demand; never paste whole history or fragment the outcome into mechanical steps.
 - **Brief** (`brief.md`): short prompt pointing at spec+acceptance IDs; never copies design/Skill; a repair writes a new brief; dispatched briefs are never rewritten.
 - **Phase contract**: frozen `--contract-file` snapshot; not a second PLAN.
 - **Delivery report**: Pi's final message in the format below.
@@ -60,7 +61,7 @@ Delete non-applicable lines; no repo rules; dispatch via `--prompt-file`.
 
 ## Contract mapping
 
-pi_phase.py fields: phaseId, goal, result, baseline, scope, designRef+designSha256 (real file), acceptanceItems[] (id/description/checkId/command/passCondition/evidence + optional minRun/forbidSkip/targetedCommand/estimatedSeconds), budgetSeconds, commandTimeoutSeconds, resourceLimits, autonomousRepair, escalateWhen. Omit checkId (default id); if a distinct identity is necessary, name the exact tool ID in the brief. No case-folding IDs/receipt edits. Real commands; unbuilt gates are deliverables, never placeholder PASS; targetedCommand optional, never substitutes for command; estimatedSeconds is a planning estimate. Confirm spec/contract goal+boundary, inputs exist, pass conditions falsifiable.
+pi_phase.py fields: phaseId, goal, result, baseline, scope, designRef+designSha256 (real file), acceptanceItems[] (id/description/checkId/command/passCondition/evidence + optional minRun/forbidSkip/targetedCommand/estimatedSeconds), budgetSeconds, commandTimeoutSeconds, resourceLimits, autonomousRepair, escalateWhen. Omit checkId (default id). Real commands only; unbuilt gates are deliverables, never placeholder PASS; targetedCommand never substitutes for command.
 
 ## Delivery format
 
@@ -75,4 +76,4 @@ Spec gaps: <must-ask items open + reading chosen>.
 Evidence limits: <superseded/mismatched/inapplicable evidence, kept apart>.
 ```
 
-Link logs, never paste; exit 0, Pi summary and local PASS never replace acceptance; keep secrets out; no push/external action by default. A same-cause repair brief adds only differences: rejected candidate/items, shared cause, reproduction, related entries (reproduced/reachable/excluded), fix decision, scope, affected checks, valid evidence, downstream effect.
+Link logs, never paste; keep secrets out; no push or external action by default. A same-cause repair brief adds only differences: rejected candidate/items, shared cause, reproduction, related entries (reproduced/reachable/excluded), fix decision, scope, affected checks, valid evidence, downstream effect.

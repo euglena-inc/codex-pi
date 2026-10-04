@@ -196,6 +196,22 @@ Deterministic, offline, under one second, no model and no network:
 Stage 1 lands checks 1–4 with the document cuts; stage 2 lands the project-config change with check 5. A
 check may not be weakened, skipped or satisfied by a wording-match test.
 
+## Budget revision (main, after takeover)
+
+The candidate `6da8156` met the frozen budgets but the independent review found three current rules
+missing, of which one was a whole command surface: `pi_task.py progress` and `pi_board.py rearm / refresh /
+pause / resume` had no syntax anywhere except the pre-0.6 archive, and `tests/test_docs.py` could not see it
+because its command check ran documented→real only. Restoring that coverage costs bytes the pre-review
+estimate had not reserved, and the alternative — deleting rules to hit 21,504 — is the `WEAKEN` disposition
+this design forbids.
+
+Final integrated content is **22,373 bytes** (−47.6% against the 42,692-byte baseline), and the guard now
+pins per-file caps at 8424 / 7016 / 5312 / 2132 with the total at 22,784, which leaves ≥128 bytes of slack
+per file so a later release cannot be blocked by a one-byte-full document. The original −50% figures stay
+above as the record of what was estimated, not what was delivered. The remaining gap to 21,504 can only be
+closed by moving rarely-needed sections (`0.6 recovery`, `network policy`) into an on-demand reference, which
+changes the metric from per-file bytes to dispatch-cycle loaded bytes and needs a separate decision.
+
 ## Check ladder and time budget (3600 s phase, 900 s command cap, serial checks, one writer)
 
 | Role | Command | Expected wall |

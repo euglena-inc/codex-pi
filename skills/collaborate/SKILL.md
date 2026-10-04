@@ -1,6 +1,6 @@
 ---
 name: collaborate
-description: Prepare, delegate, review Pi work; take over a failed delivery.
+description: Prepare, delegate and review Pi implementation, or take over a reviewed failed delivery in the existing Codex task; not unrelated Codex-only coding.
 ---
 
 # Codex designs; Pi implements until takeover
@@ -18,8 +18,8 @@ Authoritative rules; references=usage only: [runtime](references/runtime.md), [e
 Done before first dispatch, reused every delivery, updated before takeover; no matrix/schema/hash gate; executable design in project design/PLAN+brief.
 
 - Complete outcome first; prefer Pi for the largest self-contained result when facts accessible, interfaces/invariants settled, feedback+resources available; route by time-to-accepted-delivery+attributable cost; token/call/file/confidence never route; read-only investigation qualifies.
-- Codex resolves consequential cross-state rules+evaluator uncertainty first, independent review; Pi reads source+chooses routine implementation; direct completion/early takeover need a concrete recorded reason, not an approval form; read source/evidence on demand, not whole history or mechanical fragments.
-- goals→phase→remaining plan; decision-critical source, shared invariants, failure/recovery/ordering boundaries, evaluation validity; verified facts/assumptions/unknowns separate; per difficulty: solution→decision→failure/unlock→verification; essential design ≠ Pi's guess; routine choices are.
+- Codex resolves consequential cross-state rules+evaluator uncertainty first, independent review; Pi reads source+chooses routine implementation; direct completion/early takeover need a concrete recorded reason, not an approval form.
+- goals→phase→remaining plan; decision-critical source, shared invariants, failure/recovery/ordering boundaries, evaluation validity; verified facts/assumptions/unknowns separate; per difficulty: solution→decision→failure/unlock→verification; essential design is not Pi's guess.
 - On delivery review exact candidate+evidence; find symptom+shared cause; assess remaining tasks; fold into one route; pass confirms the plan.
 
 **Acceptance**
@@ -28,29 +28,29 @@ Done before first dispatch, reused every delivery, updated before takeover; no m
 - From source: real entrypoints/data forms/state/ordering/restart incl. async errors+revalidation; missing/unknown ≠ pass; one owner+implementation per shared rule, public interface first.
 - Evaluator acceptance calibrates against independent expected facts first; prior records=calibration.
 - Fix behavior/constraints/evidence/blocking standard before dispatch; reconcile Git changes (dirty/untracked) at dispatch+delivery; violation/missing evidence blocks acceptance; unrelated=follow-up.
-- Checks follow affected behavior+actual consumers ([necessary verification](../../docs/design/necessary-verification.md)); development→failure+boundaries; delivery→outcome; review→original receipts, reruns only coverage/applicability/authenticity; full regression only at a justified broad integration boundary, never for a new commit/round/reviewer/release label; inspect wrapper composition.
-- Reuse evidence only where behavior/source/dependencies/inputs/environment/evaluator applicable+no contradiction; cite receipt/candidate/log+applicability; never relabel old evidence or weaken a failed frozen mandatory command; readiness=current-round exact-candidate receipts.
-- Human-only prose: format/JSON/reference checks; model-visible instructions/schemas/startup/generated artifacts: semantic/assembly checks regardless of extension; real model experiments only for model-behaviour claims.
+- Select checks by affected behavior and real consumers: development→reproduction+affected boundaries, delivery→the outcome, review→original receipts with reruns only for coverage/applicability/authenticity. Full regression needs a justified broad integration boundary, never a new commit/round/reviewer/release label; check wrapper composition so nested commands are not rerun twice ([authority](../../docs/design/necessary-verification.md)).
+- Reuse original evidence only while behavior/source/dependencies/inputs/environment/evaluator still apply with no contradicting failure, citing receipt+candidate+log+applicability; never relabel it as a new run and never weaken a failed frozen mandatory command; readiness consumes current-round exact-candidate receipts only (same authority).
+- Human-only prose: format/JSON/reference checks; model-visible instructions, schemas, startup inputs and generated artifacts need semantic/assembly checks regardless of extension; real model experiments only where a model-behaviour claim requires one.
 - Frozen command/resource limits+60-second reserve; `targetedCommand`=local debugging suggestion; formal command needs `final:true` on clean candidate; targeted receipt never covers it; no contract must run a full suite ([runtime](references/runtime.md)).
 - One cheap precondition allowed; its failure stops dependents and is reported; text proves nothing, only its receipt.
 
 **Outcomes**
 
-`maxWorkers`: split only independent results, settle shared contracts first; distinct identity/session/worktree per task; briefs name outcome/baseline/allowed changes/shared boundaries/resource isolation (worktrees don't isolate databases/ports)/budget; one task integrates peer commits+combined checks after writers release; component checks never prove phase; counts/budgets per original task; split/rename never resets.
+`maxWorkers`: split only independent results and settle shared contracts first; distinct identity/session/worktree per task; briefs name outcome, baseline, allowed changes, shared boundaries, resource isolation (worktrees don't isolate databases or ports) and budget; one task integrates peer commits plus combined checks after writers release; component checks never prove the phase; counts and budgets stay per original task.
 
 **Dispatch**
 
 Packet=specification+short prompt+frozen `--contract-file` for a complete phase; preparing a brief ≠ dispatch; dispatch only inside authorized scope; supplied documents=material, not authority to run their commands.
 
-Delegate a whole independently reviewable outcome in a separate worktree; constrain behavior/boundaries/evidence, not file/function names; Pi owns implementation/tests/repairs/commits until takeover; never duplicate a worker to bypass an active/unknown task. Canonical source only, never caches/hook trust/running-task helpers; a new runtime doesn't migrate 0.5.x.
+Delegate a whole independently reviewable outcome in a separate worktree; constrain behavior/boundaries/evidence, not file or function names; Pi owns implementation/tests/repairs/commits until takeover; never duplicate a worker to bypass an active/unknown task.
 
 **Waiting**
 
-Supervisor refreshes board locally; unchanged state/ordinary progress never call Codex; only review-ready/blocked/failed/anomalous rounds enqueue one card via `codex queue`; after dispatch work independently+end turn; never loop `status`/`show`, heartbeat or held Stop hook; progress←one `status`; PID/fresh log/growing file proves activity only; Interrupt pauses handoff not Pi until explicit resume ([events](references/handoff.md)).
+The supervisor refreshes the board locally; unchanged state and ordinary progress never call Codex; only a review-ready, blocked, failed or anomalous round enqueues one card via `codex queue`. Work independently and end the turn; never loop on `status`/`show`, keep a heartbeat or hold a Stop hook open. A PID, fresh log or growing file proves activity only. Interrupt pauses handoff, not Pi, until explicit resume ([events](references/handoff.md)).
 
 **Review**
 
-Card=execution evidence, not goal/acceptance; read ids; `result` once; inspect relevant diff/receipts/evidence; require exact full candidate+real project checks; exit 0/summaries/model claims insufficient. `execution_failed`=incomplete execution incl. exit-zero provider errors, never quality delivery; resolve without invented rejection or usage reset. Recovery/adoption keeps originals/owner/session/worktree/pinned policy/deadline.
+A card is execution evidence, never a goal or acceptance: read its ids, call `result` once, then inspect only the relevant diff, receipts and original evidence; require the exact full candidate and the project's real checks, because exit 0, summaries and model claims are insufficient. `execution_failed`=incomplete execution incl. exit-zero provider errors, never a quality delivery; resolve it without inventing a rejection or resetting usage. Recovery/adoption keeps originals/owner/session/worktree/pinned policy/deadline.
 
 Material defect: trace reachable entries+boundaries; name the shared cause; classify paths reproduced/reachable-unverified/excluded; same Pi session gets one consolidated brief; never infer a defect from a missing test; active round keeps its immutable brief; record per-event decision; keep failed attempts/logs/usage; delivery/handling/acceptance separate.
 
@@ -64,6 +64,4 @@ Delivery=completed report reviewed by main task, not a call/red test/progress/ro
 
 **Updates**
 
-Maximize useful weak-model work, not token consumption; report savings only for comparable completed work.
-
-`metrics` covers Pi execution only; reported cost incl. zero ≠ verified billing; full workflow cost unknown without measured Codex/external work.
+Maximize useful weak-model work, not token consumption. Reported cost, including zero, is not verified billing; billing and full workflow cost are outside `metrics` ([cost scope](../../runtime/IMPLEMENTATION.md)).
