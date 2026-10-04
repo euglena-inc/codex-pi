@@ -1,9 +1,10 @@
-"""Deterministic guards for the 0.8.6 model-visible guidance budget.
+"""Deterministic guards for the model-visible guidance size budget.
 
 Offline and fast: no model, no network, no skip. The checks are
 
-1. byte budgets for the four model-visible collaboration documents, their total,
-   and the receiving cap of ``runtime/IMPLEMENTATION.md``;
+1. byte budgets for the dispatch-cycle loaded set (the documents a normal round
+   actually reads), the separately capped on-demand tier, and the receiving cap
+   of ``runtime/IMPLEMENTATION.md``;
 2. every relative Markdown link under ``skills/``, ``docs/`` and ``runtime/``
    resolves;
 3. every ``pi_task.py``/``pi_board.py`` invocation documented under ``skills/**``
@@ -28,18 +29,22 @@ ROOT = Path(__file__).resolve().parent.parent
 RUNTIME = ROOT / "runtime"
 SKILLS = ROOT / "skills"
 
-# Caps follow the reviewed content, not the pre-review estimate: the phase found five
-# public subcommands with no current syntax surface and three deleted baseline rules.
-# Restoring that coverage costs 869 bytes over the original 21504 estimate (-50.0%),
-# so the pinned total is 22784 (-46.9% against the 42692-byte baseline). See
-# docs/design/doc-size-budget.md "Budget revision".
-MODEL_VISIBLE = {
+# The metric is the set a round loads, not the size of a folder. These four files are
+# read on an ordinary dispatch/review round, so their combined size is what a model pays
+# per round; the target stays the accepted half of the 42692-byte baseline.
+LOADED_SET = {
     "skills/collaborate/SKILL.md": 8424,
-    "skills/collaborate/references/runtime.md": 7016,
+    "skills/collaborate/references/runtime.md": 6144,
     "skills/collaborate/references/task-packet.md": 5312,
     "skills/collaborate/references/handoff.md": 2132,
 }
-MODEL_VISIBLE_TOTAL = 22784
+LOADED_SET_TOTAL = 21504
+# Rarely-needed operations moved out of the loaded set. They stay in skills/**, stay
+# linked from SKILL.md and stay covered by the command-surface checks below: splitting a
+# reference may defer text, never delete it.
+ON_DEMAND = {
+    "skills/collaborate/references/runtime-ops.md": 4608,
+}
 IMPLEMENTATION_BUDGET = 42000
 MARKERS = ("worker.json", "agent_before_settle", "CODEX_PI_NETWORK_DIAG_SUPERVISOR")
 CLI_ENTRIES = ("pi_task.py", "pi_board.py")
@@ -62,14 +67,32 @@ def relative_files(base: Path, suffixes) -> list:
 
 
 class BudgetTest(unittest.TestCase):
-    def test_model_visible_files_fit_their_frozen_budgets(self):
+    def test_the_dispatch_loaded_set_fits_the_half_size_target(self):
         total = 0
-        for name, budget in MODEL_VISIBLE.items():
+        for name, budget in LOADED_SET.items():
             size = len((ROOT / name).read_bytes())
             total += size
             self.assertLessEqual(size, budget, f"{name} is {size} bytes, budget {budget}")
-        self.assertLessEqual(total, MODEL_VISIBLE_TOTAL,
-                             f"model-visible total is {total} bytes, budget {MODEL_VISIBLE_TOTAL}")
+        self.assertLessEqual(total, LOADED_SET_TOTAL,
+                             f"dispatch-cycle loaded set is {total} bytes, budget {LOADED_SET_TOTAL}")
+
+    def test_every_reference_file_declares_which_tier_it_belongs_to(self):
+        tiered = set(LOADED_SET) | set(ON_DEMAND)
+        for path in sorted((SKILLS / "collaborate" / "references").glob("*.md")):
+            self.assertIn(str(path.relative_to(ROOT)), tiered,
+                          f"{path.name} is neither loaded per round nor declared on demand")
+
+    def test_on_demand_references_are_reachable_and_state_their_condition(self):
+        skill = read(ROOT / "skills" / "collaborate" / "SKILL.md")
+        for name, budget in ON_DEMAND.items():
+            path = ROOT / name
+            size = len(path.read_bytes())
+            self.assertLessEqual(size, budget, f"{name} is {size} bytes, budget {budget}")
+            body = read(path)
+            self.assertIn(name.rsplit("/", 1)[-1], skill,
+                          f"{name} is not linked from SKILL.md, so deferring it loses it")
+            self.assertRegex(body, r"(?i)load (this file )?when|load when:",
+                             f"{name} defers content without stating when to load it")
 
     def test_implementation_notes_stay_within_the_receiving_cap(self):
         size = len((RUNTIME / "IMPLEMENTATION.md").read_bytes())
@@ -164,7 +187,7 @@ class MechanismHomeTest(unittest.TestCase):
         for marker in MARKERS:
             self.assertGreaterEqual(implementation.count(marker), 1,
                                     f"{marker} is missing from runtime/IMPLEMENTATION.md")
-            for name in MODEL_VISIBLE:
+            for name in LOADED_SET:
                 self.assertEqual(read(ROOT / name).count(marker), 0,
                                  f"{name} must not name {marker}")
 

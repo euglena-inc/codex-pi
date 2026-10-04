@@ -2,9 +2,18 @@
 
 当前 Codex 主任务负责设计、派工与验收；Pi 的模型由项目配置选择（模型政策只在 [协作 Skill](skills/collaborate/SKILL.md) 中陈述）。项目只需 `.agents/codex-pi.json` 和自己的领域约束，公共插件维护进程、同会话返修、看板和原始证据。
 
-## 0.8.6 模型可见指引体积预算
+## 0.8.7 按需加载分层（度量改为“一次派工实际载入字节”）
 
-- 四份模型可见协作文档压入冻结预算且不丢失清单规则：`skills/collaborate/SKILL.md` 8424、`references/runtime.md` 7016、`references/task-packet.md` 5312、`references/handoff.md` 2132，总计不超过 22784 字节（对基线 42692 字节为 −47.6%，未达最初估计的 −50%：复核发现 5 个公开子命令无任何现行语法、3 条基线规则被删，恢复这些覆盖的代价已在[设计](docs/design/doc-size-budget.md)的 Budget revision 中记录，不靠删规则凑数）。机制正文（worker 轮次、网络诊断、检查并发、费用范围）迁入[运行时实现](runtime/IMPLEMENTATION.md)；模型可见文件只保留规则、用法与指针。
+- 体积度量从“每文件字节”改为“一个普通轮次实际载入的字节”：常驻集仍为 `SKILL.md` + `references/runtime.md` + `references/task-packet.md` + `references/handoff.md`，现共 **21358 字节**，在上限 21504 内（对 42692 字节基线 −49.97%）；不常驻内容移到新的 `references/runtime-ops.md`（单独上限 4608），只在指定条件下加载。
+- 新增按需文件 [运行时操作](skills/collaborate/references/runtime-ops.md)：任务 store 修复与 pre-0.6 转换/`adopt-runtime`、并行检查的资源准入字段、成果观测收尾与六段限制、网络代理策略与传输故障分类。[协作 Skill](skills/collaborate/SKILL.md) 保留一句常驻指针并写明何时才需要加载；普通派工、检查与评审轮次不会读它。规则正文未删，只是择时加载；机制细节仍以[运行时实现](runtime/IMPLEMENTATION.md)为单一归宿。
+- `tests/test_docs.py` 守护升级：常驻集逐文件与总额预算、每个 `references/*.md` 必须明确归属常驻或按需某一层、按需文件必须被 `SKILL.md` 链接且自带“Load when”条件，“拆分”因此不可能被用来静默删除内容；之前的方向子命令覆盖（每个公开子命令必须出现在 `skills/**`）继续适用。本轮负控：从 `SKILL.md` 移除指向 `runtime-ops.md` 的链接后守护失败，恢复后通过。
+- 边界：本版本只改文档分层与预算口径，不改运行时算法、验收、计数、所有权或 receipt 语义，不声称模型能力、速度或真实 token 费用收益。
+
+### 0.8.6 要点
+
+#### 模型可见指引体积预算
+
+- 首次将四份模型可见协作文档压入冻结预算且不丢失[规则清单](docs/design/doc-size-budget.md)：机制正文（worker 轮次、网络诊断、检查并发、费用范围）迁入[运行时实现](runtime/IMPLEMENTATION.md)，模型可见文件只保留规则、用法与指针。当时总量 22373 字节（−47.6%），未达最初估计的 −50%：复核发现 5 个公开子命令无任何现行语法、3 条基线规则被删，恢复这些覆盖的代价已在[设计](docs/design/doc-size-budget.md)的 Budget revision 中记录，不靠删规则凑数；本口径已由 0.8.7 的载入集度量接替。
 - 新增确定性的 `tests/test_docs.py`：逐文件与总额预算、`skills/`、`docs/`、`runtime/` 下相对链接可解析、`skills/**` 文档里的 `pi_task.py`/`pi_board.py` 子命令与 flag 在真实 `--help` 中存在、**每个公开子命令都必须出现在模型可见文档中**（反方向覆盖，防止“瘦身”误删唯一语法）、机制标记只在实现文档出现，以及 `.agents/codex-pi.json` 的 constraints 指向 `AGENTS.md` 与真实设计文档、不得指向 `skills/collaborate/SKILL.md`。
 - 这些改动只影响模型可见指引、项目派工输入与版本元数据，不改变运行时算法、验收、计数、所有权或模型语义；本发布不声称模型能力、速度或费用优势。
 

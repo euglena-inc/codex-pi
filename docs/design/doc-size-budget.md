@@ -212,6 +212,25 @@ above as the record of what was estimated, not what was delivered. The remaining
 closed by moving rarely-needed sections (`0.6 recovery`, `network policy`) into an on-demand reference, which
 changes the metric from per-file bytes to dispatch-cycle loaded bytes and needs a separate decision.
 
+## Loaded-set accounting (0.8.7, main, the deferred-tier decision)
+
+That decision is now taken: the budgeted quantity is the text a round actually loads, not the size of a
+folder. A normal dispatch, check or review round reads `SKILL.md`, `references/runtime.md`,
+`references/task-packet.md` and `references/handoff.md`; those four are budgeted together at **21,504 bytes**
+(the accepted −50% figure, restored as a real invariant) and currently measure **21,358 bytes** (−49.97%).
+`references/runtime-ops.md` forms a second tier with its own cap of 4,608 bytes and is read only when one of
+its stated conditions applies: store repair or pre-0.6 conversion/adoption, declaring or changing parallel
+check resources, closing out or comparing an outcome, or classifying a proxy/transport loss.
+
+Deferral, not deletion, is the only allowed operation here, and it is guarded three ways: every
+`references/*.md` must be declared in exactly one tier, every on-demand file must stay linked from
+`SKILL.md`, and the reverse subcommand-coverage check still reads all of `skills/**`, so a live command that
+loses its only current syntax fails the build whether it was cut or moved. Nothing was deleted to reach the
+number: the deferred text (guard-rule names, network value rules and triage, six-section closeout limits,
+check-admission fields, adoption and store-repair commands) resolves in `runtime-ops.md` or
+`runtime/IMPLEMENTATION.md`, and `metrics`/`record-outcome`, `events`, `decisions`, `takeover` and the
+decision flags stay in the loaded set because main uses them every round.
+
 ## Check ladder and time budget (3600 s phase, 900 s command cap, serial checks, one writer)
 
 | Role | Command | Expected wall |

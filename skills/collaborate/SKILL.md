@@ -5,7 +5,7 @@ description: Prepare, delegate and review Pi implementation, or take over a revi
 
 # Codex designs; Pi implements until takeover
 
-Authoritative rules; references=usage only: [runtime](references/runtime.md), [events](references/handoff.md), [task packet](references/task-packet.md).
+Authoritative rules; references=usage only: [runtime](references/runtime.md), [events](references/handoff.md), [task packet](references/task-packet.md). Load [operations](references/runtime-ops.md) only for store repair, conversion/adoption or network triage.
 
 **Roles**
 
