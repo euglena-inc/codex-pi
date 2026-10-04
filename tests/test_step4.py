@@ -239,7 +239,7 @@ class MetricsTest(unittest.TestCase):
 class VersionTest(unittest.TestCase):
     def test_release_version_is_consistent(self):
         version = (RUNTIME / "VERSION").read_text().strip()
-        self.assertEqual(version, "0.8.5")
+        self.assertEqual(version, "0.8.6")
         manifest = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())
         self.assertEqual(manifest["version"].split("+")[0], version)
         self.assertIn(version, (ROOT / "README.md").read_text())

@@ -2,6 +2,12 @@
 
 当前 Codex 主任务负责设计、派工与验收；Pi 的模型由项目配置选择（模型政策只在 [协作 Skill](skills/collaborate/SKILL.md) 中陈述）。项目只需 `.agents/codex-pi.json` 和自己的领域约束，公共插件维护进程、同会话返修、看板和原始证据。
 
+## 0.8.6 模型可见指引体积预算
+
+- 四份模型可见协作文档压入冻结预算且不丢失清单规则：`skills/collaborate/SKILL.md` 8192、`references/runtime.md` 6144、`references/task-packet.md` 5120、`references/handoff.md` 2048，总计不超过 21504 字节。机制正文（worker 轮次、网络诊断、检查并发、费用范围）迁入[运行时实现](runtime/IMPLEMENTATION.md)；模型可见文件只保留规则、用法与指针。
+- 新增确定性的 `tests/test_docs.py`：逐文件与总额预算、`skills/`、`docs/`、`runtime/` 下相对链接可解析、`skills/**` 文档里的 `pi_task.py`/`pi_board.py` 子命令与 flag 在真实 `--help` 中存在、机制标记只在实现文档出现，以及 `.agents/codex-pi.json` 的 constraints 指向 `AGENTS.md` 与真实设计文档、不得指向 `skills/collaborate/SKILL.md`。
+- 这些改动只影响模型可见指引、项目派工输入与版本元数据，不改变运行时算法、验收、计数、所有权或模型语义；本发布不声称模型能力、速度或费用优势。
+
 ## 0.8.5 收尾记录与成果观测
 
 - 新增 `pi_board.py record-outcome --repo REPO --outcome ID --record-file FILE [--expected-revision N]` 与 `pi_board.py metrics --repo REPO --outcome ID`，并提供 `metrics --outcomes [--cursor ID]` 的有界游标列表。`record-outcome` 只写私有 git-common `codex-pi/outcomes/<ID>/` 下有界的不可变编号修订，复用现有锁与原子写；相同规范化载荷重复写入幂等（覆盖不确定重试），更正必须带当前修订号，陈旧冲突不修改任何文件。

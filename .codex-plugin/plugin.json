@@ -1,6 +1,6 @@
 {
   "name": "codex-pi",
-  "version": "0.8.5",
+  "version": "0.8.6",
   "description": "跨项目 Codex 与 Pi 协作：弱模型优先承接完整成果，主会话设计验收与按需接手，本地看板仅在待审或异常时通知。",
   "author": {
     "name": "Local personal tools"

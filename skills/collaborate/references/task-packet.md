@@ -1,82 +1,78 @@
 # Task packet
 
-For the main session preparing a dispatch or a whole-outcome repair. Rules and the whole-task analysis: [the Skill](../SKILL.md); commands: [runtime](runtime.md). Write in the user's language. Keep APIs, paths and commands verbatim.
-
-Before preparing this packet, define the complete outcome and prefer the configured Pi model for the largest reasonably self-contained result when facts are accessible, consequential interfaces are settled, real feedback exists and the authorized resources can support delivery. Codex direct completion or early takeover needs a concrete task-specific reason recorded in the existing design or review record (for example unresolved cross-state semantics dominating the remaining work, untrustworthy feedback, or repair/coordination cost beyond the likely benefit). Resolve consequential design uncertainty first; preserve Pi's freedom to read source and choose routine implementation. Design depth follows the actual risks, not a fixed document length.
+For the main session preparing a dispatch or whole-outcome repair. Rules: [Skill](../SKILL.md); commands: [runtime](runtime.md); keep APIs/paths/commands verbatim.
 
 ## Artifacts
 
-- **Specification**: the goal, settled design, facts, scope and acceptance. Reference the existing project design. Write `task.md` only when no design exists.
-- **Brief** (`brief.md`): the short prompt below. It points at the spec and the acceptance IDs. Never copy the design or the Skill into it. A repair writes a new brief. A dispatched brief is not rewritten.
-- **Phase contract**: `--contract-file`, a frozen snapshot. It is not a second PLAN.
-- **Delivery report**: Pi's final message, in the format below.
+- **Specification**: goal/design/facts/scope/acceptance; reference the project design; `task.md` only when no design exists.
+- **Brief** (`brief.md`): short prompt pointing at spec+acceptance IDs; never copies design/Skill; a repair writes a new brief; dispatched briefs are never rewritten.
+- **Phase contract**: frozen `--contract-file` snapshot; not a second PLAN.
+- **Delivery report**: Pi's final message in the format below.
 
 ## Specification template
 
-Omit what does not apply; link, do not restate.
-
 ```markdown
 # <phase/task> - <reviewable result>
-## Goal, phase, later plan
-Overall goal -> this phase's complete result -> authorized follow-ups and real dependencies. State where this block ends.
-## Baseline, scope, facts
-Repo, exact baseline and worktree. Allowed and protected changes. Verified facts with source or version. Unknowns and how to verify them. Allowed inputs and gaps.
-## Design, difficulties, verification
-Fact owners and writers. Public interfaces. States, idempotency, concurrency, recovery. The meaning of errors and of unknown values. For each consequential difficulty: solution -> failure or unlock path -> verification. Give one decisive boundary example where units, time zones, nulls, paging or dedup matter.
-## Two-line parallel work (if any)
-This line's outcome, sibling task and input commit, what waits, shared edits and resources, integration owner, combined acceptance.
+## Goal/phase/plan
+Goal -> phase result -> follow-ups + dependencies; state block end.
+## Baseline/scope/facts
+Repo/baseline/worktree; allowed+protected changes; verified facts+source; unknowns+verification; inputs/gaps.
+## Design/difficulties/verification
+Fact owners/writers; public interfaces; states/idempotency/concurrency/recovery; error/unknown meaning; per difficulty: solution -> failure/unlock -> verification; boundary example.
+## Parallel work (if any)
+Line outcome, sibling task+commit, waits, shared edits/resources, integrator, combined acceptance.
 ## Acceptance
 | ID | Observable pass condition | Real command / evidence | Counter-example that must fail |
-Name the checks that need fresh evidence and why; cite applicable original evidence with its covered scope and invalidation conditions. Check wrapper composition before adding duplicate commands. Justify a full set by broad integration impact. Missing, skipped or unknown required evidence is not a pass. Mark manual or external proof.
-## Repair, budget, escalation
-Allocation and its evidence; Pi execution measurements and the separate sources for Codex/external effort. What Pi fixes alone. Command and phase budgets and resource scope. Escalate only for a design contradiction, an authority change or repeated ineffective repair; include the minimal reproduction.
+Fresh evidence+why; original evidence scope/invalidation; wrapper composition; full sets justified by integration impact; missing/skipped/unknown ≠ pass; manual/external proof.
+## Repair/budget/escalation
+Allocation evidence; Pi measurements + Codex/external sources; what Pi fixes alone; budgets+resource scope; escalate only for design contradiction, authority change or repeated ineffective repair, minimal repro.
 ```
 
 ## Must-ask checklist
 
-Settle each applicable item in the specification. If one is left open, Pi takes the conservative reading and reports a spec gap.
+Settle applicable items; if open: conservative reading + spec gap.
 
-1. Which record or version wins when several exist: by content only (never by name, mtime or order).
-2. Byte-identical rerun and replay: same input must give the same output and the same files.
-3. An existing or same-name target: overwrite, refuse or version.
+1. Which record/version wins: by content only (never name/mtime/order).
+2. Byte-identical rerun/replay: same input, output and files.
+3. Existing/same-name target: overwrite, refuse or version.
 4. Dependence on time, timezone, environment or network.
-5. Empty, missing and unknown values: never zero; block and list them.
+5. Empty/missing/unknown values: never zero; block and list them.
 
 ## Writing convention
 
-Write for one reader. Name the actor, and give one independently understandable action per sentence. Keep each condition next to the action it limits. Use one term for one thing. Keep negation, permission and uncertainty exact. Split a compound sentence only when every clause keeps its own connection and scope. Do not impose a word count and do not merge distinct domain actions.
+One reader; actor named; one action per sentence; condition beside its action; one term per thing; exact negation/permission/uncertainty; compound sentences only when every clause keeps its scope; no word count; never merge distinct domain actions.
 
 ## Dispatch prompt
 
 ```text
 Complete <whole result>. Work only in <worktree> at baseline <commit>.
-Read <constraints> and <spec path/sections>. Acceptance is <contract path and IDs>.
-Settled decision and difficulty: <key decision -> solution -> verification>. Allowed scope: <allowed>. Protected scope: <protected>.
-You own the implementation, targeted checks, ordinary repairs and scoped commits. Do not stop at code written or a partial PASS.
-Run every frozen mandatory command with `check` using its exact `checkId` (or `id` when omitted). Use `targetedCommand` for relevant local repair only when needed; preserve applicable prior evidence. Keep `final:true` for a formal command that declares it, on the clean candidate.
-Allowed inputs: <allowed sources; gaps>. Do not bypass <forbidden sources>.
-If <design contradiction / authority change / repeated ineffective repair>, return the evidence and one decision question.
-If a must-ask item is open, take the conservative reading and report a spec gap.
+Read <constraints> and <spec>. Acceptance: <contract path+IDs>.
+Settled decision/difficulty: <decision -> solution -> verification>. Allowed: <allowed>. Protected: <protected>.
+You own implementation, targeted checks, repairs, scoped commits; never stop at code/partial PASS.
+Run every frozen command via `check` with its exact `checkId`/`id`; `targetedCommand` for local repair only, keeping prior evidence; `final:true` for declared formal commands on the clean candidate.
+Allowed inputs: <sources; gaps>. Do not bypass <forbidden sources>.
+If <design contradiction / authority change / repeated ineffective repair>: evidence + one decision question.
+If a must-ask item is open: conservative reading + spec gap.
 Report in the delivery format. Stop at <completion boundary>.
 ```
 
-Delete lines that do not apply; do not paste repository rules. Dispatch through `--prompt-file`.
+Delete non-applicable lines; no repo rules; dispatch via `--prompt-file`.
 
-## Mapping to the contract
+## Contract mapping
 
-Fields of `runtime/pi_phase.py`: `phaseId`, `goal`, `result`, `baseline`, `scope`, `designRef` + `designSha256` (a real worktree file), `acceptanceItems[]` (`id`, `description`, `checkId`, `command`, `passCondition`, `evidence`, optional `minRun`, `forbidSkip`, `targetedCommand`, `estimatedSeconds`), `budgetSeconds`, `commandTimeoutSeconds`, `resourceLimits`, `autonomousRepair`, `escalateWhen`. Prefer omitting `checkId`, which defaults to `id`; when explicit, use the same literal value unless a distinct identity is necessary. If distinct, name the exact tool ID in the brief. Do not case-fold IDs or edit receipts to make them match. Commands must be real. An unbuilt gate is part of the deliverable, never a placeholder PASS. `targetedCommand` is optional. It is only a local repair suggestion and never substitutes for the formal `command`. `estimatedSeconds` is a finite positive planning estimate, not a completion guarantee. Before dispatch, confirm that the spec and contract share the goal and boundary, that inputs exist, and that pass conditions are falsifiable.
+pi_phase.py fields: phaseId, goal, result, baseline, scope, designRef+designSha256 (real file), acceptanceItems[] (id/description/checkId/command/passCondition/evidence + optional minRun/forbidSkip/targetedCommand/estimatedSeconds), budgetSeconds, commandTimeoutSeconds, resourceLimits, autonomousRepair, escalateWhen. Omit checkId (default id); if a distinct identity is necessary, name the exact tool ID in the brief. No case-folding IDs/receipt edits. Real commands; unbuilt gates are deliverables, never placeholder PASS; targetedCommand optional, never substitutes for command; estimatedSeconds is a planning estimate. Confirm spec/contract goal+boundary, inputs exist, pass conditions falsifiable.
 
 ## Delivery format
 
 ```markdown
-Result: <ready for review / partial / blocked>. Never write "accepted".
-Candidate: <full commit, worktree, dirty files and owner>; task/phase/round.
-Changes: <effect on behavior and fact owners; design trade-offs>.
-Integration (if any): <peer commits, combined candidate, checks run, open dependencies>.
-Acceptance: <ID -> command, exit, counts -> receipt and evidence -> candidate>.
-Open: <missing, failed, skipped or unknown items; impact; repairs tried; facts needed>.
-Spec gaps: <must-ask items left open and the reading chosen>.
-Evidence limits: <superseded, mismatched or inapplicable evidence, kept apart>.
+Result: <ready / partial / blocked>. Never write "accepted".
+Candidate: <full commit, worktree, dirty files/owner>; task/phase/round.
+Changes: <behavior + fact owners; design trade-offs>.
+Integration: <peer commits, combined candidate, checks, open dependencies>.
+Acceptance: <ID -> command, exit, counts -> receipt/evidence -> candidate>.
+Open: <missing/failed/skipped/unknown items; impact; repairs tried; facts needed>.
+Spec gaps: <must-ask items open + reading chosen>.
+Evidence limits: <superseded/mismatched/inapplicable evidence, kept apart>.
 ```
 
-Link logs; do not paste them. Exit 0, Pi's summary and a local PASS never replace acceptance. Keep secrets out. Do not push or take external action by default. A same-cause repair brief adds only the differences: rejected candidate and items, shared cause, reproduction, related entries (reproduced, reachable, excluded), fix decision, scope, affected checks, valid evidence, downstream effect.
+Link logs, never paste; exit 0, Pi summary and local PASS never replace acceptance; keep secrets out; no push/external action by default. A same-cause repair brief adds only differences: rejected candidate/items, shared cause, reproduction, related entries (reproduced/reachable/excluded), fix decision, scope, affected checks, valid evidence, downstream effect.

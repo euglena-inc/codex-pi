@@ -1,36 +1,13 @@
 # Event handling and recovery
 
-Rules are in [the Skill](../SKILL.md); commands in [runtime](runtime.md). The supervisor refreshes the board about every 15 seconds and queues only actionable events as a delivery card (at most 1200 bytes: task, round, event id, kind, full candidate SHA, one line per acceptance item, `failed/limit owner`, Pi's truncated final report, one hint). An idle desktop task resumes; a busy one handles the card after its turn.
+Rules [Skill](../SKILL.md); commands [runtime](runtime.md). Supervisor refreshes locally (~15s); actionable events become one ≤1200-byte card (ids, kind, full SHA, item line, owner, report, hint); idle tasks resume, busy ones handle after their turn.
 
-## Handle one event
+Read card ids; reuse a collected `result` for that round; verify diff+original receipts; then `changes_requested`=findings, `reject`=reject, `resolve`=non-review incident/anomaly echo, `accept`=full real candidate. An old-round decision never accepts the current; `+N pending event(s)`→`show` and handle all this turn; repeated delivery=dedup receipt; breach/deadline→bounded question, never endless retry.
 
-Read the card's task, round and event id, reuse a `result` already collected for that round, verify the diff and original receipts, then decide:
+Eligible new tasks: early ownership handoff via `pi_board.py takeover` with current event, full candidate, reason; it rechecks released writers/contract/HEAD, preserves real counts, emits the same takeover event resolved as an ownership receipt; independent acceptance required.
 
-```sh
-python3 /abs/plugin/runtime/pi_board.py decide --repo /abs/repo --task TASK-1 --event-id EVENT_ID --decision accept --reviewed-head FULL_SHA --note 'Verified checks and review evidence'
-```
+Pause stops dispatch, not Pi; prompts/progress never resume it; a queued card never overrides a later pause. An uncertain send may have arrived: keep the claim, inspect, recover only if needed; `rearm` may duplicate (no queue idempotency key), never a live inflight send, never steal locks; hooks check only pause/recovery; a dead supervisor cannot report itself.
 
-`changes_requested` carries concrete findings; `reject` rejects the candidate; `resolve` closes a non-review incident or an anomaly echo. Acceptance needs the full real candidate commit; a decision on an old round never accepts the current one. If a card shows `+N pending event(s)`, run `show` and handle the rest in the same turn. A repeated delivered event is a receipt to deduplicate. A resource breach or deadline gets a bounded question and evidence, never an endless retry.
+Install only via the formal mechanism; never edit managed caches, hook trust or app queue DBs (hook review = user app action); a running task keeps its frozen helpers; 0.5.x tasks finish with them; registering a terminal task may enqueue a review event.
 
-For eligible new tasks, an evidence-based early ownership handoff uses `pi_board.py takeover` with the current event, full candidate and reason (see [runtime](runtime.md)). It rechecks released writers, current contract and HEAD, preserves real quality counts, and emits the same takeover event. Resolve that event as an ownership receipt; independent acceptance remains required.
-
-## Pause and uncertain delivery
-
-```sh
-python3 .../pi_board.py pause --repo REPO --task TASK --note 'User paused handoff'
-python3 .../pi_board.py resume --repo REPO --task TASK --thread OWNER_UUID
-python3 .../pi_board.py recover --thread OWNER_UUID
-python3 .../pi_board.py rearm --repo REPO --task TASK --event-id EVENT
-```
-
-A pause stops dispatch, not Pi; ordinary prompts and progress questions never resume it. A queued card does not override a later pause. A delivery that timed out or crashed may already have arrived: keep the uncertain claim, inspect, and use explicit recovery only if needed. `rearm` may duplicate it (the queue has no idempotency key); never rearm a live inflight send, steal locks or claim exactly-once. Hooks only check pause and recovery. A dead supervisor cannot report itself.
-
-## Updates
-
-Install through the formal plugin mechanism; never edit managed caches, hook trust or app queue databases (hook review is the user's action in the app). A running task keeps its frozen helpers; a task from 0.5.x is finished with those helpers, not migrated. Registering a terminal task may enqueue a review event at once.
-
-## Real desktop validation
-
-Unit tests do not prove desktop delivery. Use one real tiny Pi task (write fixed bytes to one file, run a ten-second check, commit that file, exit; bound the round to three minutes) and observe completion, supervisor, the same desktop task and a visible reply. History: [CLI queue validation](../../../docs/validation/cli-queue-20260926.md).
-
-`register` reports `routePaused` with the exact `resume` command when the owner thread is paused. An interrupted, idle desktop task keeps a queued card until it is opened again ([0.6.0 desktop check](../../../docs/validation/desktop-0.6.0-20261002.md)).
+Unit tests don't prove desktop delivery: one real tiny bounded Pi task (fixed bytes, ten-second check, commit, exit; ≤3 min) must show completion, supervisor, same desktop task, visible reply; `register` reports `routePaused` with exact `resume` command; an interrupted idle desktop task keeps its card until reopened. [cli-queue](../../../docs/validation/cli-queue-20260926.md), [desktop](../../../docs/validation/desktop-0.6.0-20261002.md).

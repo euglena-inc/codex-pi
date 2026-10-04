@@ -535,7 +535,7 @@ class BoardAuxiliaryAggregationTest(unittest.TestCase):
 
 class VersionStillReads(unittest.TestCase):
     def test_context_workflow_keeps_release_version(self):
-        self.assertEqual((RUNTIME / "VERSION").read_text().strip(), "0.8.5")
+        self.assertEqual((RUNTIME / "VERSION").read_text().strip(), "0.8.6")
 
 
 if __name__ == "__main__":
