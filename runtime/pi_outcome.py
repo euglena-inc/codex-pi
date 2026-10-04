@@ -465,7 +465,8 @@ def _receipt_metadata(data, digest, rel):
         raise ValueError(f"extra check {rel!r} has an invalid dirty flag")
     counts = data.get("test_counts")
     if counts is not None and (not isinstance(counts, dict) or any(
-            not isinstance(v, int) or isinstance(v, bool) or v < 0 for v in counts.values())):
+            not isinstance(v, int) or isinstance(v, bool) or v < 0
+            for k, v in counts.items() if k != "format")):
         raise ValueError(f"extra check {rel!r} has invalid test counts")
     test_counts = {key: value for key, value in counts.items()
                    if isinstance(value, int) and not isinstance(value, bool)} \

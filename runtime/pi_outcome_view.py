@@ -612,7 +612,7 @@ def _summary_receipt_view(receipt):
     counts = receipt.get("test_counts")
     invalid_counts = counts is not None and (not isinstance(counts, dict) or any(
         not isinstance(value, int) or isinstance(value, bool) or value < 0
-        for value in counts.values()))
+        for key, value in counts.items() if key != "format"))
     counts = {key: value for key, value in counts.items()
               if isinstance(value, int) and not isinstance(value, bool) and value >= 0} \
         if isinstance(counts, dict) and not invalid_counts else None

@@ -95,6 +95,7 @@ class OutcomeMetricsTest(unittest.TestCase):
         checks.mkdir(parents=True, exist_ok=True)
         counts = {"run": 4, "pass": 4, "fail": 0, "skip": 0} if exit_code == 0 \
             else {"run": 1, "pass": 0, "fail": 1, "skip": 0}
+        counts["format"] = "python_unittest_summary"
         data = {"schema_version": 1, "id": name,
                 "argv": argv if argv is not None else ["python3", "-m", "unittest", "discover"],
                 "cwd": str(self.repo.root), "head": head if head is not None else self.head,
