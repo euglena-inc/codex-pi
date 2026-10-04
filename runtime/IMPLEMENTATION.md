@@ -1,5 +1,7 @@
 # Codex-Pi runtime implementation
 
+Release 0.8.5 adds a main-owned closeout record and a read-only outcome view to the existing metrics CLI. `record-outcome` validates a bounded reported payload (explicit same-repository task/round members, status, full candidate for accepted reports, evidence references, reported timing and work quantities, and pinned standard check receipts) and publishes immutable numbered revisions under the private git-common `codex-pi/outcomes/<ID>/` directory with the existing lock and atomic-write primitives. Identical normalized payload replays are idempotent; corrections need the exact current revision and retain older snapshots; stale or conflicting updates change nothing. `metrics --outcome` projects six compact sections (delivery, timing, rework/incidents, verification, usage/cost, intervention/coverage) from task/round state, stored round summaries, archived board decisions/events read through existing cursors, pinned receipts and bounded network sidecars, while keeping Pi native execution/quality facts separate from the Main-reported observation. `metrics --outcomes` is a bounded cursor listing, never a success-rate denominator. Unknown stays null (never zero), timing intervals use unions, repeated clean checks are labelled potential repeats rather than waste, reported interface/SDK cost is not billing, and reasoning stays inside output. Read-only queries and the closeout write touch no execution, board decision, budget, pause, quality counter, notification, session or raw check log. No new database, service, scheduler or model call is introduced; `pi_outcome` is a lower-level helper frozen into new task snapshots.
+
 Release 0.8.4 aligns active verification guidance with actual change impact and reuses one test-support environment isolation helper in fixture creation and the standalone connection validator. The helper copies the parent environment, drops inherited Node/diagnostic injection and applies explicit fixture overrides last. Production network, ownership, budgets and receipt validation are unchanged. Formal commands remain current-round/exact-candidate; evidence applicability is reviewed explicitly, not inferred by a cache.
 
 Release 0.8.3 makes the weak-model-first allocation preference explicit in the Skill and the task packet: when facts, settled consequential interfaces, genuine feedback and authorized resources allow, prefer the configured Pi model for the largest reasonably self-contained complete outcome; choose the route by time to accepted delivery and all attributable costs, and require a concrete task-specific reason for direct Codex completion or early takeover. No runtime mechanism changes. Release 0.8.2 adds the optional `qwen38/qwen38` model route; projects selecting it use Pi's highest thinking setting, `max`. Release 0.8.0 added optional frozen network policy, primary-process transport diagnostics, and the explicit `newapi/deepseek-flash` route. Worker instructions became clearer without changing acceptance semantics. The instruction pilot pins its shared runtime to the original experiment commit so later release version bumps do not invalidate the recorded evidence. Historical task helpers remain unchanged.
@@ -17,7 +19,7 @@ python3 runtime/pi_task.py project  --repo <path-inside-project>
 python3 runtime/pi_task.py start    --repo <path> --task <id> --worktree <linked-checkout> --prompt-file <brief> [--contract-file <phase.json>] [--read-only]
 python3 runtime/pi_task.py continue --repo <path> --task <id> --prompt-file <follow-up>
 python3 runtime/pi_task.py status | result | readiness | phase-status | progress | cancel ...
-python3 runtime/pi_board.py register | show | decide | takeover | pause | resume | recover | rearm | refresh | metrics ...
+python3 runtime/pi_board.py register | show | decide | takeover | pause | resume | recover | rearm | refresh | record-outcome | metrics ...
 ```
 
 Every command prints one single-line compact JSON object and exits non-zero with an actionable stderr message on error. `PI_BIN` overrides the Pi executable (test double or explicit path only).
@@ -47,6 +49,7 @@ Board side:
 | --- | --- |
 | `runtime/pi_store.py` | Board files, locks, monitor records, owner routes and route pause |
 | `runtime/pi_archive.py` | Plugin-owned transactional SQLite cards, events, decisions, phase quotas and queue claims; bounded windows and cursor pages |
+| `runtime/pi_outcome.py` | Main-reported outcome observations: bounded immutable revisions, strict payload validation, read-only six-section projection and cursor listing (no model, service or session scan) |
 | `runtime/pi_events.py` | Card and event model, status projection, bounded progress echoes, decide hint |
 | `runtime/pi_queue.py` | Queue claims, the delivery card, one dispatch through `codex queue` |
 | `runtime/pi_board.py` | Registration, refresh, decisions, compact views, `metrics`, CLI |

@@ -17,9 +17,14 @@ python3 .../pi_task.py status --repo REPO --task TASK [--round N]   # fast read-
 python3 .../pi_task.py result --repo REPO --task TASK [--round N]
 python3 .../pi_board.py show --repo REPO --task TASK               # board card, pending events, queue
 python3 .../pi_board.py metrics --repo REPO [--task TASK]          # usage, decisions, Codex-facing bytes
+python3 .../pi_board.py record-outcome --repo REPO --outcome ID --record-file /abs/outcome.json [--expected-revision N]
+python3 .../pi_board.py metrics --repo REPO --outcome ID          # six-section read-only outcome view
+python3 .../pi_board.py metrics --repo REPO --outcomes [--cursor ID]  # bounded cursor listing
 ```
 
 `result` prints state, execution, candidate head, usage totals, check lines (`ID exit=N run=.. pass=.. fail=.. skip=..`, or `ID missing`/`ID unknown`), Pi's final text (at most 1200 characters) and notes. Collect it once per terminal round; raw logs, receipts and the native session stay under the Git common directory `codex-pi/tasks/`. `show` gives the absolute evidence paths a delivery card leaves out.
+
+`record-outcome` stores one Main-reported observation as bounded immutable numbered revisions under `codex-pi/outcomes/<ID>/` using the existing lock and atomic write: explicit same-repository task/round members (never inferred by name or predecessor), status, a full candidate for accepted reports, evidence references, reported timing and external work, and pinned standard check receipts. An identical normalized payload replay is idempotent; a correction needs the current `--expected-revision` and keeps older snapshots; stale or conflicting updates change nothing. `metrics --outcome` is a read-only projection (delivery, timing, rework/incidents, verification, usage/cost, intervention/coverage); `metrics --outcomes` is a bounded listing, not a denominator of all work or a success rate. A closeout is a reported observation, never acceptance, ownership or permission; Pi-native facts and Main-reported facts stay separate, unknown is not zero, intervals use unions, repeated clean checks are potential repeats only, and reported interface/SDK cost is not billing. Neither command executes anything, scans a session or raw log, or changes execution, board decisions, budgets, pause, quality counters, notifications or models.
 
 ## Continue and cancel
 

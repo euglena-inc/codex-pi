@@ -2,6 +2,28 @@
 
 当前 Codex 主任务负责设计、派工与验收；Pi 的模型由项目配置选择（模型政策只在 [协作 Skill](skills/collaborate/SKILL.md) 中陈述）。项目只需 `.agents/codex-pi.json` 和自己的领域约束，公共插件维护进程、同会话返修、看板和原始证据。
 
+## 0.8.5 收尾记录与成果观测
+
+- 新增 `pi_board.py record-outcome --repo REPO --outcome ID --record-file FILE [--expected-revision N]` 与 `pi_board.py metrics --repo REPO --outcome ID`，并提供 `metrics --outcomes [--cursor ID]` 的有界游标列表。`record-outcome` 只写私有 git-common `codex-pi/outcomes/<ID>/` 下有界的不可变编号修订，复用现有锁与原子写；相同规范化载荷重复写入幂等（覆盖不确定重试），更正必须带当前修订号，陈旧冲突不修改任何文件。
+- 收尾是带来源的主会话观察，不是验收、接管权限或执行许可。`metrics --outcome` 只读地投影六个部分（交付、时间、返修/事故、验证、用量/费用、干预与覆盖）：Pi 原生执行/质量事实与主会话报告分离；未知不填 0；时间间隔按并集而非相加；检查重复只标为潜在重复，不推断浪费；接口/SDK 报告费用不是账单，reasoning 已含在 output 中不重复计费；归档决策通过 cursor 读取，不只看卡片窗口。`metrics`、`refresh` 与 `record-outcome` 不修改执行、board 决定、预算、pause、质量计数，不触发通知或模型调用，也不重扫原始日志/会话。
+- 成员只按显式记录的同仓库任务/轮次关联，不按名称或前驱递归猜组；被引用来源之后缺失/损坏时明确标为不完整。公共示例与测试只使用合成身份和路径；真实任务、会话、凭据与业务证据不进入公共仓库。列表只代表已记录的有界集合，不发布成功率或策略节省。设计与边界见[成果观测设计](docs/design/outcome-metrics.md)。
+
+示例（合成值，`candidate` 必须是仓库中真实存在的完整提交）：
+
+```sh
+python3 runtime/pi_board.py record-outcome --repo /abs/repo --outcome retro-1 \
+  --record-file /abs/outcome.json
+python3 runtime/pi_board.py metrics --repo /abs/repo --outcome retro-1
+```
+
+```json
+{"members":[{"task":"TASK-1","rounds":[1,2]}],"status":"accepted",
+ "candidate":"<full-40-or-64-hex-commit>",
+ "evidenceRefs":["docs/design/example.md"],"startedAt":1000,"finishedAt":1300,
+ "workComplete":false,
+ "extraChecks":["tasks/TASK-1/rounds/1/round.checks/regression.json"]}
+```
+
 ## 0.8.4 必要验证与测试环境隔离
 
 - 冻结前按实际影响选择检查：开发聚焦失败和受影响路径，审查优先核原回执，必要的广泛整合才跑完整回归；新提交、轮次或发布本身不触发全量。检查脚本包含关系，避免重复套跑。

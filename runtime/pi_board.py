@@ -17,7 +17,10 @@ Roles are explicit commands, not a permission framework:
     commit resolved in the registered repository;
   * ``pause``/``resume`` -- explicit persisted control state;
   * ``rearm``     -- explicit requeue after a lost/interrupted owner turn;
-  * ``show``/``metrics`` -- bounded compact reads and size/usage accounting.
+  * ``show``/``metrics`` -- bounded compact reads and size/usage accounting;
+    ``record-outcome`` and ``metrics --outcome/--outcomes`` record and read
+    main-reported closeout observations without touching execution or board
+    decisions.
 
 Modules: ``pi_store`` (board files, monitors, routes, pause), ``pi_events`` (cards and
 events, status projection), ``pi_queue`` (queue claims and dispatch). This file holds
@@ -124,6 +127,7 @@ from pi_store import (
 from pi_takeover import FAILURE_KINDS, _records as decision_records, review_policy
 from pi_task import build_status
 from pi_archive import Cards, initialize_store, event_page, STORE_FILE
+from pi_outcome import list_outcomes, outcome_metrics, record_outcome
 
 
 def refresh_with_status(board_file, task_id: str, status: dict, now=None, block: bool = True,
@@ -1008,10 +1012,25 @@ def build_parser() -> argparse.ArgumentParser:
     show.set_defaults(func=cmd_show)
 
     metrics = sub.add_parser("metrics", help="one compact JSON line per task: rounds, usage/cost, "
-                                             "review decisions, takeover, Codex-facing bytes")
+                                             "review decisions, takeover, Codex-facing bytes; "
+                                             "--outcome/--outcomes read recorded closeouts")
     metrics.add_argument("--repo", required=True)
     metrics.add_argument("--task")
+    metrics.add_argument("--outcome", help="one recorded Main-reported outcome observation")
+    metrics.add_argument("--outcomes", action="store_true",
+                         help="bounded cursor listing of recorded outcome observations")
+    metrics.add_argument("--cursor", help="outcome id after the previous bounded listing page")
     metrics.set_defaults(func=cmd_metrics)
+
+    record = sub.add_parser("record-outcome",
+                            help="main: record one reported outcome observation as an immutable revision")
+    record.add_argument("--repo", required=True)
+    record.add_argument("--outcome", required=True)
+    record.add_argument("--record-file", required=True,
+                        help="bounded JSON file with the reported observation payload")
+    record.add_argument("--expected-revision", type=int,
+                        help="current revision to correct; omit for the initial revision 0")
+    record.set_defaults(func=cmd_record_outcome)
 
     decide = sub.add_parser("decide", help="handle one exact event with an explicit decision")
     decide.add_argument("--repo", required=True)
@@ -1397,7 +1416,34 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
     return record
 
 
-def cmd_metrics(args) -> list:
+def cmd_record_outcome(args) -> dict:
+    root, common, _board = board_file_for_repo(args.repo)
+    path = Path(args.record_file)
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise ValueError(f"record file is unreadable: {path}") from exc
+    if size > 1_000_000:
+        raise ValueError("record file exceeds the 1 MiB bounded input limit")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("record file is not valid JSON") from exc
+    return record_outcome(root, common, args.outcome, payload,
+                          expected_revision=args.expected_revision)
+
+
+def cmd_metrics(args) -> list | dict:
+    if args.outcomes:
+        if args.task or args.outcome:
+            raise ValueError("--outcomes cannot be combined with --task or --outcome")
+        _root, _common, _board = board_file_for_repo(args.repo)
+        return list_outcomes(_common, args.cursor or "")
+    if args.outcome:
+        if args.task:
+            raise ValueError("--outcome cannot be combined with --task")
+        root, common, _board = board_file_for_repo(args.repo)
+        return outcome_metrics(root, common, args.outcome)
     _root, _common, board_file = board_file_for_repo(args.repo)
     board, _problem = read_board(board_file)
     cards = (board or {}).get("cards") or {}
