@@ -151,5 +151,17 @@ class MechanismHomeTest(unittest.TestCase):
                                  f"{name} must not name {marker}")
 
 
+class ConstraintDirectionTest(unittest.TestCase):
+    def test_constraints_name_real_paths_and_not_the_skill(self):
+        config = json.loads(read(ROOT / ".agents" / "codex-pi.json"))
+        constraints = config.get("constraints", [])
+        self.assertIn("AGENTS.md", constraints)
+        self.assertNotIn("skills/collaborate/SKILL.md", constraints)
+        self.assertTrue(any(entry.startswith("docs/design/") for entry in constraints),
+                        "constraints should include a design document")
+        for entry in constraints:
+            self.assertTrue((ROOT / entry).is_file(), f"constraint path does not exist: {entry}")
+
+
 if __name__ == "__main__":
     unittest.main()

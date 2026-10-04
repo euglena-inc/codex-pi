@@ -3,7 +3,9 @@
   "model": "deepseek/deepseek-flash",
   "thinking": "max",
   "constraints": [
-    "skills/collaborate/SKILL.md"
+    "AGENTS.md",
+    "docs/design/necessary-verification.md",
+    "docs/design/doc-size-budget.md"
   ],
   "checks": [
     "Run the Python behavioral suite for affected runtime paths."
