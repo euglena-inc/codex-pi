@@ -63,6 +63,7 @@ from pi_core import (
     record_codex_io,
     require_allowed_model,
     require_task_arg,
+    require_process_release,
     task_dir_for,
 )
 from pi_events import (
@@ -412,6 +413,8 @@ def register_task(repo, task, thread=None, transport=TRANSPORT_OFFLINE, codex_bi
                              plan_ref, root, common, frozen.get("worktree"), transport,
                              resolved_bin, now)
             cards[task_id] = card
+            if isinstance(frozen.get("reviewPolicyPin"), dict):
+                card["reviewPolicyPin"] = dict(frozen["reviewPolicyPin"])
         else:
             card["ownerThread"] = owner_thread or card.get("ownerThread")
             card["codexTaskId"] = codex_task_id or card.get("codexTaskId") \
@@ -727,24 +730,28 @@ def decide(repo, task, event_id, decision, reviewed_head=None, note=None, phase=
                 existing_latch.update({"required": True, "scope": policy["scope"],
                                        "outcome": policy.get("outcome"),
                                        "limit": policy["limit"],
-                                       "failedReports": policy["failedReports"]})
+                                       "failedReports": policy["failedReports"],
+                                       "failedDeliveries": policy["failedDeliveries"]})
             else:
                 # First reach of the pinned limit: keep the exact time so a later
                 # acceptance can be proven to have happened after the latch.
                 codex["takeover"] = {"required": True, "at": now, "scope": policy["scope"],
                                      "outcome": policy.get("outcome"),
                                      "limit": policy["limit"],
-                                     "failedReports": policy["failedReports"]}
-            takeover = add_event(card, "codex_takeover_required", card_round,
-                                 "quality-failure-limit-reached",
-                                 f"Codex must take over implementation after {policy['limit']} "
-                                 f"failed reviewed "
-                                 f"deliver{'y' if policy['limit'] == 1 else 'ies'}",
-                                 event.get("candidate") or {}, {"reviewPolicy": policy},
-                                 policy["instruction"], now)
-            if takeover is not None:
-                takeover["phaseId"] = event_phase
-                takeover["contractHash"] = event.get("contractHash")
+                                     "failedReports": policy["failedReports"],
+                                     "failedDeliveries": policy["failedDeliveries"],
+                                     "cause": "quality_limit"}
+            if not (isinstance(existing_latch, dict) and existing_latch.get("required")):
+                takeover = add_event(card, "codex_takeover_required", card_round,
+                                     "quality-failure-limit-reached",
+                                     f"Codex must take over implementation after {policy['limit']} "
+                                     f"failed reviewed "
+                                     f"deliver{'y' if policy['limit'] == 1 else 'ies'}",
+                                     event.get("candidate") or {}, {"reviewPolicy": policy},
+                                     policy["instruction"], now)
+                if takeover is not None:
+                    takeover["phaseId"] = event_phase
+                    takeover["contractHash"] = event.get("contractHash")
         board["revision"] = int(board.get("revision") or 0) + 1
         board["updatedAt"] = now
         _write_board(board_file, board)
@@ -757,6 +764,103 @@ def decide(repo, task, event_id, decision, reviewed_head=None, note=None, phase=
                         "main review of the current review event, never exit 0"}
     finally:
         os.close(fd)
+
+
+def take_over(repo, task, event_id, reviewed_head, note, now=None) -> dict:
+    """Explicit owner handoff on an exact released outcome; never acceptance or a rejection."""
+    from pi_core import TERMINAL_STATES, list_rounds
+    from pi_summary import read_meta
+    from pi_execution import effective_execution
+    from pi_phase import read_phase_record
+
+    if not isinstance(event_id, str) or not EVENT_ID_RE.fullmatch(event_id):
+        raise ValueError("event id must be a 64-character lowercase hex digest")
+    if not isinstance(reviewed_head, str) or not FULL_OID_RE.fullmatch(reviewed_head):
+        raise ValueError("takeover requires the full reviewed candidate commit")
+    if not isinstance(note, str) or not note.strip() or len(note) > MAX_NOTE:
+        raise ValueError(f"takeover requires a reason of 1..{MAX_NOTE} characters")
+    now = time.time() if now is None else now
+    root, common, board_file = board_file_for_repo(repo)
+    task_id = require_task_arg(task)
+    task_dir = task_dir_for(common, task_id)
+    frozen = read_json(task_dir / "task.json", None)
+    if (not isinstance(frozen, dict) or frozen.get("task") != task_id
+            or Path(frozen.get("repo", "")).resolve() != root):
+        raise ValueError("takeover needs the exact frozen task/repository identity")
+    if (frozen.get("reviewPolicyPin") or {}).get("earlyTakeover") is not True:
+        raise ValueError("this frozen task does not allow early takeover; keep its original policy")
+    locks = []
+    try:
+        # Same admission order as continue/adopt; hold writer leases through the board commit.
+        for path in (common / "codex-pi/.admission.lock", task_dir / ".task.lock",
+                     task_dir / ".supervisor.lock", board_file.with_name(BOARD_LOCK)):
+            locks.append(lock_fd(path, blocking=False))
+        board, problem = read_board(board_file)
+        if board is None:
+            raise ValueError(f"board state is {problem}")
+        card = board["cards"].get(task_id)
+        if not isinstance(card, dict):
+            raise ValueError("task owner is not registered")
+        if card.get("worktree") != frozen.get("worktree"):
+            raise ValueError("registered worktree differs from the frozen task")
+        latch = (card.get("codex") or {}).get("takeover") or {}
+        if latch.get("required"):
+            if (latch.get("cause") == "main_decision" and latch.get("eventId") == event_id
+                    and latch.get("reviewedHead") == reviewed_head and latch.get("note") == note.strip()):
+                return {"ok": True, "idempotent": True, "taskId": task_id,
+                        "reviewPolicy": review_policy(card)}
+            raise ValueError("takeover is already latched; refusing a conflicting handoff")
+        event = find_event(card, event_id)
+        if not isinstance(event, dict) or event.get("kind") not in (
+                "review_required", "phase_blocked", "execution_failed"):
+            raise ValueError("takeover needs a current delivery or execution incident event")
+        if event.get("decision") == "accepted":
+            raise ValueError("accepted outcomes are not early takeover candidates")
+        rounds = list_rounds(task_dir)
+        if not rounds or event.get("round") != rounds[-1][0]:
+            raise ValueError("takeover event is not the current round")
+        number, round_dir = rounds[-1]
+        state = read_json(round_dir / "round.state.json", {}) or {}
+        effective, _ = effective_execution(state, round_dir / "round.jsonl",
+                                           terminal_meta=read_meta(round_dir / "round.meta"))
+        if effective not in TERMINAL_STATES:
+            raise ValueError("takeover needs terminal-known execution and released writers")
+        if not any(isinstance(state.get(key), int) and not isinstance(state.get(key), bool)
+                   and state[key] > 0 for key in ("piPid", "supervisorPid")):
+            raise ValueError("recorded process identity is unavailable; writer release is unknown")
+        require_process_release(state)
+        head, head_problem = probe_worktree_head(Path(frozen["worktree"]))
+        if head_problem or head != reviewed_head or (event.get("candidate") or {}).get("head") != head:
+            raise ValueError("takeover candidate is unknown or differs from the reviewed event/HEAD")
+        phase, phase_problem = read_phase_record(task_dir)
+        if phase_problem not in (None, "absent"):
+            raise ValueError("takeover phase contract is unverified")
+        current_phase = (phase or {}).get("contract", {}).get("phaseId")
+        if (event.get("phaseId") != current_phase
+                or event.get("contractHash") != (phase or {}).get("contractSha256")):
+            raise ValueError("takeover event no longer names the current phase contract")
+        policy = review_policy(card)
+        card.setdefault("codex", _default_codex())["takeover"] = {
+            "required": True, "at": now, "cause": "main_decision", "note": note.strip(),
+            "eventId": event_id, "reviewedHead": head, "scope": policy["scope"],
+            "limit": policy["limit"], "failedDeliveries": policy["failedDeliveries"],
+            "failedReports": policy["failedReports"],
+            "outcome": {"round": number, "eventId": event_id,
+                        "phaseId": current_phase, "contractHash": event.get("contractHash")}}
+        policy = review_policy(card)
+        handoff = add_event(card, "codex_takeover_required", number, "explicit-main-takeover",
+                            "Codex explicitly took over the released outcome", event.get("candidate") or {},
+                            {"reviewPolicy": policy}, policy["instruction"], now)
+        handoff.update(phaseId=current_phase, contractHash=event.get("contractHash"))
+        card["updatedAt"] = now
+        board["revision"] = int(board.get("revision") or 0) + 1
+        board["updatedAt"] = now
+        _write_board(board_file, board)
+        return {"ok": True, "idempotent": False, "taskId": task_id, "eventId": handoff["id"],
+                "reviewPolicy": policy, "revision": board["revision"], "acceptance": "not_verified"}
+    finally:
+        for fd in reversed(locks):
+            os.close(fd)
 
 
 def set_paused(repo, task, paused: bool, note=None, now=None) -> dict:
@@ -840,6 +944,10 @@ def cmd_decide(args) -> dict:
                   failure_kind=args.failure_kind)
 
 
+def cmd_takeover(args) -> dict:
+    return take_over(args.repo, args.task, args.event_id, args.reviewed_head, args.note)
+
+
 def cmd_pause(args) -> dict:
     return set_paused(args.repo, args.task, True, note=args.note)
 
@@ -921,6 +1029,14 @@ def build_parser() -> argparse.ArgumentParser:
                              "does not count")
     decide.add_argument("--note")
     decide.set_defaults(func=cmd_decide)
+
+    takeover = sub.add_parser("takeover", help="main: explicitly take over an exact released new-task outcome")
+    takeover.add_argument("--repo", required=True)
+    takeover.add_argument("--task", required=True)
+    takeover.add_argument("--event-id", required=True)
+    takeover.add_argument("--reviewed-head", required=True)
+    takeover.add_argument("--note", required=True)
+    takeover.set_defaults(func=cmd_takeover)
 
     pause = sub.add_parser("pause", help="persist explicit pause; queue dispatch stops")
     pause.add_argument("--repo", required=True)
@@ -1093,7 +1209,8 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
         if not summary.get("usage_complete"):
             incomplete.append(number)
         value = summary.get("reported_cost_usd")
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and value >= 0):
             cost += value
         else:
             cost_unknown.append(number)
@@ -1190,9 +1307,20 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
                                 and not auxiliary_unknown
                                 and all(item["complete"] for item in auxiliary_metrics.values()))
     record = {"task": task_id, "rounds": len(rounds),
+              "measurementScope": {"scope": "pi_execution",
+                  "includes": ["pi_assistant", "pi_auxiliary", "pi_checks"],
+                  "excludes": ["codex_design", "codex_review", "codex_takeover", "external_work"]},
+              "workflowCost": {"complete": False, "reportedCostUsd": None,
+                  "reason": "codex_and_external_costs_not_recorded",
+                  "evidenceRefs": {"plan": card.get("planRef") if isinstance(card, dict) else None,
+                                   "brief": card.get("briefRef") if isinstance(card, dict) else None},
+                  "note": "Keep independently measured external costs in existing acceptance records; "
+                          "these references do not prove cost coverage."},
               "usage": {"known": usage, "complete": bool(rounds) and not missing and not incomplete,
                         "roundsMissing": missing, "roundsIncomplete": incomplete},
               "costUsd": {"known": cost, "complete": bool(rounds) and not cost_unknown,
+                          "scope": "pi_assistant", "source": "provider_reported",
+                          "billingCostUsd": None, "billingComplete": False,
                           "roundsUnknown": cost_unknown},
               "auxiliaryUsage": {
                   "known": {key: derived_auxiliary.get(key) for key in auxiliary_metric_keys},
@@ -1263,7 +1391,9 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
             else:
                 by_command[command] = by_command.get(command, 0) + size
     record["codexBytes"] = {"tracked": tracked, "packet": packet, "commands": by_command,
-                            "total": total, "badLines": bad}
+                            "total": total, "badLines": bad,
+                            "unit": "utf8_bytes", "scope": "plugin_output_only",
+                            "note": "Not Codex token usage, model cost or total workflow context."}
     return record
 
 

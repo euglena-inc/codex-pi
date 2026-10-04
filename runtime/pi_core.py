@@ -704,3 +704,24 @@ def runtime_version() -> str:
         return version_file.read_text(encoding="utf-8").strip()
     except OSError:
         return "unknown"
+
+
+def require_process_release(state):
+    """Verify recorded leaders and process groups are gone; never signal unknown owners."""
+    groups={value for key in ['piPid','supervisorPid'] for value in [state.get(key)]
+            if isinstance(value,int) and not isinstance(value,bool) and value>0}
+    until=time.monotonic()+1
+    while groups:
+        try:
+            proc=subprocess.run(['ps','-axo','pid=,pgid=,stat='],capture_output=True,text=True,timeout=3)
+        except (OSError,subprocess.SubprocessError) as exc:
+            raise ValueError(f'cannot verify recorded process release: {exc}') from None
+        if proc.returncode!=0:raise ValueError('cannot verify recorded process-group release')
+        rows=proc.stdout.splitlines()
+        if len(rows)>50_000:raise ValueError('process inventory exceeded its bounded scan')
+        live=[r for r in rows if len(r.split())>=3 and r.split()[2][0]!='Z'
+              and (int(r.split()[0]) in groups or int(r.split()[1]) in groups)]
+        if not live:break
+        if time.monotonic()>=until:
+            raise ValueError('recorded PID/group still exists; ownership is unknown, inspect without blind signaling')
+        time.sleep(0.05)

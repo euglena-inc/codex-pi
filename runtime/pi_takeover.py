@@ -1,6 +1,6 @@
 """Review-based implementation handoff; never a model launcher or acceptance owner.
 
-The board's exact main-session decisions are the authority. Every task allows two
+The board's exact main-session decisions are the authority. New tasks allow at most two
 complete Pi deliveries: after the first reviewed quality failure the same Codex
 main session reassesses the whole outcome and the remaining plan and records the
 repair in the existing design plus the next immutable brief, then the SAME Pi
@@ -27,12 +27,21 @@ REPLAN_INSTRUCTION = (
     "Pi session and worktree for that second complete delivery. The runtime only counts "
     "exact review decisions; it cannot prove the analysis quality."
 )
+BOUNDED_REPLAN_INSTRUCTION = REPLAN_INSTRUCTION.replace(
+    "Continue the SAME Pi session and worktree for that second complete delivery.",
+    "Choose whether another Pi delivery is worthwhile. If continuing, use the SAME Pi session "
+    "and worktree; otherwise explicitly take over after verified writer release.")
 
 
-def takeover_message(limit: int, failed: int) -> str:
+def takeover_message(limit: int, failed: int, cause="quality_limit", note=None) -> str:
     """The refusal/ownership instruction for the exact reached limit."""
     noun = "failure" if limit == 1 else "failures"
     recorded = "delivery" if failed == 1 else "deliveries"
+    if cause == "main_decision":
+        return (f"{TAKEOVER_PREFIX}: explicit main-session decision after {failed} reviewed "
+                f"quality {'failure' if failed == 1 else 'failures'}; reason: {note}. The released checkout belongs to the same "
+                "Codex main session for implementation and verification. Keep the candidate, "
+                "dirty work, evidence and budgets. Resume does not return this work to Pi.")
     return (
         f"{TAKEOVER_PREFIX}: the review policy allows {limit} reviewed quality {noun} "
         f"for this outcome and {failed} distinct failed {recorded} have been recorded. "
@@ -130,8 +139,23 @@ def review_policy(card: dict) -> dict:
         outcome = dict(latch["outcome"])
     elif latched:
         outcome=(seed or {}).get('outcome')
-    failed_count = max(len(failed), limit) if latched else len(failed)
-    if required:
+    cause = (latch or {}).get("cause") or (seed or {}).get("takeoverCause") or "quality_limit"
+    note = (latch or {}).get("note") or (seed or {}).get("takeoverNote")
+    if latched:
+        retained = list((latch or {}).get("failedReports") or (seed or {}).get("failedReports") or [])
+        reports = failed[-limit:] if len(failed) > len(retained) else retained
+        stored_count = (latch or {}).get("failedDeliveries", (seed or {}).get("failedDeliveries"))
+        if isinstance(stored_count, int) and not isinstance(stored_count, bool) and stored_count >= 0:
+            failed_count = max(len(failed), stored_count)
+        else:
+            failed_count = max(len(reports), limit)  # historical limit-based latch
+        outcome = (latch or {}).get("outcome") or (seed or {}).get("outcome") or outcome
+    else:
+        failed_count = len(failed)
+    early_allowed = pin.get("earlyTakeover") is True
+    if required and cause == "main_decision":
+        reason = f"explicit main-session takeover: {note}"
+    elif required:
         reason = (f"quality-failure limit {limit} reached with {failed_count} distinct "
                   f"failed deliver{'y' if failed_count == 1 else 'ies'}")
     elif replan_required:
@@ -149,8 +173,12 @@ def review_policy(card: dict) -> dict:
         "failedDeliveries": failed_count,
         "failedReports": reports,
         "takeoverRequired": required,
+        "earlyTakeoverAllowed": early_allowed,
+        "takeoverCause": cause if required else None,
+        "takeoverNote": note if required else None,
         "implementationOwner": "codex" if required else "pi",
         "reason": reason,
-        "instruction": takeover_message(limit, failed_count) if required else (
-            REPLAN_INSTRUCTION if replan_required else None),
+        "instruction": takeover_message(limit, failed_count, cause, note) if required else (
+            (BOUNDED_REPLAN_INSTRUCTION if early_allowed else REPLAN_INSTRUCTION)
+            if replan_required else None),
     }

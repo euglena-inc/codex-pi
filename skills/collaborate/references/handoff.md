@@ -12,6 +12,8 @@ python3 /abs/plugin/runtime/pi_board.py decide --repo /abs/repo --task TASK-1 --
 
 `changes_requested` carries concrete findings; `reject` rejects the candidate; `resolve` closes a non-review incident or an anomaly echo. Acceptance needs the full real candidate commit; a decision on an old round never accepts the current one. If a card shows `+N pending event(s)`, run `show` and handle the rest in the same turn. A repeated delivered event is a receipt to deduplicate. A resource breach or deadline gets a bounded question and evidence, never an endless retry.
 
+For eligible new tasks, an evidence-based early ownership handoff uses `pi_board.py takeover` with the current event, full candidate and reason (see [runtime](runtime.md)). It rechecks released writers, current contract and HEAD, preserves real quality counts, and emits the same takeover event. Resolve that event as an ownership receipt; independent acceptance remains required.
+
 ## Pause and uncertain delivery
 
 ```sh

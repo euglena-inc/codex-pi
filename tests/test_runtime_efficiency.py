@@ -642,6 +642,49 @@ class CheckMetricsTest(TimingCase):
 
 
 class BoardMetricsTest(unittest.TestCase):
+    def test_reported_zero_and_plugin_bytes_do_not_prove_workflow_cost(self):
+        for number in (1, 2):
+            summary = self.new_summary(10, 3.0, 1.0, 56.0, 2)
+            summary["reported_cost_usd"] = 0.0
+            self.write_summary(number, summary)
+        (self.task_dir / "codex-io.jsonl").write_text(
+            json.dumps({"bytes": 42, "command": "result", "kind": "output"}) + "\n")
+        record = pi_board.task_metrics(self.board_file, {"planRef": "PLAN.md"}, "T")
+        self.assertEqual(record["costUsd"]["known"], 0.0)
+        self.assertTrue(record["costUsd"]["complete"])
+        self.assertFalse(record["costUsd"]["billingComplete"])
+        self.assertIsNone(record["costUsd"]["billingCostUsd"])
+        self.assertFalse(record["workflowCost"]["complete"])
+        self.assertIsNone(record["workflowCost"]["reportedCostUsd"])
+        self.assertEqual(record["workflowCost"]["evidenceRefs"]["plan"], "PLAN.md")
+        self.assertIn("codex_takeover", record["measurementScope"]["excludes"])
+        self.assertEqual(record["codexBytes"]["total"], 42)
+        self.assertEqual(record["codexBytes"]["unit"], "utf8_bytes")
+
+    def test_invalid_reported_cost_never_enters_known_total(self):
+        for invalid in (float("nan"), float("inf"), -1, True):
+            with self.subTest(invalid=invalid):
+                self.write_summary(1, {"usage": {}, "usage_complete": True,
+                                       "reported_cost_usd": invalid})
+                self.write_summary(2, {"usage": {}, "usage_complete": True,
+                                       "reported_cost_usd": 0.25})
+                cost = pi_board.task_metrics(self.board_file, None, "T")["costUsd"]
+                self.assertEqual(cost["known"], 0.25)
+                self.assertFalse(cost["complete"])
+                self.assertEqual(cost["roundsUnknown"], [1])
+
+    def test_summary_cost_completeness_is_not_billing_completeness(self):
+        usage = dict.fromkeys(pi_summary.USAGE_KEYS, 0)
+        auxiliary = {"complete": True, "reportedCostUsd": {"value": 0}}
+        for name in pi_summary.AUXILIARY_LEAF_NAMES.values():
+            auxiliary[name] = {"value": 0}
+        result = pi_summary.total_metrics(usage, True, 0, 1, 1, auxiliary)
+        self.assertTrue(result["costComplete"])
+        self.assertEqual(result["reportedCostUsd"], 0)
+        self.assertEqual(result["costSource"], "provider_reported")
+        self.assertFalse(result["billingComplete"])
+        self.assertEqual(result["scope"], "pi_execution")
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="codex-pi-board-metrics-")
         self.addCleanup(self._tmp.cleanup)
@@ -769,9 +812,9 @@ class BenchmarkHelperTest(unittest.TestCase):
 
 class VersionTest(unittest.TestCase):
     def test_version_matches_release(self):
-        self.assertEqual((RUNTIME / "VERSION").read_text().strip(), "0.8.1")
+        self.assertEqual((RUNTIME / "VERSION").read_text().strip(), "0.8.2")
         manifest = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())
-        self.assertEqual(manifest["version"], "0.8.1")
+        self.assertEqual(manifest["version"], "0.8.2")
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ import tempfile
 import time
 
 from pi_archive import initialize_store, read_store, STORE_FILE
-from pi_core import atomic, canonical_root, git_common_dir, lock_fd, read_json, require_task_arg
+from pi_core import atomic, canonical_root, git_common_dir, lock_fd, read_json, require_task_arg, require_process_release
 from pi_phase import phase_budget, read_phase_record
 from pi_store import (MAX_BOARD_BYTES, _read_bounded_json, board_file_for_common,
                       read_board, validate_board)
@@ -155,23 +155,7 @@ def adopt_runtime(repo,task_id,helper_files,source,dry_run=False):
                 state=dict(state,state=recovered,executionEvidence=evidence)
         if state.get('state') not in ('completed','failed','cancelled','timed_out','interrupted'):
             raise ValueError('runtime adoption needs a terminal-known round and released writers')
-        groups={value for key in ['piPid','supervisorPid'] for value in [state.get(key)]
-                if isinstance(value,int) and not isinstance(value,bool) and value>0}
-        until=time.monotonic()+1
-        while groups:
-            try:
-                proc=subprocess.run(['ps','-axo','pid=,pgid=,stat='],capture_output=True,text=True,timeout=3)
-            except (OSError,subprocess.SubprocessError) as exc:
-                raise ValueError(f'cannot verify recorded process release: {exc}') from None
-            if proc.returncode!=0:raise ValueError('cannot verify recorded process-group release')
-            rows=proc.stdout.splitlines()
-            if len(rows)>50_000:raise ValueError('process inventory exceeded its bounded scan')
-            live=[r for r in rows if len(r.split())>=3 and r.split()[2][0]!='Z'
-                  and (int(r.split()[0]) in groups or int(r.split()[1]) in groups)]
-            if not live:break
-            if time.monotonic()>=until:
-                raise ValueError('recorded PID/group still exists; ownership is unknown, inspect without blind signaling')
-            time.sleep(0.05)
+        require_process_release(state)
         # Claims and the immutable task/session/worktree identity are rechecked
         # again by continue. Preparation never extends its original budget.
         board,problem=read_board(board_file_for_common(common))

@@ -157,7 +157,9 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(row["rounds"], 2)
         self.assertEqual(row["usage"]["known"], {"input": 30, "output": 2, "totalTokens": 32})
         self.assertTrue(row["usage"]["complete"])
-        self.assertEqual(row["costUsd"], {"known": 0.75, "complete": True, "roundsUnknown": []})
+        self.assertEqual(row["costUsd"], {"known": 0.75, "complete": True, "roundsUnknown": [],
+                                         "scope": "pi_assistant", "source": "provider_reported",
+                                         "billingCostUsd": None, "billingComplete": False})
         # A missing round summary: the known part is shown, never as complete.
         self.make_task("gap", {1: self.summary(10, 0.25), 2: None})
         row, = self.metrics("--task", "gap")
@@ -237,7 +239,7 @@ class MetricsTest(unittest.TestCase):
 class VersionTest(unittest.TestCase):
     def test_release_version_is_consistent(self):
         version = (RUNTIME / "VERSION").read_text().strip()
-        self.assertEqual(version, "0.8.1")
+        self.assertEqual(version, "0.8.2")
         manifest = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())
         self.assertEqual(manifest["version"].split("+")[0], version)
         self.assertIn(version, (ROOT / "README.md").read_text())

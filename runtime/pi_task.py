@@ -464,6 +464,7 @@ def cmd_start(args) -> dict:
             "createdAt": created_at, "startHead": start_head,
             "runtimeVersion": runtime_version(), "helperHashes": hashes,
             "piVersion": installed_pi,
+            "reviewPolicyPin": {"qualityFailureLimit": REVIEW_LIMIT, "earlyTakeover": True},
             "sessionId": task, "sessionDir": str(task_dir / "session"),
         }
         atomic(task_dir / "task.json", task_json)
@@ -1121,6 +1122,8 @@ def build_result(repo_arg: str, task_arg: str, round_arg=None) -> dict:
         "usage": (summary or {}).get("usage"),
         "usageComplete": bool(summary and summary.get("usage_complete")),
         "costUsd": (summary or {}).get("reported_cost_usd"),
+        "costEvidence": {"scope": "pi_assistant", "source": "provider_reported",
+                         "billingComplete": False, "workflowComplete": False},
         "auxiliaryUsage": (summary or {}).get("auxiliary_usage"),
         "totalUsageComplete": bool(summary and summary.get("total_usage_complete")),
         "checks": checks,
@@ -1244,10 +1247,12 @@ def cmd_project(args) -> dict:
                                       "rejected without substitution",
                        "reviewPolicy": {
                            "limit": REVIEW_LIMIT,
-                           "note": "every task allows two complete deliveries; after the first "
+                           "earlyTakeover": True,
+                           "note": "new tasks allow at most two complete deliveries; after the first "
                                    "reviewed quality failure the same Codex main session "
                                    "reassesses the complete outcome and the remaining plan "
-                                   "before the second Pi delivery, and a second failure "
+                                   "before deciding to continue the same Pi session or explicitly "
+                                   "take over after verified writer release; a second failure "
                                    "transfers implementation to that main session; contract "
                                    "revisions, phase renames, pauses and resumes never reset "
                                    "counted failures"},

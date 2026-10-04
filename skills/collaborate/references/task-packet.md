@@ -2,6 +2,8 @@
 
 For the main session preparing a dispatch or a whole-outcome repair. Rules and the whole-task analysis: [the Skill](../SKILL.md); commands: [runtime](runtime.md). Write in the user's language. Keep APIs, paths and commands verbatim.
 
+Before preparing this packet, decide whether Pi has an independently verifiable complete outcome worth delegating. If Codex direct completion is the better route, use it. Resolve consequential design uncertainty first; preserve Pi's freedom to read source and choose routine implementation. Design depth follows the actual risks, not a fixed document length.
+
 ## Artifacts
 
 - **Specification**: the goal, settled design, facts, scope and acceptance. Reference the existing project design. Write `task.md` only when no design exists.
@@ -27,7 +29,7 @@ This line's outcome, sibling task and input commit, what waits, shared edits and
 | ID | Observable pass condition | Real command / evidence | Counter-example that must fail |
 Missing, skipped or unknown evidence is not a pass. Mark manual or external proof.
 ## Repair, budget, escalation
-What Pi fixes alone. Command and phase budgets and resource scope. Escalate only for a design contradiction, an authority change or repeated ineffective repair; include the minimal reproduction.
+Allocation and its evidence; Pi execution measurements and the separate sources for Codex/external effort. What Pi fixes alone. Command and phase budgets and resource scope. Escalate only for a design contradiction, an authority change or repeated ineffective repair; include the minimal reproduction.
 ```
 
 ## Must-ask checklist

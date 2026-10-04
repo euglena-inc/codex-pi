@@ -72,6 +72,16 @@ python3 .../pi_board.py decide --repo REPO --task TASK --event-id EVENT --decisi
 
 `--failure-kind external` requires a note naming the unlock condition. Counting rules are in the Skill.
 
+## Explicit main-session takeover
+
+```sh
+python3 .../pi_board.py takeover --repo REPO --task TASK --event-id EVENT --reviewed-head FULL_SHA --note 'Verified design/cost evidence warrants direct completion'
+```
+
+Only tasks started with the frozen early-takeover capability qualify. The exact latest delivery or execution-incident event, current contract and actual HEAD must agree. Admission, task and supervisor leases plus recorded process groups must be released. Active, unknown, stale, accepted or conflicting outcomes are refused. Identical replay is idempotent. The existing `codex_takeover_required` event carries the ownership receipt; `decide resolve` handles it. Quality decisions remain separate: taking over does not accept the candidate or fabricate a rejection, and later resume cannot return implementation to Pi.
+
+`metrics` labels Pi execution coverage and provider-reported cost; billing and full workflow cost remain unknown. `codexBytes` is UTF-8 plugin output only. Keep independently measured Codex/external cost evidence in the project's existing acceptance record. Old summaries are read without modification.
+
 ## Bounded check concurrency
 
 `checkExecution` is an optional phase-level object: `maxConcurrent` (1..4), `cpuSlots`, `memoryMiB`. Per-item `checkResources` may declare `parallelSafe`, `cpuSlots`, `memoryMiB`, and `exclusiveKeys`. Metadata follows normalized command argv, not the call's id. Conflicting declarations are refused.

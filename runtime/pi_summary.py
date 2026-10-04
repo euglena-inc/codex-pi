@@ -677,12 +677,17 @@ def total_metrics(usage, usage_complete, assistant_cost, cost_samples, unique_me
     if not assistant_cost_known:
         reasons.append("assistant_cost_unknown")
     return {"assistantComplete": bool(usage_complete), "auxiliaryComplete": auxiliary_complete,
+            "scope": "pi_execution", "costSource": "provider_reported",
+            "billingCostUsd": None, "billingComplete": False,
+            "billingReason": "no_verified_billing_or_price_source",
             "complete": bool(usage_complete and auxiliary_complete),
             "usage": combined,
             "reportedCostUsd": assistant_cost + auxiliary_cost if cost_known else None,
             "costComplete": cost_known,
             "reason": "; ".join(reasons) if reasons else None,
-            "note": "assistant fields keep their original meaning; auxiliary "
+            "note": "Pi assistant and auxiliary usage only; costComplete means reported fields "
+                    "are present, not verified billing. Reported zero does not prove free inference. "
+                    "Codex design/review/takeover and external work are outside this scope; "
                     "compaction/branch_summary/usage entries are added once here, never twice"}
 
 

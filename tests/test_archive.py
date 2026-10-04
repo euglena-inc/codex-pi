@@ -27,6 +27,28 @@ THREAD='11111111-2222-3333-4444-555555555555'
 
 
 class ArchiveTest(unittest.TestCase):
+    def test_explicit_takeover_checkpoint_retains_actual_failure_count(self):
+        c = self.card()
+        c["reviewPolicyPin"] = {"qualityFailureLimit": 2, "earlyTakeover": True}
+        c["codex"]["takeover"] = {"required": True, "cause": "main_decision",
+            "note": "Verified repair uncertainty", "limit": 2, "failedDeliveries": 1,
+            "failedReports": [{"round": 1, "eventId": "a" * 64}]}
+        self.legacy({"task": c})
+        pi_recovery.recover_store(self.repo.root)
+        for number in range(2, 65):
+            board, card = self.load()
+            event = pi_events.add_event(card, "review_required", number, str(number), "review",
+                                       {"head": self.head}, {}, "review", number)
+            event.update(handled=True, decision="accepted", handledAt=number)
+            self.save(board)
+        _, card = self.load()
+        policy = review_policy(card)
+        self.assertEqual(policy["failedDeliveries"], 1)
+        self.assertEqual(policy["takeoverCause"], "main_decision")
+        self.assertEqual(policy["takeoverNote"], "Verified repair uncertainty")
+        self.assertEqual(policy["implementationOwner"], "codex")
+        self.assertEqual(policy["failedReports"], [{"round": 1, "eventId": "a" * 64}])
+
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(prefix='codex-pi-archive-')
         self.addCleanup(self.tmp.cleanup);self.addCleanup(cleanup_repos)

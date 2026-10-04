@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -357,6 +358,137 @@ class TakeoverLifecycleTest(unittest.TestCase):
         self.assertIn("Codex takeover required", refused.stderr)
 
 
+    def prepared_takeover(self, task="early"):
+        self.start(task)
+        self.assertEqual(self.repo.wait_terminal(task)["state"], "completed")
+        self.register(task)
+        self.refresh(task)
+        event = self.review_event(task, 1)
+        head = event["candidate"]["head"]
+        return event, head
+
+    def early_takeover(self, task, event, head, note="Verified repair uncertainty warrants direct completion", expect=0):
+        return board_cli("takeover", "--repo", self.repo.root, "--task", task,
+                         "--event-id", event["id"], "--reviewed-head", head, "--note", note,
+                         env=self.env, expect=expect)
+
+    def test_early_takeover_preserves_one_failure_evidence_dirty_and_budget(self):
+        event, head = self.prepared_takeover()
+        self.decide("early", event["id"], "changes_requested")
+        directory = self.repo.task_dir("early")
+        originals = {p: p.read_bytes() for p in directory.rglob("*")
+                     if p.is_file() and p.name not in (".task.lock", ".supervisor.lock")}
+        dirty = self.wt / "preserved.txt"
+        dirty.write_text("preserve this work\n")
+        out = self.early_takeover("early", event, head)
+        self.assertEqual(out["acceptance"], "not_verified")
+        self.assertEqual(out["reviewPolicy"]["failedDeliveries"], 1)
+        self.assertEqual(out["reviewPolicy"]["takeoverCause"], "main_decision")
+        self.assertEqual(out["reviewPolicy"]["implementationOwner"], "codex")
+        self.assertEqual(dirty.read_text(), "preserve this work\n")
+        for path, raw in originals.items():
+            self.assertEqual(path.read_bytes(), raw, path.name)
+        self.assertTrue(self.early_takeover("early", event, head)["idempotent"])
+        conflict = self.early_takeover("early", event, head, note="Different reason", expect=2)
+        self.assertIn("conflicting handoff", conflict.stderr)
+        takeover = self.review_event("early", 1, "codex_takeover_required")
+        self.decide("early", takeover["id"], "resolve")
+        board_cli("pause", "--repo", self.repo.root, "--task", "early", env=self.env)
+        board_cli("resume", "--repo", self.repo.root, "--task", "early", env=self.env)
+        self.refresh("early")
+        policy = self.card_view("early")["reviewPolicy"]
+        self.assertEqual(policy["failedDeliveries"], 1)
+        self.assertEqual(policy["takeoverCause"], "main_decision")
+        events = [e for e in self.board_card("early")["events"] if e["kind"] == "codex_takeover_required"]
+        self.assertEqual(len(events), 1)
+        refused = run_cli("continue", "--repo", self.repo.root, "--task", "early",
+                          "--prompt", "Must not restart Pi", env=self.env, expect=2)
+        self.assertIn("Codex takeover required", refused.stderr)
+        self.assertEqual([p.name for p in (directory / "rounds").iterdir()], ["1"])
+
+    def test_design_takeover_does_not_fabricate_quality_failure(self):
+        event, head = self.prepared_takeover("design")
+        out = self.early_takeover("design", event, head)
+        self.assertEqual(out["reviewPolicy"]["failedDeliveries"], 0)
+        self.assertEqual(out["reviewPolicy"]["failedReports"], [])
+        self.decide("design", event["id"], "changes_requested")
+        self.assertEqual(self.card_view("design")["reviewPolicy"]["failedDeliveries"], 1)
+        self.assertEqual(self.card_view("design")["reviewPolicy"]["takeoverCause"], "main_decision")
+
+    def test_legacy_task_cannot_gain_eligibility_by_registration(self):
+        event, head = self.prepared_takeover("legacy")
+        path = self.repo.task_dir("legacy") / "task.json"
+        frozen = json.loads(path.read_text())
+        frozen.pop("reviewPolicyPin")  # synthetic pre-upgrade metadata
+        path.write_text(json.dumps(frozen))
+        self.register("legacy")
+        out = self.early_takeover("legacy", event, head, expect=2)
+        self.assertIn("original policy", out.stderr)
+        self.assertFalse(self.board_card("legacy")["codex"].get("takeover"))
+
+    def test_stale_head_and_accepted_event_are_refused(self):
+        event, head = self.prepared_takeover("stale")
+        wrong = self.early_takeover("stale", event, "0" * 40, expect=2)
+        self.assertIn("candidate", wrong.stderr)
+        self.decide("stale", event["id"], "accept", "--reviewed-head", head)
+        out = self.early_takeover("stale", event, head, expect=2)
+        self.assertIn("accepted outcomes", out.stderr)
+        self.assertFalse(self.board_card("stale")["codex"].get("takeover"))
+
+    def test_unknown_terminal_and_missing_process_identity_are_refused(self):
+        event, head = self.prepared_takeover("unknown")
+        path = self.repo.task_dir("unknown") / "rounds/1/round.state.json"
+        original = path.read_bytes()
+        state = json.loads(original)
+        try:
+            state.update(state="unknown", exitCode=None)
+            path.write_text(json.dumps(state))
+            out = self.early_takeover("unknown", event, head, expect=2)
+            self.assertIn("terminal-known", out.stderr)
+            state = json.loads(original)
+            state.pop("piPid", None)
+            state.pop("supervisorPid", None)
+            path.write_text(json.dumps(state))
+            out = self.early_takeover("unknown", event, head, expect=2)
+            self.assertIn("writer release is unknown", out.stderr)
+            self.assertFalse(self.board_card("unknown")["codex"].get("takeover"))
+        finally:
+            path.write_bytes(original)
+
+    def test_stale_round_cannot_take_over_a_new_delivery(self):
+        event, head = self.prepared_takeover("stale-round")
+        self.decide("stale-round", event["id"], "changes_requested")
+        run_cli("continue", "--repo", self.repo.root, "--task", "stale-round",
+                "--prompt", "Complete the repair", env=self.env)
+        self.repo.wait_terminal("stale-round", round=2)
+        self.refresh("stale-round")
+        out = self.early_takeover("stale-round", event, head, expect=2)
+        self.assertIn("current round", out.stderr)
+        self.assertFalse(self.board_card("stale-round")["codex"].get("takeover"))
+
+    def test_live_writer_and_recorded_process_are_refused(self):
+        event, head = self.prepared_takeover("writer")
+        directory = self.repo.task_dir("writer")
+        fd = pi_core.lock_fd(directory / ".task.lock")
+        try:
+            out = self.early_takeover("writer", event, head, expect=2)
+            self.assertIn("lock", out.stderr.lower())
+        finally:
+            os.close(fd)
+        state_path = directory / "rounds/1/round.state.json"
+        original = state_path.read_bytes()
+        state = json.loads(original)
+        state["piPid"] = os.getpid()  # real live process; takeover must not signal it
+        state_path.write_text(json.dumps(state))
+        try:
+            out = self.early_takeover("writer", event, head, expect=2)
+            self.assertIn("ownership is unknown", out.stderr)
+            self.assertFalse(self.board_card("writer")["codex"].get("takeover"))
+        finally:
+            state_path.write_bytes(original)  # fixture cleanup only owns its original worker
+
+
+
 class MissingEvidencePolicyTest(unittest.TestCase):
     """A round that only lacks evidence is not a reviewed quality failure."""
 
@@ -393,6 +525,32 @@ class MissingEvidencePolicyTest(unittest.TestCase):
         raw = pi_store.read_board(self.repo.state_dir / "board.json")[0]["cards"][task]
         return [event for event in raw["events"] if event["kind"] == "phase_blocked"
                 and not event["handled"]]
+
+    def test_phase_takeover_uses_verified_current_contract(self):
+        task = "phase-handoff"
+        run_cli("start", "--repo", self.repo.root, "--task", task,
+                "--worktree", self.wt, "--prompt", "Implement the phase",
+                "--contract-file", self.contract_path, env=self.env)
+        self.repo.wait_terminal(task)
+        board_cli("register", "--repo", self.repo.root, "--task", task,
+                  "--transport", "offline", env=self.env)
+        events = self.pending_blocked(task)
+        self.assertTrue(events)
+        event = events[-1]
+        phase_path = self.repo.task_dir(task) / "phase.json"
+        original = phase_path.read_bytes()
+        corrupted = json.loads(original)
+        corrupted["contract"]["phaseId"] = "different-phase"
+        phase_path.write_text(json.dumps(corrupted))
+        args = ("takeover", "--repo", self.repo.root, "--task", task,
+                "--event-id", event["id"], "--reviewed-head", event["candidate"]["head"],
+                "--note", "Independent evidence requires direct completion")
+        out = board_cli(*args, env=self.env, expect=2)
+        self.assertIn("contract is unverified", out.stderr)
+        phase_path.write_bytes(original)
+        out = board_cli(*args, env=self.env)
+        self.assertEqual(out["reviewPolicy"]["failedDeliveries"], 0)
+        self.assertEqual(out["acceptance"], "not_verified")
 
     def test_missing_evidence_does_not_count_but_two_quality_failures_do(self):
         run_cli("start", "--repo", self.repo.root, "--task", "missing-receipt",
