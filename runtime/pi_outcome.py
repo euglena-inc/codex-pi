@@ -113,7 +113,10 @@ RECEIPT_FIELDS = ("id", "exitCode", "timedOut", "cancelled", "startedAt", "ended
 # ---------------------------------------------------------------------------
 
 def _finite(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    try:
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _time_value(value, name):
@@ -126,7 +129,7 @@ def _time_value(value, name):
 
 
 def _token_count(value, name):
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
+    if not _finite(value) \
             or value < 0 or not float(value).is_integer():
         raise ValueError(f"{name} must be a non-negative whole token count")
     return int(value)
@@ -212,33 +215,33 @@ def outcome_path(common, outcome_id) -> Path:
     """Lexical bounded outcome directory inside the verified outcomes root."""
     root = _outcomes_root(common)
     target = root / validate_outcome_id(outcome_id)
-    if not inside(target.resolve(), root):
-        raise ValueError("outcome id resolves outside the outcomes directory")
-    return target
+    return _require_under(target, root, "outcome directory")
 
 
 def _require_under(path, root, label) -> Path:
     """Write-path resolution: reject symlinks and escapes from the trusted root."""
-    candidate = Path(path)
-    if candidate.is_symlink():
-        raise ValueError(f"{label} must not be a symlink")
-    try:
-        resolved = candidate.resolve()
-    except OSError as exc:
-        raise ValueError(f"{label} is unresolvable") from exc
-    if not inside(resolved, root):
-        raise ValueError(f"{label} escapes the private git-common state root")
+    resolved, problem = _inspect_under(path, root)
+    if problem:
+        raise ValueError(f"{label} {problem}")
     return resolved
 
 
 def _inspect_under(path, root):
     """Read-path resolution: never follow a symlink or escape; return a problem."""
-    candidate = Path(path)
-    if candidate.is_symlink():
-        return None, "is a symlink"
+    candidate, root = Path(path), Path(root)
     try:
+        relative = candidate.relative_to(root)
+        if ".." in relative.parts:
+            return None, "escapes the private git-common state root"
+        current = root
+        for part in ("", *relative.parts):
+            current = current / part
+            if current.is_symlink():
+                return None, "is a symlink or has a symlink parent"
         resolved = candidate.resolve()
-    except OSError:
+    except ValueError:
+        return None, "escapes the private git-common state root"
+    except (OSError, RuntimeError):
         return None, "is unresolvable"
     if not inside(resolved, root):
         return None, "escapes the private git-common state root"
@@ -293,7 +296,7 @@ def _member_task_identity(common, task):
     if declared_common is not None:
         try:
             declared_path = Path(declared_common).resolve()
-        except OSError:
+        except (OSError, TypeError, ValueError, RuntimeError):
             declared_path = None
         if declared_path != Path(common).resolve():
             raise ValueError(f"member task {task!r} belongs to a different git-common directory")
@@ -451,7 +454,7 @@ def _receipt_metadata(data, digest, rel):
     ended = data.get("ended_at")
     if not _finite(started) or not _finite(ended) or started < 0 or ended < started:
         raise ValueError(f"extra check {rel!r} has invalid timestamps")
-    if not isinstance(data.get("log_sha256"), str):
+    if not isinstance(data.get("log_sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", data["log_sha256"]):
         raise ValueError(f"extra check {rel!r} has no pinned log digest")
     timed_out = data.get("timed_out")
     cancelled = data.get("cancelled")
@@ -461,6 +464,9 @@ def _receipt_metadata(data, digest, rel):
     if dirty is not None and not isinstance(dirty, bool):
         raise ValueError(f"extra check {rel!r} has an invalid dirty flag")
     counts = data.get("test_counts")
+    if counts is not None and (not isinstance(counts, dict) or any(
+            not isinstance(v, int) or isinstance(v, bool) or v < 0 for v in counts.values())):
+        raise ValueError(f"extra check {rel!r} has invalid test counts")
     test_counts = {key: value for key, value in counts.items()
                    if isinstance(value, int) and not isinstance(value, bool)} \
         if isinstance(counts, dict) else None
@@ -555,6 +561,7 @@ def _validate_stored_payload(payload):
     if not isinstance(members, list) or len(members) > MAX_MEMBERS:
         raise ValueError("payload members are invalid")
     total_rounds = 0
+    seen_rounds = set()
     for member in members:
         if not isinstance(member, dict) or set(member) != {"task", "rounds"}:
             raise ValueError("payload member is invalid")
@@ -566,6 +573,10 @@ def _validate_stored_payload(payload):
         for number in rounds:
             if isinstance(number, bool) or not isinstance(number, int) or number < 1:
                 raise ValueError("payload member round is invalid")
+            pair = (member["task"], number)
+            if pair in seen_rounds:
+                raise ValueError("payload has duplicate member rounds")
+            seen_rounds.add(pair)
         total_rounds += len(rounds)
     if total_rounds > MAX_MEMBER_ROUNDS:
         raise ValueError("payload member rounds exceed the bounded total")
@@ -579,8 +590,8 @@ def _validate_stored_payload(payload):
     if not isinstance(refs, list) or len(refs) > MAX_EVIDENCE_REFS \
             or any(not isinstance(ref, str) or not ref or len(ref) > MAX_REF_CHARS for ref in refs):
         raise ValueError("payload evidenceRefs are invalid")
-    if payload.get("status") == "accepted" and not refs:
-        raise ValueError("accepted payload has no evidenceRefs")
+    if payload.get("status") == "accepted" and (not refs or candidate is None):
+        raise ValueError("accepted payload needs a candidate and evidenceRefs")
     for key in ("startedAt", "finishedAt"):
         value = payload.get(key)
         if value is not None and (not _finite(value) or value < 0):
@@ -607,6 +618,8 @@ def _validate_stored_payload(payload):
         cost = entry.get("reportedCostUsd")
         if cost is not None and (not _finite(cost) or cost < 0):
             raise ValueError("payload work cost is invalid")
+    if _normalize_work(work) != work:
+        raise ValueError("payload work is not normalized")
     if not isinstance(payload.get("workComplete"), bool):
         raise ValueError("payload workComplete is invalid")
     extra = payload.get("extraChecks")
@@ -642,7 +655,7 @@ def _validate_stored_payload(payload):
             raise ValueError("payload extraChecks head is invalid")
         counts = entry.get("testCounts")
         if counts is not None and (not isinstance(counts, dict)
-                                   or any(isinstance(v, bool) or not isinstance(v, int)
+                                   or any(isinstance(v, bool) or not isinstance(v, int) or v < 0
                                           for v in counts.values())):
             raise ValueError("payload extraChecks testCounts are invalid")
 
@@ -745,7 +758,8 @@ def record_outcome(root, common, outcome_id, payload, expected_revision=None, no
     if not _finite(timestamp) or timestamp < 0:
         raise ValueError("recordedAt must be a finite non-negative Unix timestamp")
     directory = outcome_path(common, outcome_id)
-    fd = lock_fd(directory / "write.lock", blocking=True, timeout=30)
+    lock_path = _require_under(directory / "write.lock", _codex_root(common), "outcome lock")
+    fd = lock_fd(lock_path, blocking=True, timeout=30)
     try:
         try:
             history = _load_history(directory)
@@ -768,6 +782,8 @@ def record_outcome(root, common, outcome_id, payload, expected_revision=None, no
             raise ValueError(f"stale expected revision {expected_revision}: "
                              f"current revision is {current_number}")
         number = current_number + 1
+        if number > MAX_REVISIONS:
+            raise ValueError(f"history exceeds the bounded revision count ({MAX_REVISIONS})")
         envelope = {"schemaVersion": SCHEMA_VERSION, "revision": number, "recordedAt": timestamp,
                     "payloadDigest": digest, "payload": normalized}
         size = _rendered_envelope_size(envelope)
@@ -775,6 +791,9 @@ def record_outcome(root, common, outcome_id, payload, expected_revision=None, no
             raise ValueError(f"normalized outcome revision is {size} bytes and exceeds the "
                              f"{MAX_REVISION_BYTES}-byte bounded revision limit; reduce work, "
                              "argv or extraChecks before recording")
+        history_bytes = sum(path.stat().st_size for path in _revision_files(directory).values())
+        if history_bytes + size > MAX_HISTORY_BYTES:
+            raise ValueError("history exceeds the bounded cumulative size")
         if directory.exists() and directory.is_symlink():
             raise ValueError("outcome directory must not be a symlink")
         atomic(directory / f"revision-{number:06d}.json", envelope)

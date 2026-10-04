@@ -166,7 +166,7 @@ class OutcomeMetricsTest(unittest.TestCase):
                      "complete": auxiliary_complete,
                      "status": "complete" if auxiliary_complete else "partial", "reason": None}
         combined = total_usage if total_usage is not None else {
-            "uncachedInput": 11, "cacheRead": 22, "cacheWrite": 1, "output": 2, "totalTokens": 36}
+            "input": 11, "cacheRead": 22, "cacheWrite": 1, "output": 2, "totalTokens": 36}
         total = {"assistantComplete": True, "auxiliaryComplete": auxiliary_complete,
                  "scope": "pi_execution", "costSource": "provider_reported",
                  "billingCostUsd": None, "billingComplete": False,
@@ -899,6 +899,125 @@ class OutcomeMetricsTest(unittest.TestCase):
                          ["alpha", "beta", "gamma"])
         self.assertEqual(listing["outcomes"][0]["memberSources"]["missing"], ["task-a/1"])
         self.assertNotIn("successRate", json.dumps(listing))
+
+
+    def test_native_total_generator_and_model_attribution(self):
+        import pi_summary
+        self.make_task("task-a", (1, 2))
+        for number in (1, 2):
+            self.write_state("task-a", number)
+            summary = self.write_summary("task-a", number)
+            summary["metrics"]["total"] = pi_summary.total_metrics(
+                summary["usage"], True, 0.25, 2, 2, summary["metrics"]["auxiliary"])
+            if number == 2:
+                summary["models"] = {"model-a": 1, "model-b": 1}
+            path = self.repo.task_dir("task-a") / "rounds" / str(number) / "round.summary.json"
+            path.write_text(json.dumps(summary))
+        self.accept_record("native", self.accepted_payload(members=[{"task": "task-a", "rounds": [1, 2]}]))
+        pi = self.query("native")["usageCost"]["piReported"]
+        self.assertEqual(pi["total"]["uncachedInput"]["known"], 22)
+        self.assertTrue(pi["totalComplete"])
+        by_model = {entry["model"]: entry for entry in pi["assistantByModel"]}
+        self.assertEqual(by_model[None]["rounds"], ["task-a/2"])
+        self.assertEqual(by_model["deepseek/deepseek-flash"]["usage"]["uncachedInput"]["known"], 10)
+        self.assertNotIn("model-a", by_model)
+
+    def test_combined_overflow_is_unknown_and_json_finite(self):
+        self.make_task()
+        self.write_state("task-a", 1)
+        self.write_summary("task-a", 1, total_cost=1e308)
+        self.accept_record("overflow", self.accepted_payload(workComplete=True, work=[{
+            "id": "review", "kind": "review", "reportedCostUsd": 1e308,
+            "evidenceRef": "review.json"}]))
+        view = self.query("overflow")
+        json.dumps(view, allow_nan=False)
+        cost = view["usageCost"]["combinedReportedCostUsd"]
+        self.assertIsNone(cost["value"])
+        self.assertIn("overflow", cost["reason"])
+        self.assertFalse(pi_outcome._finite(10 ** 1000))
+
+    def test_history_limits_refuse_before_publish_and_allow_replay(self):
+        from unittest.mock import patch
+        payload = {"status": "unknown", "finishedAt": 1}
+        pi_outcome.record_outcome(self.repo.root, self.common, "bounded", payload)
+        directory = pi_outcome.outcome_path(self.common, "bounded")
+        original = (directory / "revision-000001.json").read_bytes()
+        with patch.object(pi_outcome, "MAX_REVISIONS", 1):
+            replay = pi_outcome.record_outcome(self.repo.root, self.common, "bounded", payload)
+            self.assertTrue(replay["idempotent"])
+            with self.assertRaisesRegex(ValueError, "revision count"):
+                pi_outcome.record_outcome(self.repo.root, self.common, "bounded",
+                                          dict(payload, finishedAt=2), expected_revision=1)
+        with patch.object(pi_outcome, "MAX_HISTORY_BYTES", len(original) + 1):
+            with self.assertRaisesRegex(ValueError, "cumulative size"):
+                pi_outcome.record_outcome(self.repo.root, self.common, "bounded",
+                                          dict(payload, finishedAt=2), expected_revision=1)
+        self.assertFalse((directory / "revision-000002.json").exists())
+        self.assertEqual((directory / "revision-000001.json").read_bytes(), original)
+        self.assertEqual(self.query("bounded")["revision"], 1)
+
+    def test_intermediate_alias_and_changed_identity_are_not_member_sources(self):
+        import shutil
+        a = self.make_task("task-a")
+        b = self.make_task("task-b")
+        for task in ("task-a", "task-b"):
+            self.write_state(task, 1)
+            self.write_summary(task, 1)
+        self.accept_record("original", self.accepted_payload())
+        shutil.rmtree(a / "rounds")
+        (a / "rounds").symlink_to(b / "rounds", target_is_directory=True)
+        self.record("aliased", self.accepted_payload(), expect=2)
+        view = self.query("original")
+        self.assertEqual(view["delivery"]["nativeRounds"][0]["state"], "unknown")
+        self.assertIsNone(view["usageCost"]["piReported"]["total"]["uncachedInput"]["known"])
+        listing = pi_outcome_view.list_outcomes(self.common)
+        self.assertEqual(listing["outcomes"][0]["memberSources"]["missing"], ["task-a/1"])
+        (a / "rounds").unlink()
+        shutil.copytree(b / "rounds", a / "rounds")
+        meta = json.loads((a / "task.json").read_text())
+        meta["task"] = "task-b"
+        (a / "task.json").write_text(json.dumps(meta))
+        view = self.query("original")
+        self.assertEqual(view["delivery"]["nativeRounds"][0]["state"], "unknown")
+        self.assertEqual(pi_outcome_view.list_outcomes(self.common)["outcomes"][0]["memberSources"]["missing"], ["task-a/1"])
+
+    def test_native_receipt_cannot_name_another_round_and_bad_flags_are_unknown(self):
+        self.make_task("task-a", (1, 2))
+        self.write_state("task-a", 1)
+        foreign = self.write_receipt("task-a", 2, "foreign")
+        local = self.write_receipt("task-a", 1, "local")
+        self.write_summary("task-a", 1, receipts=[
+            self.receipt_meta(foreign, receipt=str(foreign)),
+            self.receipt_meta(local, cancelled="false")])
+        self.accept_record("receipts", self.accepted_payload())
+        verify = self.query("receipts")["verification"]
+        self.assertEqual(verify["uniqueReceipts"], 1)
+        self.assertEqual(verify["counts"]["passed"], 0)
+        self.assertEqual(verify["counts"]["unknown"], 1)
+        self.assertFalse(verify["countsComplete"])
+
+    def test_earlier_failed_round_is_not_later_takeover(self):
+        self.make_task("task-a", (1, 2))
+        self.write_state("task-a", 1)
+        self.write_summary("task-a", 1)
+        card = pi_events._new_card("task-a", THREAD, "Synthetic", "Synthetic", None, None,
+            str(self.repo.root), str(self.repo.state_dir), str(self.repo.root), "offline", None, 1)
+        card["codex"] = {"takeover": {"required": True, "cause": "quality_limit", "at": 4,
+            "outcome": {"round": 2}, "failedReports": [{"round": 1}, {"round": 2}]}}
+        self.seed_card({"task-a": card})
+        self.accept_record("earlier", self.accepted_payload())
+        intervention = self.query("earlier")["interventionCoverage"]
+        self.assertFalse(intervention["nativeTakeover"]["observed"])
+        self.assertEqual(intervention["nativeTakeover"]["coverage"]["excluded"], 1)
+
+    def test_handled_review_with_missing_time_has_partial_coverage(self):
+        coverage = {"status": "known"}
+        payload = {"startedAt": 0, "finishedAt": 20, "work": [], "workComplete": False}
+        event = {"kind": "review_required", "createdAt": 1, "handled": True,
+                 "decision": "accepted"}
+        view = pi_outcome_view._timing_section(payload, [], [event], coverage)
+        self.assertEqual(view["reviewWaitSeconds"]["coverage"]["status"], "unknown")
+        self.assertEqual(view["reviewWaitSeconds"]["coverage"]["missingBoundaries"], 1)
 
 
 if __name__ == "__main__":

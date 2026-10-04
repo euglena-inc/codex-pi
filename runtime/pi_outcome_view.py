@@ -108,13 +108,23 @@ def _load_member_rows(common, selected) -> tuple:
                                                       f"member task {task} metadata")
             if meta_problem == "missing" and problem:
                 meta_problem = problem
+            if task_meta is not None:
+                declared_common = task_meta.get("commonDir")
+                try:
+                    common_matches = (declared_common is None or
+                                      Path(declared_common).resolve() == Path(common).resolve())
+                except (TypeError, ValueError, OSError, RuntimeError):
+                    common_matches = False
+                if task_meta.get("task", task) != task or not common_matches:
+                    meta_problem = "task identity or git-common directory mismatch"
+                    task_meta = None
         elif task_dir is not None:
             meta_problem = task_problem or "missing task directory"
         for number in rounds:
             round_dir = state_data = summary = None
             state_problem = summary_problem = checks_problem = None
             checks_dir = None
-            if task_dir is not None:
+            if task_dir is not None and meta_problem is None:
                 round_dir, problem = _inspect_under(task_dir / "rounds" / str(number), state)
                 if round_dir is not None and round_dir.is_dir():
                     checks_dir, checks_problem = _inspect_under(round_dir / "round.checks", state)
@@ -126,12 +136,18 @@ def _load_member_rows(common, selected) -> tuple:
                         f"member round {task}/{number} state")
                     if state_problem == "missing" and problem:
                         state_problem = problem
+                    if state_data is not None and state_data.get("state") not in (
+                            "pending", "starting", "running", "completed", "failed",
+                            "timed_out", "cancelled", "interrupted"):
+                        state_data, state_problem = None, "invalid execution state"
                     summary_path, problem = _inspect_under(round_dir / "round.summary.json", state)
                     summary, _, summary_problem = bounded_json(
                         summary_path if not problem else None, MAX_SUMMARY_BYTES,
                         f"member round {task}/{number} summary")
                     if summary_problem == "missing" and problem:
                         summary_problem = problem
+                    if summary is not None and not isinstance(summary.get("metrics"), dict):
+                        summary, summary_problem = None, "invalid summary metrics"
                 else:
                     state_problem = summary_problem = checks_problem = \
                         problem or "missing round directory"
@@ -159,6 +175,11 @@ def _read_archive(common, selected) -> tuple:
         coverage.update(status="not_applicable",
                         note="no member rounds selected; nothing to attribute from the archive")
         return decisions, events, coverage
+    for source in (board_file, store, Path(str(store) + "-wal"), Path(str(store) + "-shm")):
+        _, problem = _inspect_under(source, _codex_root(common))
+        if problem:
+            coverage["problem"] = f"archive source {problem}"
+            return decisions, events, coverage
     if not store.is_file():
         coverage["problem"] = "board archive is not initialized; decisions/events are unavailable"
         return decisions, events, coverage
@@ -246,16 +267,20 @@ def _attribution_facts(decisions) -> dict:
             counts[decision] += 1
         if not _is_delivery_record(record) or decision not in DELIVERY_DECISIONS:
             continue
+        if decision != "accepted" and record.get("failureKind", "quality") != "quality":
+            continue
         view = {"task": record.get("task"), "round": record.get("round"),
                 "eventId": record.get("eventId"), "decision": decision,
                 "failureKind": record.get("failureKind", "quality") if decision != "accepted" else None,
                 "at": record.get("at"), "reviewedHead": record.get("reviewedHead")}
-        if first_delivery is None or (isinstance(view["at"], (int, float))
+        if not _finite(view["at"]) or view["at"] < 0:
+            view["at"] = None
+        if first_delivery is None or (_finite(view["at"])
                                       and (first_delivery.get("at") is None
                                            or view["at"] < first_delivery["at"])):
             first_delivery = view
         if decision == "accepted" and (first_acceptance is None
-                                       or (isinstance(view["at"], (int, float))
+                                       or (_finite(view["at"])
                                            and (first_acceptance.get("at") is None
                                                 or view["at"] < first_acceptance["at"]))):
             first_acceptance = view
@@ -272,6 +297,11 @@ def _takeover_latches(common, selected, events) -> tuple:
     """Attributed takeover evidence: board latch plus archived takeover events."""
     latches, coverage = [], {"excluded": 0, "unattributed": 0, "problem": None}
     board_file = board_file_for_common(Path(common))
+    for source in (board_file, board_file.with_name(STORE_FILE)):
+        _, problem = _inspect_under(source, _codex_root(common))
+        if problem:
+            coverage["problem"] = f"board source {problem}"
+            return latches, coverage
     board, problem = read_board(board_file)
     if isinstance(board, dict):
         cards = board.get("cards") or {}
@@ -291,10 +321,7 @@ def _takeover_latches(common, selected, events) -> tuple:
             if isinstance(outcome, dict) and isinstance(outcome.get("round"), int) \
                     and not isinstance(outcome["round"], bool):
                 candidates.add(outcome["round"])
-            for report in latch.get("failedReports") or []:
-                if isinstance(report, dict) and isinstance(report.get("round"), int) \
-                        and not isinstance(report["round"], bool):
-                    candidates.add(report["round"])
+            # Failed earlier deliveries are not the round where takeover occurred.
             entry = {"task": task, "cause": latch.get("cause"), "at": latch.get("at"),
                      "scope": latch.get("scope"), "failedDeliveries": latch.get("failedDeliveries"),
                      "source": "board_takeover_latch"}
@@ -396,12 +423,14 @@ def _delivery_section(payload, rows, facts, archive_coverage):
             missing.append(label)
             continue
         state = row["state"]
-        rounds.append(key | {"state": state.get("state"), "exitCode": state.get("exitCode"),
-                             "timedOut": bool(state.get("timedOut")),
-                             "cancelled": bool(state.get("cancelled")),
+        code = state.get("exitCode")
+        rounds.append(key | {"state": state.get("state"),
+                             "exitCode": code if isinstance(code, int) and not isinstance(code, bool) else None,
+                             "timedOut": state.get("timedOut") if isinstance(state.get("timedOut"), bool) else None,
+                             "cancelled": state.get("cancelled") if isinstance(state.get("cancelled"), bool) else None,
                              "endHead": state.get("endHead") or state.get("head"),
-                             "startedAt": state.get("startedAt"),
-                             "endedAt": state.get("endedAt")})
+                             "startedAt": _plain_number(state.get("startedAt")),
+                             "endedAt": _plain_number(state.get("endedAt"))})
         known.append(label)
     first_delivery = facts["firstReviewedDelivery"]
     return {
@@ -418,7 +447,7 @@ def _delivery_section(payload, rows, facts, archive_coverage):
             "counts": {key: facts["counts"][key] for key in sorted(facts["counts"])},
             "firstReviewedDelivery": first_delivery,
             "firstReviewedDeliveryAccepted": (first_delivery["decision"] == "accepted")
-                                             if first_delivery else None,
+                if first_delivery and archive_coverage.get("status") == "known" else None,
             "firstReviewedAcceptance": facts["firstReviewedAcceptance"],
             "reviewedQualityFailures": facts["qualityEvents"],
             "reviewedQualityFailureCount": facts["qualityCount"],
@@ -493,7 +522,7 @@ def _timing_section(payload, rows, events, archive_coverage):
                           "reason": "no external work entry has both boundaries"}
     external_union.update({"entries": len(payload["work"]), "source": "main_reported",
                            "label": "union of explicit external work intervals"})
-    review_intervals, pending_reviews = [], 0
+    review_intervals, pending_reviews, missing_review_times = [], 0, 0
     for event in events:
         if not isinstance(event, dict) or event.get("kind") not in DELIVERY_EVENT_KINDS:
             continue
@@ -502,17 +531,20 @@ def _timing_section(payload, rows, events, archive_coverage):
             created_at = event.get("at")
         handled = event.get("handledAt")
         if event.get("decision") in DELIVERY_DECISIONS and _finite(created_at) \
-                and _finite(handled) and handled >= created_at:
+                and _finite(handled) and handled >= created_at >= 0:
             review_intervals.append((created_at, handled))
         elif not event.get("handled"):
             pending_reviews += 1
-    if archive_coverage.get("status") == "known" and pending_reviews == 0:
+        else:
+            missing_review_times += 1
+    if archive_coverage.get("status") == "known" and pending_reviews == 0 and not missing_review_times:
         review_coverage = {"status": "known", "intervals": len(review_intervals),
                            "pendingExcluded": 0}
     else:
         review_coverage = {"status": "unknown" if not review_intervals else "partial",
                            "intervals": len(review_intervals),
                            "pendingExcluded": pending_reviews}
+    review_coverage["missingBoundaries"] = missing_review_times
     sums = {key: {"sum": 0.0, "known": [], "incomplete": []}
             for key in SUMMARY_TIMING_KEYS + ("checkElapsedSeconds",)}
     for row in rows:
@@ -578,19 +610,22 @@ def _summary_receipt_view(receipt):
                      and all(isinstance(arg, str) and len(arg) <= MAX_ARGV_CHARS for arg in argv))
     dirty = receipt.get("dirty") if isinstance(receipt.get("dirty"), bool) else None
     counts = receipt.get("test_counts")
+    invalid_counts = counts is not None and (not isinstance(counts, dict) or any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in counts.values()))
     counts = {key: value for key, value in counts.items()
-              if isinstance(value, int) and not isinstance(value, bool)} \
-        if isinstance(counts, dict) else None
+              if isinstance(value, int) and not isinstance(value, bool) and value >= 0} \
+        if isinstance(counts, dict) and not invalid_counts else None
     head = receipt.get("head")
     return {"id": receipt.get("id") if isinstance(receipt.get("id"), str) else None,
-            "exitCode": receipt.get("exit_code") if (receipt.get("exit_code") is None
+            "exitCode": receipt.get("exit_code") if not invalid_counts and receipt.get("log_verified") is True and (receipt.get("exit_code") is None
                                                      or (isinstance(receipt.get("exit_code"), int)
                                                          and not isinstance(receipt.get("exit_code"), bool)))
                         else None,
             "timedOut": receipt.get("timed_out") if isinstance(receipt.get("timed_out"), bool) else None,
             "cancelled": receipt.get("cancelled") if isinstance(receipt.get("cancelled"), bool) else None,
-            "startedAt": receipt.get("started_at") if _finite(receipt.get("started_at")) else None,
-            "endedAt": receipt.get("ended_at") if _finite(receipt.get("ended_at")) else None,
+            "startedAt": _plain_number(receipt.get("started_at")),
+            "endedAt": _plain_number(receipt.get("ended_at")),
             "head": head if isinstance(head, str) and FULL_OID_RE.fullmatch(head) else None,
             "dirty": dirty,
             "argv": argv_list if argv_complete else (argv_list if argv_list else None),
@@ -618,6 +653,8 @@ def _receipt_canonical(value, checks_dir, state) -> tuple:
     resolved, problem = _inspect_under(candidate, state)
     if problem is not None:
         return None, f"receipt {problem}"
+    if checks_dir is None or not resolved.is_relative_to(checks_dir):
+        return None, "native receipt is outside its owning round checks directory"
     return resolved, None
 
 
@@ -720,7 +757,7 @@ def _verification_section(common, payload, rows):
         if merged["timedOut"] or merged["cancelled"]:
             counts["interrupted"] += 1
             continue
-        if merged["exitCode"] is None:
+        if merged["exitCode"] is None or merged["timedOut"] is None or merged["cancelled"] is None:
             counts["unknown"] += 1
             continue
         counts["completed"] += 1
@@ -745,7 +782,7 @@ def _verification_section(common, payload, rows):
                         "classification": "potential_repeat",
                         "note": "same recorded clean candidate and argv only; this is not "
                                 "evidence of waste and does not prove the same environment"})
-    counts_complete = (not round_missing and not round_unknown and not unattributed
+    counts_complete = (not counts["unknown"] and not round_missing and not round_unknown and not unattributed
                        and not untrusted and not conflicts and not degraded
                        and not any(entry.get("fileProblem") for contributions in groups.values()
                                    for entry in contributions))
@@ -783,7 +820,7 @@ def _verification_section(common, payload, rows):
                                "outside, and references are never a new execution"}}
 
 
-def _usage_section(payload, rows):
+def _usage_section(payload, rows, *, group_models=True):
     """Assistant + auxiliary + total facts from stored summaries, never re-derived."""
     assistant = {key: {"sum": 0.0, "known": [], "incomplete": []}
                  for key in ASSISTANT_METRIC_KEYS + ("reasoning",)}
@@ -842,7 +879,8 @@ def _usage_section(payload, rows):
             combined = total_section.get("usage") if isinstance(total_section.get("usage"), dict) else {}
             total_complete = total_section.get("complete") is True
             for metric in ASSISTANT_METRIC_KEYS:
-                value = _plain_number(combined.get(metric), integer=True)
+                source_key = "input" if metric == "uncachedInput" else metric
+                value = _plain_number(combined.get(source_key), integer=True)
                 if value is None:
                     if combined.get(metric) is not None:
                         invalid.append({"round": key, "field": f"total.usage.{metric}"})
@@ -868,7 +906,9 @@ def _usage_section(payload, rows):
             for metric in ASSISTANT_METRIC_KEYS:
                 total[metric]["incomplete"].append(key)
         if isinstance(summary.get("models"), dict):
-            models.update(summary["models"])
+            models.update({k: v for k, v in summary["models"].items()
+                           if isinstance(k, str) and isinstance(v, int)
+                           and not isinstance(v, bool) and v > 0})
         if isinstance(summary.get("expected_model"), str):
             expected.add(summary["expected_model"])
     def aggregate(bucket):
@@ -962,6 +1002,39 @@ def _usage_section(payload, rows):
     else:
         combined = (pi_report["costUsd"]["known"] if rows else 0.0) \
             + (external["reportedCostUsd"] or 0.0)
+        if not _finite(combined):
+            combined, reason = None, "combined reported cost overflowed"
+    if group_models:
+        # Only single-identity assistant rounds can be allocated without guessing.
+        # Native auxiliary summaries have no per-model identity, so their totals
+        # remain in the explicitly aggregate view above, never assigned by share.
+        buckets = {}
+        for row in rows:
+            identities = (row.get("summary") or {}).get("models")
+            valid = isinstance(identities, dict) and identities and all(
+                isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool) and v > 0
+                for k, v in identities.items())
+            model = next(iter(identities)) if valid and len(identities) == 1 else None
+            buckets.setdefault(model, []).append(row)
+        pi_report["assistantByModel"] = []
+        for model, model_rows in sorted(buckets.items(), key=lambda pair: pair[0] or ""):
+            model_view = _usage_section(dict(payload, work=[], workComplete=False),
+                                        model_rows, group_models=False)
+            costs = [_plain_number((row.get("summary") or {}).get("reported_cost_usd"))
+                     for row in model_rows]
+            known_costs = [cost for cost in costs if cost is not None]
+            cost_sum = sum(known_costs)
+            pi_report["assistantByModel"].append({
+                "model": model, "attribution": "recorded_single_model" if model else "unattributed",
+                "rounds": [f"{row['task']}/{row['round']}" for row in model_rows],
+                "usage": model_view["piReported"]["assistant"],
+                "reportedCostUsd": cost_sum if known_costs and _finite(cost_sum) else None,
+                "costComplete": model_view["piReported"]["costUsd"]["complete"]
+                    and len(known_costs) == len(model_rows) and _finite(cost_sum)})
+        pi_report["modelAttributionNote"] = (
+            "assistant-only model groups; mixed/unknown rounds remain unattributed; "
+            "auxiliary summaries lack model identity and are never allocated by message count")
+        external["entries"] = work
     return {
         "source": "stored_round_summaries_and_main_reported_work",
         "modelIdentity": identity,
@@ -1009,24 +1082,30 @@ def _rework_section(payload, rows, facts, events, archive_coverage, verification
             failed_rounds.append({"round": key, "state": value, "exitCode": state.get("exitCode")})
         elif value not in ("completed",):
             unknown_rounds.append(key)
-    transport = Counter()
+    transport, observations = Counter(), Counter()
     transport_rounds, transport_unknown = [], []
     for row in rows:
         key = f"{row['task']}/{row['round']}"
         meta = row["taskMeta"]
-        diagnostics = ((meta or {}).get("network") or {}).get("diagnostics") \
-            if isinstance(meta, dict) else None
+        network = meta.get("network") if isinstance(meta, dict) else None
+        diagnostics = network.get("diagnostics") if isinstance(network, dict) else None
         if diagnostics is not True or row["roundDir"] is None:
             transport_unknown.append(key)
             continue
-        sidecar = read_network_sidecar(row["roundDir"] / "round.network.jsonl")
+        sidecar_path, problem = _inspect_under(row["roundDir"] / "round.network.jsonl",
+                                               row["roundDir"])
+        sidecar = read_network_sidecar(sidecar_path) if problem is None else {"status": "unreadable"}
         if sidecar.get("status") in ("missing", "unreadable"):
             transport_unknown.append(key)
             continue
         transport_rounds.append(key)
+        if sidecar.get("truncated") or sidecar.get("oversized"):
+            transport_unknown.append(key)
         for name, value in (sidecar.get("classes") or {}).items():
             if isinstance(value, int) and not isinstance(value, bool):
-                transport[name] += value
+                observations[name] += value
+                if name != "abort_cleanup":
+                    transport[name] += value
     return {
         "source": "native_rounds_receipts_decisions_network",
         "reviewedQualityFailures": {
@@ -1043,6 +1122,7 @@ def _rework_section(payload, rows, facts, events, archive_coverage, verification
         "failedRounds": failed_rounds,
         "unknownRounds": unknown_rounds,
         "transportErrors": {"classes": {key: transport[key] for key in sorted(transport)},
+                            "observations": dict(observations),
                             "roundsWithReadableSidecar": transport_rounds,
                             "roundsUnknown": transport_unknown,
                             "coverage": _status(transport_rounds, [], transport_unknown)},
@@ -1057,7 +1137,7 @@ def _rework_section(payload, rows, facts, events, archive_coverage, verification
 
 def _intervention_section(payload, rows, takeover_evidence, takeover_coverage):
     kinds = Counter(entry["kind"] for entry in payload["work"])
-    observed = bool(takeover_evidence)
+    observed = any(entry.get("attribution") == "selected_round" for entry in takeover_evidence)
     failed = [row for row in rows if isinstance(row.get("state"), dict)
               and row["state"].get("state") in ("failed", "timed_out", "cancelled", "interrupted")]
     if payload["status"] != "accepted":
@@ -1132,26 +1212,11 @@ def outcome_metrics(root, common, outcome_id) -> dict:
 
 def _member_source_flags(common, members) -> dict:
     present, missing = [], []
-    try:
-        state = _codex_root(common)
-    except ValueError:
-        return {"present": [], "missing": [f"{member.get('task')}/{number}"
-                                            for member in members
-                                            for number in member.get("rounds") or []]}
-    for member in members:
-        task = member.get("task")
-        task_dir = None
-        if isinstance(task, str):
-            task_dir, _problem = _inspect_under(state / "tasks" / task, state)
-        for number in member.get("rounds") or []:
-            key = f"{task}/{number}"
-            task_ok = task_dir is not None and (task_dir / "task.json").is_file()
-            round_ok = False
-            if task_ok:
-                round_dir, _problem = _inspect_under(task_dir / "rounds" / str(number), state)
-                round_ok = round_dir is not None \
-                    and (round_dir / "round.state.json").is_file()
-            (present if task_ok and round_ok else missing).append(key)
+    rows, _ = _load_member_rows(common, _selected_rounds(members))
+    for row in rows:
+        key = f"{row['task']}/{row['round']}"
+        (missing if row["taskProblem"] or row["stateProblem"] or row["summaryProblem"]
+         else present).append(key)
     return {"present": present, "missing": missing}
 
 
