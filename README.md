@@ -2,6 +2,10 @@
 
 当前 Codex 主任务负责设计、派工与验收；Pi 的模型由项目配置选择（模型政策只在 [协作 Skill](skills/collaborate/SKILL.md) 中陈述）。项目只需 `.agents/codex-pi.json` 和自己的领域约束，公共插件维护进程、同会话返修、看板和原始证据。
 
+## 0.8.1 Qwen 3.8
+
+- 允许项目显式选择 `qwen38/qwen38`。将 `thinking` 设为 `max` 使用 Pi 的最高思考档；默认模型仍为 `deepseek/deepseek-flash`。模型和思考档按任务冻结，不可用时不自动切换。
+
 ## 0.8.0 指令清晰度与连接诊断
 
 - worker 合同、工具说明和派工模板明确区分 Promise 完成与检查通过、执行失败与准入拒绝，以及定向检查与正式验收；保持原有权限、预算与验收语义。
@@ -67,7 +71,7 @@ Sol-Luna 已迁出为独立个人 Skill，使用 Codex 原生子代理，不需�
 
 `checks` 是验收指引，插件不会把它当作通过证明。`maxWorkers` 是容量上限；项目的依赖和并行资格仍由项目约束决定。整轮超时和单个命令的时限分别设置。Pi 退出码 0 仅表示执行结束。
 
-`model` 必须取自 `pi_task.py project` 列出的允许模型（当前含 `deepseek/deepseek-flash`、`newapi/glm-5.3`、`newapi/deepseek-flash`）；选择、按任务冻结和不回退的规则见 Skill。若选用 NewAPI 路由，本机 Pi 需已配置对应 provider 和凭证。
+`model` 必须取自 `pi_task.py project` 列出的允许模型（当前含 `deepseek/deepseek-flash`、`newapi/glm-5.3`、`newapi/deepseek-flash`、`qwen38/qwen38`）；选择、按任务冻结和不回退的规则见 Skill。Pi 当前将 `qwen38/qwen38` 列为支持 thinking 的模型；将它设为项目模型时，使用最高思考档 `"thinking": "max"`，例如 `{"model":"qwen38/qwen38","thinking":"max"}`。模型由项目显式选择，默认仍为 `deepseek/deepseek-flash`；本机 Pi 仍需配置相应 provider 和凭证。
 
 ### 网络代理与传输诊断（连接支持）
 
@@ -126,7 +130,7 @@ codex plugin marketplace add euglena-inc/codex-pi --ref main
 codex plugin add codex-pi@codex-pi
 ```
 
-在桌面应用中重新加载插件，并按提示审核、信任 Hooks；用新会话加载新版技能。安装只提供协作工具，不会复制本机的 Pi/DeepSeek 凭据或项目配置。已有项目仍需自己的 `.agents/codex-pi.json` 和领域约束。
+在桌面应用中重新加载插件，并按提示审核、信任 Hooks；用新会话加载新版技能。安装只提供协作工具，不会复制本机的 Pi、模型 provider 凭据或项目配置。已有项目仍需自己的 `.agents/codex-pi.json` 和领域约束。
 
 更新通过正式插件安装流程完成；若应用要求重新审核、信任 Hooks，由用户在应用内完成。不得手改缓存或信任记录。运行中任务保留原 helper 快照，在安全终态后采用新版本。已有任务的迁移需验证原会话和工作树没有改变。
 

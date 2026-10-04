@@ -486,9 +486,9 @@ class ContractMetadataTest(BudgetCase):
 class FreezeTest(BudgetCase):
     def test_version_and_frozen_snapshot_carry_the_new_runtime(self):
         root = Path(__file__).resolve().parent.parent
-        self.assertEqual((RUNTIME / "VERSION").read_text().strip(), "0.8.0")
+        self.assertEqual((RUNTIME / "VERSION").read_text().strip(), "0.8.1")
         manifest = json.loads((root / ".codex-plugin" / "plugin.json").read_text())
-        self.assertEqual(manifest["version"], "0.8.0")
+        self.assertEqual(manifest["version"], "0.8.1")
         self.assertIn("pi_worker.ts", pi_task.HELPER_FILES)
         self.assertEqual((self.tools / "pi_worker.ts").read_bytes(),
                          (RUNTIME / "pi_worker.ts").read_bytes())

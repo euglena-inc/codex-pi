@@ -110,29 +110,35 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(recorded["tools"], "read,grep,find,ls,check,progress,readiness,codemode")
         self.assertIn("read-only", (repo.task_dir("ro") / "rounds" / "1" / "contract.md").read_text())
 
-    def test_project_selected_newapi_model_is_pinned_and_passed_to_pi(self):
-        for index, (model, reported) in enumerate((("newapi/glm-5.3", "glm-5.3"),
-                                                   ("newapi/deepseek-flash", "deepseek-flash"))):
+    def test_project_selected_model_is_pinned_and_passed_to_pi(self):
+        cases = (("newapi/glm-5.3", "newapi", "glm-5.3"),
+                 ("newapi/deepseek-flash", "newapi", "deepseek-flash"),
+                 ("qwen38/qwen38", "qwen38", "qwen38"))
+        for index, (model, provider, reported) in enumerate(cases):
             with self.subTest(model=model):
-                repo, worktree = self.make(default_config(model=model), name=f"newapi-repo-{index}")
-                trace = self.tmp / f"newapi-trace-{index}.jsonl"
+                repo, worktree = self.make(default_config(model=model, thinking="max"),
+                                           name=f"model-repo-{index}")
+                trace = self.tmp / f"model-trace-{index}.jsonl"
                 env = base_env(PI_DOUBLE_MODE="session-trace", PI_DOUBLE_TRACE=str(trace),
-                               PI_DOUBLE_REPORTED_PROVIDER="newapi",
+                               PI_DOUBLE_REPORTED_PROVIDER=provider,
                                PI_DOUBLE_REPORTED_MODEL=reported)
 
-                started = repo.start_json(f"newapi-model-{index}", worktree, env=env)
+                started = repo.start_json(f"selected-model-{index}", worktree, env=env)
                 self.assertEqual(started["model"], model)
-                result = repo.wait_terminal(f"newapi-model-{index}", env=env)
+                self.assertEqual(started["thinking"], "max")
+                result = repo.wait_terminal(f"selected-model-{index}", env=env)
                 self.assertEqual(result["state"], "completed")
                 self.assertEqual(result["modelCheck"], "matched")
 
-                task = json.loads((repo.task_dir(f"newapi-model-{index}") / "task.json").read_text())
+                task = json.loads((repo.task_dir(f"selected-model-{index}") / "task.json").read_text())
                 self.assertEqual(task["model"], model)
-                contract = (repo.task_dir(f"newapi-model-{index}") / "rounds" / "1"
+                self.assertEqual(task["thinking"], "max")
+                contract = (repo.task_dir(f"selected-model-{index}") / "rounds" / "1"
                             / "contract.md").read_text()
                 self.assertIn(f"pinned to `{model}`", contract)
                 recorded = json.loads(trace.read_text().splitlines()[0])
                 self.assertEqual(recorded["model"], model)
+                self.assertEqual(recorded["thinking"], "max")
 
     # ------------------------------------------------------------------
     def test_failed_attempt_stays_visible_and_continue_uses_same_session(self):

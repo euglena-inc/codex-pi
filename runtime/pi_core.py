@@ -25,7 +25,7 @@ SCHEMA_VERSION = 1
 # The CLI entry that task-side messages and records name.
 TASK_CLI = Path(__file__).with_name("pi_task.py").resolve()
 DEFAULT_MODEL = "deepseek/deepseek-flash"
-ALLOWED_MODELS = (DEFAULT_MODEL, "newapi/glm-5.3", "newapi/deepseek-flash")
+ALLOWED_MODELS = (DEFAULT_MODEL, "newapi/glm-5.3", "newapi/deepseek-flash", "qwen38/qwen38")
 DEFAULT_THINKING = "max"
 DEFAULT_TIMEOUT = 14400
 MAX_TIMEOUT = 604800

@@ -85,7 +85,8 @@ class ConfigTest(unittest.TestCase):
         self.assertIn("bash", data["capabilities"]["writableTools"])
         self.assertTrue(data["limits"]["readOnlyIsNotASecuritySandbox"])
         self.assertEqual(data["limits"]["allowedModels"],
-                         ["deepseek/deepseek-flash", "newapi/glm-5.3", "newapi/deepseek-flash"])
+                         ["deepseek/deepseek-flash", "newapi/glm-5.3", "newapi/deepseek-flash",
+                          "qwen38/qwen38"])
         self.assertIn("each new task pins", data["limits"]["modelPolicy"])
         self.assertEqual(data["activeTaskCount"], 0)
 
@@ -133,7 +134,8 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(data["repo"], str(project_wt.resolve()))
         self.assertEqual(data["config"]["model"], "deepseek/deepseek-flash")
         self.assertEqual(data["limits"]["allowedModels"],
-                         ["deepseek/deepseek-flash", "newapi/glm-5.3", "newapi/deepseek-flash"])
+                         ["deepseek/deepseek-flash", "newapi/glm-5.3", "newapi/deepseek-flash",
+                          "qwen38/qwen38"])
         self.assertEqual(data["capabilities"]["configCheckout"], str(project_wt.resolve()))
         # A second linked worker checkout is accepted and uses the project checkout config.
         started = run_cli("start", "--repo", str(project_wt), "--task", "cfg",
@@ -214,7 +216,8 @@ class ConfigTest(unittest.TestCase):
         data = cli_json("project", "--repo", str(repo.root), env=env)
         self.assertEqual(data["repo"], str(repo.root.resolve()))
         self.assertEqual(data["limits"]["allowedModels"],
-                         ["deepseek/deepseek-flash", "newapi/glm-5.3", "newapi/deepseek-flash"])
+                         ["deepseek/deepseek-flash", "newapi/glm-5.3", "newapi/deepseek-flash",
+                          "qwen38/qwen38"])
         self.assertFalse(marker.exists())
         project_path = os.environ.get("CODEX_PI_PRIVATE_PROJECT")
         primary_path = os.environ.get("CODEX_PI_PRIVATE_PRIMARY")
@@ -229,7 +232,8 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(data["repo"], str(project.resolve()))
         self.assertEqual(data["config"]["model"], "deepseek/deepseek-flash")
         self.assertEqual(data["limits"]["allowedModels"],
-                         ["deepseek/deepseek-flash", "newapi/glm-5.3", "newapi/deepseek-flash"])
+                         ["deepseek/deepseek-flash", "newapi/glm-5.3", "newapi/deepseek-flash",
+                          "qwen38/qwen38"])
         primary_proc = run_cli("project", "--repo", str(primary), env=env, expect=None)
         self.assertIn(primary_proc.returncode, (0, 2))
         if primary_proc.returncode == 0:
