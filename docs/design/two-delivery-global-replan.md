@@ -1,3 +1,9 @@
+> **Historical design note.** This 0.5.x implementation design introduced the
+> whole-task analysis and two-complete-deliveries mechanism. The current rules
+> are in [the Skill](../../skills/collaborate/SKILL.md), including the
+> weak-model-first default ([design](weak-model-first.md)); the release and
+> version instructions in this file are not active.
+
 # Two complete deliveries with whole-task Codex analysis
 
 Codex's primary contribution is whole-task design and review: freed from routine

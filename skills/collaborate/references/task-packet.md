@@ -2,7 +2,7 @@
 
 For the main session preparing a dispatch or a whole-outcome repair. Rules and the whole-task analysis: [the Skill](../SKILL.md); commands: [runtime](runtime.md). Write in the user's language. Keep APIs, paths and commands verbatim.
 
-Before preparing this packet, decide whether Pi has an independently verifiable complete outcome worth delegating. If Codex direct completion is the better route, use it. Resolve consequential design uncertainty first; preserve Pi's freedom to read source and choose routine implementation. Design depth follows the actual risks, not a fixed document length.
+Before preparing this packet, define the complete outcome and prefer the configured Pi model for the largest reasonably self-contained result when facts are accessible, consequential interfaces are settled, real feedback exists and the authorized resources can support delivery. Codex direct completion or early takeover needs a concrete task-specific reason recorded in the existing design or review record (for example unresolved cross-state semantics dominating the remaining work, untrustworthy feedback, or repair/coordination cost beyond the likely benefit). Resolve consequential design uncertainty first; preserve Pi's freedom to read source and choose routine implementation. Design depth follows the actual risks, not a fixed document length.
 
 ## Artifacts
 

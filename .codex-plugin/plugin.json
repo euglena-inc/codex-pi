@@ -1,15 +1,15 @@
 {
   "name": "codex-pi",
-  "version": "0.8.2",
-  "description": "跨项目 Codex 与 Pi 协作：主会话设计验收，Pi 完整实施与同会话返修，本地看板仅在待审或异常时通知。",
+  "version": "0.8.3",
+  "description": "跨项目 Codex 与 Pi 协作：弱模型优先承接完整成果，主会话设计验收与按需接手，本地看板仅在待审或异常时通知。",
   "author": {
     "name": "Local personal tools"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex + Pi",
-    "shortDescription": "Pi 持续实施；看板有事再通知，原主会话设计验收。",
-    "longDescription": "项目配置固定 Pi 模型，任务冻结所选模型。现有 supervisor 维护本地看板，Codex CLI 仅以 queue 传递事件到原桌面任务。主会话设计、审查并在接手后实施；不新增 Codex 模型调度器。",
+    "shortDescription": "较大完整成果默认交给 Pi；主会话设计验收，看板有事再通知。",
+    "longDescription": "默认偏好把最大且可独立验收的完整成果交给配置的 Pi 模型；直接完成或提前接管需具体理由。项目配置固定 Pi 模型，任务冻结所选模型。现有 supervisor 维护本地看板，Codex CLI 仅以 queue 传递事件到原桌面任务。主会话设计、审查并在接手后实施；不新增 Codex 模型调度器。",
     "developerName": "Local personal tools",
     "category": "Productivity",
     "capabilities": [
@@ -17,7 +17,7 @@
       "Write"
     ],
     "defaultPrompt": [
-      "使用 $collaborate，将当前项目已授权的完整任务交给 Pi 实施，由当前主会话设计并验收。"
+      "使用 $collaborate，将当前项目已授权的完整任务优先交给 Pi 实施，由当前主会话设计并验收。"
     ]
   }
 }
