@@ -30,6 +30,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 RUNTIME = ROOT / "runtime"
 PROBE = ROOT / "scripts" / "connection_support_probe.mjs"
+
+# The validator already depends on the offline test suite for its integration
+# mode; reuse the same boundary helper so an inherited NODE_OPTIONS/preload or
+# diagnostic identity can never masquerade as this run's intended observer.
+sys.path.insert(0, str(ROOT / "tests"))
+from runtime_helpers import isolated_env  # noqa: E402
+
 MAX_LINES = 257
 ALLOWED_RECORD_KEYS = {"at", "dur", "phase", "class", "code", "status", "hdr", "scope",
                        "proc", "primary"}
@@ -104,7 +111,7 @@ def read_sidecar(path: Path) -> list:
 
 def probe_env(core, sidecar: Path, scope: str) -> dict:
     env, _record = core.apply_network_policy(
-        os.environ, {"proxyUrl": None, "diagnostics": True, "source": "frozen"},
+        isolated_env(), {"proxyUrl": None, "diagnostics": True, "source": "frozen"},
         diagnostics_file=sidecar, scope=scope, supervisor_pid=os.getpid(),
         preload_path=RUNTIME / "pi_network_diagnostics.mjs")
     # Local fault servers must never be routed through an inherited proxy.

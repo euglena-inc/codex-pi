@@ -16,9 +16,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from runtime_helpers import (ROOT, RUNTIME, Repo, base_env, cleanup_repos, cli_json,
-                             default_config, make_pi_trap, run_cli, write_config)
+                             default_config, isolated_env, make_pi_trap, run_cli, write_config)
 
 sys.path.insert(0, str(RUNTIME))
 import pi_core  # noqa: E402
@@ -41,16 +42,16 @@ ALLOWED_RECORD_KEYS = {"at", "dur", "phase", "class", "code", "status", "hdr", "
 
 
 def connection_env(**extra) -> dict:
-    """Test environment with inherited proxy/NODE_OPTIONS removed.
+    """Test environment with inherited proxy/Node/diagnostic identities removed.
 
-    Verbatim trace values are only requested for this explicit key list, so a
-    developer's real proxy credentials are never written into a trace file.
+    ``base_env`` already drops ambient ``NODE_OPTIONS`` and the three plugin
+    diagnostic identity variables, so only explicit ``extra`` values opt back
+    in. Verbatim trace values are only requested for this explicit key list, so
+    a developer's real proxy credentials are never written into a trace file.
     """
     env = base_env(**extra)
     for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
         env.pop(key, None)
-    if "NODE_OPTIONS" not in extra:
-        env.pop("NODE_OPTIONS", None)
     env["NO_PROXY"] = "existing.invalid"
     env["no_proxy"] = "existing.invalid"
     env["CODEX_PI_TEST_UNRELATED"] = "synthetic-unrelated"
@@ -447,6 +448,27 @@ class FrozenPolicyIntegrationTest(unittest.TestCase):
         self.assertFalse((repo.task_dir("quiet") / "rounds" / "1"
                           / "round.network.jsonl").exists())
 
+    def test_disabled_diagnostics_under_polluted_parent_stays_disabled(self):
+        pollution = {
+            "NODE_OPTIONS": "--import=file:///synthetic%20inherited/pi_network_diagnostics.mjs",
+            "CODEX_PI_NETWORK_DIAG_FILE": str(self.tmp / "inherited-round.network.jsonl"),
+            "CODEX_PI_NETWORK_DIAG_SCOPE": "inherited-round",
+            "CODEX_PI_NETWORK_DIAG_SUPERVISOR": "4242",
+        }
+        with mock.patch.dict(os.environ, pollution):
+            repo, worktree = self.make(network={"proxyUrl": None, "diagnostics": False})
+            trace = self.tmp / "trace.jsonl"
+            env = connection_env(PI_DOUBLE_TRACE=str(trace), NODE_OPTIONS="")
+            self.start(repo, worktree, "polluted-quiet", env)
+            entry = trace_entries(trace)[0]
+            self.assertEqual(entry["envValues"]["NODE_OPTIONS"], "")
+            for key in ("CODEX_PI_NETWORK_DIAG_FILE", "CODEX_PI_NETWORK_DIAG_SCOPE",
+                        "CODEX_PI_NETWORK_DIAG_SUPERVISOR"):
+                self.assertIsNone(entry["envValues"].get(key),
+                                  f"inherited {key} must not reach the frozen task")
+            self.assertFalse((repo.task_dir("polluted-quiet") / "rounds" / "1"
+                              / "round.network.jsonl").exists())
+
 
 class HelperSnapshotTest(unittest.TestCase):
     def setUp(self):
@@ -465,6 +487,62 @@ class HelperSnapshotTest(unittest.TestCase):
                          PRELOAD.read_bytes())
 
 
+class EnvironmentIsolationTest(unittest.TestCase):
+    """The reusable test-boundary isolation helper and its integration."""
+
+    POLLUTED = {
+        "NODE_OPTIONS": "--import=file:///synthetic%20inherited/pi_network_diagnostics.mjs",
+        "CODEX_PI_NETWORK_DIAG_FILE": "/synthetic/inherited-round.network.jsonl",
+        "CODEX_PI_NETWORK_DIAG_SCOPE": "inherited-round",
+        "CODEX_PI_NETWORK_DIAG_SUPERVISOR": "4242",
+    }
+
+    def test_helper_copies_and_drops_inherited_identities_without_mutation(self):
+        base = dict(self.POLLUTED, CODEX_PI_TEST_UNRELATED="synthetic-unrelated",
+                    CODEX_PI_TEST_PATH="/synthetic/value")
+        snapshot = dict(base)
+        result = isolated_env(base)
+        for key in ("NODE_OPTIONS", "CODEX_PI_NETWORK_DIAG_FILE",
+                    "CODEX_PI_NETWORK_DIAG_SCOPE", "CODEX_PI_NETWORK_DIAG_SUPERVISOR"):
+            self.assertNotIn(key, result)
+        self.assertEqual(result["CODEX_PI_TEST_UNRELATED"], "synthetic-unrelated")
+        self.assertEqual(result["CODEX_PI_TEST_PATH"], "/synthetic/value")
+        self.assertEqual(base, snapshot, "the helper must not mutate its source")
+
+    def test_explicit_fixture_overrides_apply_after_isolation(self):
+        result = isolated_env(
+            dict(self.POLLUTED, CODEX_PI_TEST_UNRELATED="polluted"),
+            NODE_OPTIONS="--max-old-space-size=128",
+            CODEX_PI_NETWORK_DIAG_FILE="/synthetic/explicit-round.network.jsonl",
+            CODEX_PI_NETWORK_DIAG_SCOPE="round-2",
+            CODEX_PI_NETWORK_DIAG_SUPERVISOR="5150")
+        self.assertEqual(result["NODE_OPTIONS"], "--max-old-space-size=128")
+        self.assertEqual(result["CODEX_PI_NETWORK_DIAG_FILE"],
+                         "/synthetic/explicit-round.network.jsonl")
+        self.assertEqual(result["CODEX_PI_NETWORK_DIAG_SCOPE"], "round-2")
+        self.assertEqual(result["CODEX_PI_NETWORK_DIAG_SUPERVISOR"], "5150")
+        self.assertEqual(result["CODEX_PI_TEST_UNRELATED"], "polluted")
+
+    def test_pi_test_environments_strip_parent_pollution_without_mutating_it(self):
+        pollution = dict(self.POLLUTED, CODEX_PI_TEST_KEEP="synthetic-keep")
+        with mock.patch.dict(os.environ, pollution):
+            for env in (base_env(), connection_env()):
+                self.assertNotIn("NODE_OPTIONS", env)
+                for key in ("CODEX_PI_NETWORK_DIAG_FILE", "CODEX_PI_NETWORK_DIAG_SCOPE",
+                            "CODEX_PI_NETWORK_DIAG_SUPERVISOR"):
+                    self.assertNotIn(key, env)
+                self.assertEqual(env["CODEX_PI_TEST_KEEP"], "synthetic-keep")
+            explicit = connection_env(
+                NODE_OPTIONS="--max-old-space-size=128",
+                CODEX_PI_NETWORK_DIAG_FILE="/synthetic/explicit.network.jsonl")
+            self.assertEqual(explicit["NODE_OPTIONS"], "--max-old-space-size=128")
+            self.assertEqual(explicit["CODEX_PI_NETWORK_DIAG_FILE"],
+                             "/synthetic/explicit.network.jsonl")
+            for key, value in pollution.items():
+                self.assertEqual(os.environ.get(key), value,
+                                 "the parent environment must stay unchanged")
+
+
 @unittest.skipUnless(NODE, "node is required for the preload mechanism tests")
 class PreloadMechanismTest(unittest.TestCase):
     def setUp(self):
@@ -472,17 +550,26 @@ class PreloadMechanismTest(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
 
-    def probe_env(self, sidecar: Path) -> dict:
+    def probe_env(self, sidecar: Path, ambient: dict | None = None, **overrides) -> dict:
+        """Deliberately isolated probe environment with explicit diagnostics.
+
+        ``ambient`` simulates an inherited worker/developer environment; the
+        reusable helper removes its Node/diagnostic identities before this
+        fixture deliberately opts back into the intended preload.
+        """
         env, _record = pi_core.apply_network_policy(
-            os.environ, {"proxyUrl": None, "diagnostics": True, "source": "frozen"},
+            isolated_env(ambient, **overrides),
+            {"proxyUrl": None, "diagnostics": True, "source": "frozen"},
             diagnostics_file=sidecar, scope="test-probe", supervisor_pid=os.getpid(),
             preload_path=PRELOAD)
         env["NO_PROXY"] = "127.0.0.1,localhost"
         env["no_proxy"] = "127.0.0.1,localhost"
         return env
 
-    def run_probe(self, mode: str, sidecar: Path) -> dict:
-        proc = subprocess.run([NODE, str(PROBE), mode], env=self.probe_env(sidecar),
+    def run_probe(self, mode: str, sidecar: Path, ambient: dict | None = None,
+                  **overrides) -> dict:
+        proc = subprocess.run([NODE, str(PROBE), mode],
+                              env=self.probe_env(sidecar, ambient, **overrides),
                               cwd=str(ROOT), capture_output=True, text=True, timeout=120)
         self.assertEqual(proc.returncode, 0, f"{mode}: {proc.stderr[-400:]}")
         return json.loads(proc.stdout.strip().splitlines()[-1])
@@ -490,6 +577,80 @@ class PreloadMechanismTest(unittest.TestCase):
     def records(self, sidecar: Path) -> list:
         return [json.loads(line) for line in
                 sidecar.read_text(encoding="utf-8").splitlines() if line]
+
+    @staticmethod
+    def stable_records(records: list) -> list:
+        """Drop per-run volatile fields so two probe runs can be compared."""
+        return [{key: value for key, value in record.items()
+                 if key not in ("at", "dur", "proc")} for record in records]
+
+    def inherited_worker_environment(self) -> tuple:
+        """Synthetic polluted parent: different-path preload with a space and
+        an old sidecar identity, as a worker or developer environment may hold."""
+        tools = self.tmp / "inherited tools"
+        tools.mkdir()
+        old_preload = tools / "pi_network_diagnostics.mjs"
+        shutil.copy2(PRELOAD, old_preload)
+        old_sidecar = self.tmp / "inherited-round.network.jsonl"
+        ambient = {
+            "NODE_OPTIONS": f"--import={old_preload.as_uri()}",
+            "CODEX_PI_NETWORK_DIAG_FILE": str(old_sidecar),
+            "CODEX_PI_NETWORK_DIAG_SCOPE": "inherited-round",
+            "CODEX_PI_NETWORK_DIAG_SUPERVISOR": "999999",
+        }
+        return ambient, old_sidecar
+
+    def test_polluted_parent_yields_exactly_one_intended_observer(self):
+        ambient, old_sidecar = self.inherited_worker_environment()
+        sidecar = self.tmp / "isolated-round.network.jsonl"
+        self.run_probe("synthetic", sidecar, ambient)
+        records = self.records(sidecar)
+        self.assertEqual(sum(record.get("phase") == "observer_ready" for record in records), 1)
+        self.assertFalse(old_sidecar.exists(), "the inherited sidecar must stay untouched")
+        self.assertNotIn("inherited tools", sidecar.read_text(encoding="utf-8"))
+        # The polluted and clean inputs must produce the same stable observations.
+        clean = self.tmp / "clean-round.network.jsonl"
+        self.run_probe("synthetic", clean, {})
+        self.assertEqual(self.stable_records(records),
+                         self.stable_records(self.records(clean)))
+
+    def test_explicit_node_options_win_over_a_polluted_parent(self):
+        ambient, old_sidecar = self.inherited_worker_environment()
+        sidecar = self.tmp / "explicit-round.network.jsonl"
+        env = self.probe_env(sidecar, ambient, NODE_OPTIONS="--max-old-space-size=128")
+        self.assertTrue(env["NODE_OPTIONS"].startswith("--max-old-space-size=128 --import="))
+        self.assertEqual(env["NODE_OPTIONS"].count("--import="), 1)
+        self.assertNotIn("inherited", env["NODE_OPTIONS"])
+        proc = subprocess.run([NODE, str(PROBE), "synthetic"], env=env, cwd=str(ROOT),
+                              capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-400:])
+        records = self.records(sidecar)
+        self.assertEqual(sum(record.get("phase") == "observer_ready" for record in records), 1)
+        self.assertFalse(old_sidecar.exists())
+
+    def test_inherited_preload_without_isolation_still_duplicates(self):
+        """Bounded negative control: the old ambient-copy behavior is observable.
+
+        Without the isolation helper the inherited different-path preload stays
+        loaded beside the deliberate one, so the synthetic probe reports two
+        observers. This keeps the original defect reproducible instead of
+        turning the failing assertion into a skip.
+        """
+        ambient, _old_sidecar = self.inherited_worker_environment()
+        sidecar = self.tmp / "unisolated-round.network.jsonl"
+        env, _record = pi_core.apply_network_policy(
+            dict(ambient), {"proxyUrl": None, "diagnostics": True, "source": "frozen"},
+            diagnostics_file=sidecar, scope="test-probe", supervisor_pid=os.getpid(),
+            preload_path=PRELOAD)
+        env["NO_PROXY"] = "127.0.0.1,localhost"
+        env["no_proxy"] = "127.0.0.1,localhost"
+        proc = subprocess.run([NODE, str(PROBE), "synthetic"], env=env, cwd=str(ROOT),
+                              capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-400:])
+        observers = [record for record in self.records(sidecar)
+                     if record.get("phase") == "observer_ready"]
+        self.assertEqual(len(observers), 2,
+                         "the unisolated inherited preload must remain observable")
 
     def test_synthetic_classification_privacy_and_allowlist(self):
         sidecar = self.tmp / "round.network.jsonl"
@@ -629,9 +790,8 @@ class PreloadMechanismTest(unittest.TestCase):
         self.assertEqual(observation["exit"], 0)
 
     def test_disabled_diagnostics_adds_no_preload_or_file(self):
-        base = {key: value for key, value in os.environ.items() if key != "NODE_OPTIONS"}
         env, _record = pi_core.apply_network_policy(
-            base, {"proxyUrl": None, "diagnostics": False, "source": "frozen"},
+            isolated_env(), {"proxyUrl": None, "diagnostics": False, "source": "frozen"},
             diagnostics_file=self.tmp / "never.jsonl", scope="round-1",
             supervisor_pid=os.getpid(), preload_path=PRELOAD)
         proc = subprocess.run([NODE, "-e", "console.log('ok')"], env=env, cwd=str(ROOT),

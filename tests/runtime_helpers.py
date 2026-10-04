@@ -16,6 +16,29 @@ DOUBLES = Path(__file__).resolve().parent / "doubles"
 PI_DOUBLE = DOUBLES / "pi_double.py"
 GRANDCHILD = DOUBLES / "grandchild.py"
 
+# Node and plugin diagnostic identities a worker or developer environment may
+# inherit. A synthetic fixture must opt into these deliberately instead of
+# inheriting an unrelated preload or sidecar target.
+DIAGNOSTIC_ENVIRONMENT_KEYS = ("NODE_OPTIONS", "CODEX_PI_NETWORK_DIAG_FILE",
+                               "CODEX_PI_NETWORK_DIAG_SCOPE",
+                               "CODEX_PI_NETWORK_DIAG_SUPERVISOR")
+
+
+def isolated_env(base: dict | None = None, **overrides) -> dict:
+    """Copy an ambient/base environment with inherited diagnostics removed.
+
+    The source mapping (``os.environ`` by default) is never mutated. Inherited
+    ``NODE_OPTIONS`` and the three plugin diagnostic identity variables are
+    dropped so a synthetic fixture starts clean; explicit ``overrides`` are
+    applied last and may deliberately opt back into flags or identities.
+    Unrelated values are preserved.
+    """
+    env = dict(os.environ if base is None else base)
+    for key in DIAGNOSTIC_ENVIRONMENT_KEYS:
+        env.pop(key, None)
+    env.update({key: str(value) for key, value in overrides.items()})
+    return env
+
 
 def default_config(**overrides) -> dict:
     config = {"schemaVersion": 1, "model": "deepseek/deepseek-flash", "thinking": "max",
@@ -30,8 +53,7 @@ def base_env(**extra) -> dict:
         os.chmod(PI_DOUBLE, 0o755)
     except OSError:
         pass
-    env = os.environ.copy()
-    env.update({"PI_BIN": str(PI_DOUBLE), "PI_DOUBLE_MODE": "ok"})
+    env = isolated_env(PI_BIN=str(PI_DOUBLE), PI_DOUBLE_MODE="ok")
     env.pop("PI_DOUBLE_TRACE", None)
     env.pop("PI_DOUBLE_GRANDCHILD_PIDFILE", None)
     env.pop("PI_DOUBLE_REPORTED_PROVIDER", None)

@@ -27,7 +27,7 @@ Fact owners and writers. Public interfaces. States, idempotency, concurrency, re
 This line's outcome, sibling task and input commit, what waits, shared edits and resources, integration owner, combined acceptance.
 ## Acceptance
 | ID | Observable pass condition | Real command / evidence | Counter-example that must fail |
-Missing, skipped or unknown evidence is not a pass. Mark manual or external proof.
+Name the checks that need fresh evidence and why; cite applicable original evidence with its covered scope and invalidation conditions. Check wrapper composition before adding duplicate commands. Justify a full set by broad integration impact. Missing, skipped or unknown required evidence is not a pass. Mark manual or external proof.
 ## Repair, budget, escalation
 Allocation and its evidence; Pi execution measurements and the separate sources for Codex/external effort. What Pi fixes alone. Command and phase budgets and resource scope. Escalate only for a design contradiction, an authority change or repeated ineffective repair; include the minimal reproduction.
 ```
@@ -53,7 +53,7 @@ Complete <whole result>. Work only in <worktree> at baseline <commit>.
 Read <constraints> and <spec path/sections>. Acceptance is <contract path and IDs>.
 Settled decision and difficulty: <key decision -> solution -> verification>. Allowed scope: <allowed>. Protected scope: <protected>.
 You own the implementation, targeted checks, ordinary repairs and scoped commits. Do not stop at code written or a partial PASS.
-Run every formal check with the `check` tool. If an item declares a `targetedCommand`, run it first for local repair. Keep `final:true` for its formal command on the clean candidate.
+Run every frozen mandatory command with `check` using its exact `checkId` (or `id` when omitted). Use `targetedCommand` for relevant local repair only when needed; preserve applicable prior evidence. Keep `final:true` for a formal command that declares it, on the clean candidate.
 Allowed inputs: <allowed sources; gaps>. Do not bypass <forbidden sources>.
 If <design contradiction / authority change / repeated ineffective repair>, return the evidence and one decision question.
 If a must-ask item is open, take the conservative reading and report a spec gap.
@@ -64,7 +64,7 @@ Delete lines that do not apply; do not paste repository rules. Dispatch through 
 
 ## Mapping to the contract
 
-Fields of `runtime/pi_phase.py`: `phaseId`, `goal`, `result`, `baseline`, `scope`, `designRef` + `designSha256` (a real worktree file), `acceptanceItems[]` (`id`, `description`, `checkId`, `command`, `passCondition`, `evidence`, optional `minRun`, `forbidSkip`, `targetedCommand`, `estimatedSeconds`), `budgetSeconds`, `commandTimeoutSeconds`, `resourceLimits`, `autonomousRepair`, `escalateWhen`. Commands must be real. An unbuilt gate is part of the deliverable, never a placeholder PASS. `targetedCommand` is optional. It is only a local repair suggestion and never substitutes for the formal `command`. `estimatedSeconds` is a finite positive planning estimate, not a completion guarantee. Before dispatch, confirm that the spec and contract share the goal and boundary, that inputs exist, and that pass conditions are falsifiable.
+Fields of `runtime/pi_phase.py`: `phaseId`, `goal`, `result`, `baseline`, `scope`, `designRef` + `designSha256` (a real worktree file), `acceptanceItems[]` (`id`, `description`, `checkId`, `command`, `passCondition`, `evidence`, optional `minRun`, `forbidSkip`, `targetedCommand`, `estimatedSeconds`), `budgetSeconds`, `commandTimeoutSeconds`, `resourceLimits`, `autonomousRepair`, `escalateWhen`. Prefer omitting `checkId`, which defaults to `id`; when explicit, use the same literal value unless a distinct identity is necessary. If distinct, name the exact tool ID in the brief. Do not case-fold IDs or edit receipts to make them match. Commands must be real. An unbuilt gate is part of the deliverable, never a placeholder PASS. `targetedCommand` is optional. It is only a local repair suggestion and never substitutes for the formal `command`. `estimatedSeconds` is a finite positive planning estimate, not a completion guarantee. Before dispatch, confirm that the spec and contract share the goal and boundary, that inputs exist, and that pass conditions are falsifiable.
 
 ## Delivery format
 
