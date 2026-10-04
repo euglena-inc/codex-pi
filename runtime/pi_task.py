@@ -112,7 +112,8 @@ from pi_takeover import REVIEW_LIMIT
 HELPER_FILES = ("pi_task.py", "pi_core.py", "pi_evidence.py", "pi_phase.py", "pi_brief.py",
                 "pi_supervisor.py", "pi_summary.py", "pi_check.py", "pi_copy.py", "pi_size.py",
                 "pi_board.py", "pi_store.py", "pi_events.py", "pi_queue.py", "pi_takeover.py",
-                "pi_execution.py", "pi_archive.py", "pi_outcome.py", "pi_recovery.py", "pi_worker.ts",
+                "pi_execution.py", "pi_archive.py", "pi_outcome.py", "pi_outcome_view.py",
+                "pi_recovery.py", "pi_worker.ts",
                 "pi_network_diagnostics.mjs", "VERSION")
 
 

@@ -127,7 +127,8 @@ from pi_store import (
 from pi_takeover import FAILURE_KINDS, _records as decision_records, review_policy
 from pi_task import build_status
 from pi_archive import Cards, initialize_store, event_page, STORE_FILE
-from pi_outcome import list_outcomes, outcome_metrics, record_outcome
+from pi_outcome import load_record_payload, record_outcome
+from pi_outcome_view import list_outcomes, outcome_metrics
 
 
 def refresh_with_status(board_file, task_id: str, status: dict, now=None, block: bool = True,
@@ -1418,17 +1419,7 @@ def task_metrics(board_file: Path, card, task_id: str) -> dict:
 
 def cmd_record_outcome(args) -> dict:
     root, common, _board = board_file_for_repo(args.repo)
-    path = Path(args.record_file)
-    try:
-        size = path.stat().st_size
-    except OSError as exc:
-        raise ValueError(f"record file is unreadable: {path}") from exc
-    if size > 1_000_000:
-        raise ValueError("record file exceeds the 1 MiB bounded input limit")
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise ValueError("record file is not valid JSON") from exc
+    payload = load_record_payload(Path(args.record_file))
     return record_outcome(root, common, args.outcome, payload,
                           expected_revision=args.expected_revision)
 
