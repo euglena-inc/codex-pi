@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Short Codex hooks for the Codex-Pi cli-queue route (0.6.0).
+"""Short Codex hooks for the Codex-Pi cli-queue route (0.8.8).
 
 Delivery of Pi results is done by the board queue (``pi_board.py``); there is no
 Stop-hook delivery any more. The hooks that remain are deliberately small:
 
 * ``Interrupt`` persists a route pause for the interrupted session. Only an
   explicit ``pi_board.py resume`` clears it; ordinary prompts never do.
-* ``SessionStart`` / ``UserPromptSubmit`` print bounded, read-only recovery
-  evidence for cli-queue routes (pause, uncertain delivery, monitor health).
+* ``SessionStart`` / ``UserPromptSubmit`` return bounded read-only presence as
+  ``hookSpecificOutput.additionalContext``: work awaiting a main decision, the
+  phase pins of every task on this session, and cli-queue transport evidence.
+* ``PreCompact`` returns the same pins so an automatic compaction keeps the
+  contract hash and candidate head instead of losing them.
+* ``SessionEnd`` prepares the outcome closeout for this session and reports the
+  path; it never files a record and never implies acceptance.
 
 This module never invokes the Codex CLI and never starts a model.
 """
@@ -50,13 +55,41 @@ def _queue_recovery_lines(session: str) -> list:
     return [bounded(line, 400) for line in lines[:10]]
 
 
-def handle_recovery(event_name: str, session: str) -> dict:
-    lines = _queue_recovery_lines(session)
-    if not lines:
+def handle_presence(event_name: str, session: str) -> dict:
+    """Presence digest for a boundary event; silent when this session has no Pi work."""
+    try:
+        from pi_presence import compact_digest, render_context
+        digest = compact_digest(session)
+    except Exception:  # noqa: BLE001 - presence must never break a session
         return {}
-    text = "\n".join(["Codex-Pi cli-queue transport (read-only recovery evidence):"] + lines)
-    return {"hookSpecificOutput": {"hookEventName": event_name,
-                                   "additionalContext": bounded(text, MAX_MESSAGE_BYTES)}}
+    if digest.get("problem") in ("missing", "not-routed") or not digest.get("lines"):
+        return {}
+    text, _truncated = render_context(digest)
+    return {"hookSpecificOutput": {"hookEventName": event_name, "additionalContext": text}}
+
+
+def handle_compaction(session: str) -> dict:
+    """Carry the pins into a compaction summary; never blocks compaction."""
+    return handle_presence("PreCompact", session)
+
+
+def handle_closeout(session: str, cwd=None) -> dict:
+    """Prepare the closeout for this session. Preparation only, never filing."""
+    repo = Path(cwd) if isinstance(cwd, str) and cwd.strip() else None
+    if repo is None:
+        return {"systemMessage": bounded("codex-pi closeout skipped: the hook carried no "
+                                        "repository path; run pi_board.py closeout --repo <path> "
+                                        "--session <uuid>")}
+    try:
+        from pi_presence import prepare_closeout
+        result = prepare_closeout(session, repo=repo)
+    except Exception as exc:  # noqa: BLE001 - a broken digest can never block a session end
+        return {"systemMessage": bounded(f"codex-pi closeout preparation failed safely: {exc}")}
+    if not result.get("ok"):
+        return {"systemMessage": bounded(f"codex-pi closeout not prepared: {result.get('problem')}; "
+                                        "never acceptance")}
+    return {"systemMessage": bounded(f"codex-pi closeout prepared: {result['path']}; "
+                                    f"outcome id {result['outcomeId']}; not acceptance")}
 
 
 def handle_interrupt(session: str) -> dict:
@@ -83,7 +116,11 @@ def dispatch_hook(event: dict) -> dict:
     if name == "Interrupt":
         return handle_interrupt(session)
     if name in ("SessionStart", "UserPromptSubmit"):
-        return handle_recovery(name, session)
+        return handle_presence(name, session)
+    if name == "PreCompact":
+        return handle_compaction(session)
+    if name == "SessionEnd":
+        return handle_closeout(session, event.get("cwd"))
     return {}
 
 
@@ -109,7 +146,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pi_handoff.py",
         description="Codex hook entry for the Codex-Pi cli-queue route (Interrupt pause, "
-                    "SessionStart/UserPromptSubmit recovery). Never invokes the Codex CLI or a model.")
+                    "SessionStart/UserPromptSubmit presence, PreCompact pins, SessionEnd "
+                    "closeout). Never invokes the Codex CLI or a model.")
     sub = parser.add_subparsers(dest="command", required=True)
     hook = sub.add_parser("hook", help="read one hook event from stdin")
     hook.set_defaults(func=cmd_hook)

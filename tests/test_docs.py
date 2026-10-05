@@ -43,7 +43,8 @@ LOADED_SET_TOTAL = 21504
 # linked from SKILL.md and stay covered by the command-surface checks below: splitting a
 # reference may defer text, never delete it.
 ON_DEMAND = {
-    "skills/collaborate/references/runtime-ops.md": 4608,
+    # The deferred tier grows when text is deferred into it; it is read on condition, not per round.
+    "skills/collaborate/references/runtime-ops.md": 5120,
 }
 IMPLEMENTATION_BUDGET = 42000
 MARKERS = ("worker.json", "agent_before_settle", "CODEX_PI_NETWORK_DIAG_SUPERVISOR")

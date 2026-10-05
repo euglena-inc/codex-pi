@@ -218,8 +218,8 @@ That decision is now taken: the budgeted quantity is the text a round actually l
 folder. A normal dispatch, check or review round reads `SKILL.md`, `references/runtime.md`,
 `references/task-packet.md` and `references/handoff.md`; those four are budgeted together at **21,504 bytes**
 (the accepted −50% figure, restored as a real invariant) and currently measure **21,358 bytes** (−49.97%).
-`references/runtime-ops.md` forms a second tier with its own cap of 4,608 bytes and is read only when one of
-its stated conditions applies: store repair or pre-0.6 conversion/adoption, declaring or changing parallel
+`references/runtime-ops.md` forms a second tier with its own cap, 4,608 bytes at first and 5,120 bytes once
+the session closeout surface moved in, and is read only when one of its stated conditions applies: store repair or pre-0.6 conversion/adoption, declaring or changing parallel
 check resources, closing out or comparing an outcome, or classifying a proxy/transport loss.
 
 Deferral, not deletion, is the only allowed operation here, and it is guarded three ways: every

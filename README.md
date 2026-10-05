@@ -2,7 +2,14 @@
 
 当前 Codex 主任务负责设计、派工与验收；Pi 的模型由项目配置选择（模型政策只在 [协作 Skill](skills/collaborate/SKILL.md) 中陈述）。项目只需 `.agents/codex-pi.json` 和自己的领域约束，公共插件维护进程、同会话返修、看板和原始证据。
 
-## 0.8.7 按需加载分层（度量改为“一次派工实际载入字节”）
+### 0.8.8 hook 存在感与会话收尾（P0-1 + P0-2）
+
+- 边界 hook 现在返回**有界的存在感摘要**（官方 `hookSpecificOutput.additionalContext`）：本会话上等待 main 决策的事件（`review_required`/`phase_blocked`/`codex_takeover_required`）、每个任务的 pin（状态、phase、契约摘要 12 位、候选 12 位、所有权、接管钩、真实失败次数、待处理数），并合并原有队列/监视器恢复证据。以前只有异常才提示，一切健康的待评审轮次不会产生任何提示，main 必须记得去 `show`；现在不需要。
+- `PreCompact` 把 pin 带进自动压缩摘要，长阶段不再因为压缩丢掉契约哈希与候选 HEAD；`SessionEnd` 只为该会话**准备**成果观测（写自己那份私有文件并给出 outcome id 与命令），默认不落盘任何记录；`pi_board.py closeout --repo R --session UUID [--task T] [--apply]` 是唯一会归档的形式，且其中 `accepted` 仍需真实候选 commit，“准备”永远造不出成功。语法记在按需层 [运行时操作](skills/collaborate/references/runtime-ops.md)（该层上限因此从 4608 提到 5120）。
+- 新模块 [`runtime/pi_presence.py`](runtime/pi_presence.py) 是摘要与收尾准备的单一归宿；hooks 仍不调用 Codex CLI、不起模型或 daemon、不改决策/所有权/hook 信任，除 Interrupt 路由暂停与 SessionEnd 自有文件外全为只读。超预算时按行截断并保留 `…(+N more)` 与页脚；读不到的值一律 `unknown`，不用 0 替。`PostToolUse` 评估后不采用（每个工具调用都要付钱）。
+- 新增确定性 `tests/test_presence.py`（21 项），含三项负控：去掉 additionalContext 输出、把 `unknown` 改成 `0`、让收尾默认归档，均使守护失败；并验证 hook 在空 PATH 下仍正常且不起子进程。边界：单元测试不能证明真实 hook 信任与真实压缩行为，那两项需用户在应用内确认，否则记为未知。
+
+### 0.8.7 按需加载分层（度量改为“一次派工实际载入字节”）
 
 - 体积度量从“每文件字节”改为“一个普通轮次实际载入的字节”：常驻集仍为 `SKILL.md` + `references/runtime.md` + `references/task-packet.md` + `references/handoff.md`，现共 **21358 字节**，在上限 21504 内（对 42692 字节基线 −49.97%）；不常驻内容移到新的 `references/runtime-ops.md`（单独上限 4608），只在指定条件下加载。
 - 新增按需文件 [运行时操作](skills/collaborate/references/runtime-ops.md)：任务 store 修复与 pre-0.6 转换/`adopt-runtime`、并行检查的资源准入字段、成果观测收尾与六段限制、网络代理策略与传输故障分类。[协作 Skill](skills/collaborate/SKILL.md) 保留一句常驻指针并写明何时才需要加载；普通派工、检查与评审轮次不会读它。规则正文未删，只是择时加载；机制细节仍以[运行时实现](runtime/IMPLEMENTATION.md)为单一归宿。

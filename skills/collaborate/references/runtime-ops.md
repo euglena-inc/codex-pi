@@ -13,6 +13,14 @@ Load when:
 
 `record-outcome` stores a Main-reported observation of an outcome at `--expected-revision`, appending a revision rather than editing a past one. `metrics --outcome` renders the six sections read-only and `--outcomes` lists them bounded; neither is a denominator, a success rate, an acceptance, an ownership decision or permission to execute. Pi-native facts and Main-reported facts stay in separate fields, unknown is never replaced by zero, timing intervals are unions rather than sums, and a reported interface cost is not a billing figure. No record or read command scans a session or changes execution, decisions, budgets, pause or quality counts ([detail](../../../docs/validation/outcome-observations-0.8.5.md)).
 
+The `SessionEnd` hook prepares that record automatically for the tasks bound to the closing session:
+
+```sh
+RUNTIME/pi_board.py closeout --repo REPO --session OWNER_UUID [--task TASK] [--apply]
+```
+
+Preparation writes only its own files under the repository's private state and reports the outcome id; `--apply` is the only form that files a record, and an accepted status there still needs a real candidate commit, so a preparation can never fabricate success. Rounds come from retained delivery events, so a pruned history can under-report and stays unknown.
+
 ## Check resource admission
 
 `checkExecution`: `maxConcurrent` 1..4, `cpuSlots`, `memoryMiB`. `checkResources` per command: `parallelSafe`, `cpuSlots`, `memoryMiB`, `exclusiveKeys`. The default is serial; a parallel declaration needs complete estimates plus a pool, metadata follows the normalized argv, and a conflict refuses the run. Shared resources stay exclusive, bounds are soft per-worker and never host-wide, and measuring 1 and 2 lanes before 4 is the expected order (admission mechanics: [IMPLEMENTATION.md](../../../runtime/IMPLEMENTATION.md)).

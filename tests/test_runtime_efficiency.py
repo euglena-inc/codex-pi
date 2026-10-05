@@ -812,9 +812,9 @@ class BenchmarkHelperTest(unittest.TestCase):
 
 class VersionTest(unittest.TestCase):
     def test_version_matches_release(self):
-        self.assertEqual((RUNTIME / "VERSION").read_text().strip(), "0.8.7")
+        self.assertEqual((RUNTIME / "VERSION").read_text().strip(), "0.8.8")
         manifest = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())
-        self.assertEqual(manifest["version"], "0.8.7")
+        self.assertEqual(manifest["version"], "0.8.8")
 
 
 if __name__ == "__main__":

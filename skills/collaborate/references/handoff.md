@@ -6,7 +6,7 @@ Read card ids; reuse a collected `result` for that round; verify diff+original r
 
 Eligible new tasks: early ownership handoff via `pi_board.py takeover` with current event, full candidate, reason; it rechecks released writers/contract/HEAD, preserves real counts, emits the same takeover event resolved as an ownership receipt; independent acceptance required.
 
-Pause stops dispatch, not Pi; prompts/progress never resume it; a queued card never overrides a later pause. An uncertain send may have arrived: keep the claim, inspect, recover only if needed; `rearm` may duplicate (no queue idempotency key), never a live inflight send, never steal locks; hooks check only pause/recovery; a dead supervisor cannot report itself.
+Pause stops dispatch, not Pi; prompts/progress never resume it; a queued card never overrides a later pause. An uncertain send may have arrived: keep the claim, inspect, recover only if needed; `rearm` may duplicate (no queue idempotency key), never a live inflight send, never steal locks; boundary hooks add pending-decision presence and phase pins but decide nothing, and `SessionEnd` only prepares a closeout; a dead supervisor cannot report itself.
 
 Install via the formal mechanism only (hook review is the user's app action); a running task keeps its frozen helpers and 0.5.x tasks finish with them; registering a terminal task may enqueue a review event at once.
 

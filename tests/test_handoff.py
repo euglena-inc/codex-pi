@@ -71,13 +71,17 @@ class HooksAfterStopRemovalTest(unittest.TestCase):
         return path
 
     # ------------------------------------------------------------------
-    def test_hooks_config_keeps_only_interrupt_and_recovery_events(self):
+    def test_hooks_config_keeps_only_bounded_presence_and_pause_events(self):
         config = json.loads(HOOKS_JSON.read_text(encoding="utf-8"))
-        self.assertEqual(sorted(config["hooks"]), ["Interrupt", "SessionStart", "UserPromptSubmit"])
+        self.assertEqual(sorted(config["hooks"]),
+                         ["Interrupt", "PreCompact", "SessionEnd", "SessionStart",
+                          "UserPromptSubmit"])
         for name, entries in config["hooks"].items():
             hook = entries[0]["hooks"][0]
             self.assertEqual(hook["command"], 'python3 "${PLUGIN_ROOT}/runtime/pi_handoff.py" hook')
             self.assertLessEqual(hook["timeout"], 3, name)
+        for forbidden in ("Stop", "PreToolUse", "PostToolUse", "SessionEnd delivery"):
+            self.assertNotIn(forbidden, config["hooks"])
 
     def test_hook_command_executes_through_a_shell_with_spaces(self):
         command = json.loads(HOOKS_JSON.read_text(encoding="utf-8"))["hooks"]["Interrupt"][0][

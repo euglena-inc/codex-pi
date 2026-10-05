@@ -973,6 +973,14 @@ def cmd_recover(args) -> dict:
     return {"ok": True, **summary}
 
 
+def cmd_closeout(args) -> dict:
+    """Prepare (default) or, with --apply, file the outcome observation for one session."""
+    from pi_presence import prepare_closeout
+    thread = _validate_thread(args.session or os.environ.get("CODEX_THREAD_ID"))
+    return prepare_closeout(thread, repo=args.repo, task=args.task,
+                            apply=bool(args.apply))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pi_board.py",
@@ -1074,6 +1082,15 @@ def build_parser() -> argparse.ArgumentParser:
     recover = sub.add_parser("recover", help="bounded recovery evidence for one thread route")
     recover.add_argument("--thread")
     recover.set_defaults(func=cmd_recover)
+
+    closeout = sub.add_parser(
+        "closeout", help="prepare (read-only by default) the outcome closeout for one session")
+    closeout.add_argument("--repo", required=True)
+    closeout.add_argument("--session", help="owner thread uuid; defaults to CODEX_THREAD_ID")
+    closeout.add_argument("--task")
+    closeout.add_argument("--apply", action="store_true",
+                          help="file the prepared observation; without it nothing is recorded")
+    closeout.set_defaults(func=cmd_closeout)
 
     store=sub.add_parser("recover-store",help="archive legacy JSON and transactionally convert writer-free board/queue")
     store.add_argument("--repo",required=True)

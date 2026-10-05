@@ -800,7 +800,7 @@ class BoardTest(unittest.TestCase):
                                         "session_id": THREAD_A, "cwd": str(repo.root)},
                                        env).stdout)
             context = hook["hookSpecificOutput"]["additionalContext"]
-            self.assertIn("cli-queue transport", context)
+            self.assertIn("Codex-Pi presence", context)
             self.assertIn("monitor=error", context)
         finally:
             repo.cancel("board-monitor", env=env)
